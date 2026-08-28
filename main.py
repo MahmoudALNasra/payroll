@@ -436,9 +436,38 @@ def get_default_app_dir():
         app_dir = os.path.join(base_dir, ".payrollprodata")
     return app_dir
 
+def _auto_discover_existing_database():
+    """If the active app data directory has no database, scan adjacent folders for previous payroll_data.enc."""
+    default_dir = get_default_app_dir()
+    target_db = os.path.join(default_dir, "payroll_data.enc")
+    if os.path.exists(target_db) and os.path.getsize(target_db) > 1000:
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, "payroll_data.enc"),
+        os.path.join(os.getcwd(), "payroll_data.enc"),
+        os.path.join(os.path.expanduser("~"), "Downloads", "pythonapp", "payroll_data.enc"),
+        os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop", "app", "payroll_data.enc"),
+        os.path.join(os.path.expanduser("~"), "Desktop", "app", "payroll_data.enc"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "HighendPayroll", "payroll_data.enc"),
+        os.path.join(os.path.expanduser("~"), "Library", "Application Support", "HighendPayroll", "payroll_data.enc"),
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.path.abspath(c) != os.path.abspath(target_db):
+            try:
+                if os.path.getsize(c) > 500:
+                    import shutil
+                    os.makedirs(default_dir, exist_ok=True)
+                    shutil.copy2(c, target_db)
+                    break
+            except Exception:
+                pass
+
 def get_app_dir():
     default_dir = get_default_app_dir()
     os.makedirs(default_dir, exist_ok=True)
+    _auto_discover_existing_database()
     
     config_file = os.path.join(default_dir, "location_config.json")
     if os.path.exists(config_file):
@@ -9178,10 +9207,44 @@ if HAS_DEPS:
             
             settings_notebook = tb.Notebook(dialog, bootstyle="info")
             settings_notebook.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+            def _create_scrollable_tab(parent_nb, title):
+                tab = tb.Frame(parent_nb)
+                parent_nb.add(tab, text=title)
+                canvas = tk.Canvas(tab, highlightthickness=0)
+                scrollbar = tb.Scrollbar(tab, orient="vertical", command=canvas.yview)
+                scroll_content = tb.Frame(canvas, padding=15)
+                scroll_content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+                win_id = canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+                def _on_cfg(e):
+                    canvas.itemconfigure(win_id, width=e.width)
+                canvas.bind("<Configure>", _on_cfg)
+                canvas.configure(yscrollcommand=scrollbar.set)
+                
+                def _wheel(e):
+                    try:
+                        delta = int(-1 * (e.delta / 120)) if getattr(e, "delta", 0) else (1 if getattr(e, "num", 0) == 5 else -1)
+                        canvas.yview_scroll(delta, "units")
+                    except Exception:
+                        pass
+                def _bind_w(w):
+                    try:
+                        w.bind("<MouseWheel>", _wheel, add="+")
+                        w.bind("<Button-4>", _wheel, add="+")
+                        w.bind("<Button-5>", _wheel, add="+")
+                    except Exception:
+                        pass
+                    for ch in w.winfo_children():
+                        _bind_w(ch)
+                dialog.after(120, lambda: _bind_w(scroll_content))
+                dialog.after(120, lambda: _bind_w(canvas))
+                
+                canvas.pack(side=LEFT, fill=BOTH, expand=True)
+                scrollbar.pack(side=RIGHT, fill=Y)
+                return tab, scroll_content
             
             # --- TAB 1: LOCAL DIR ---
-            tab_local = tb.Frame(settings_notebook, padding=15)
-            settings_notebook.add(tab_local, text=self._tr("Local (Offline / Shared Sync)"))
+            tab_local_wrapper, tab_local = _create_scrollable_tab(settings_notebook, self._tr("Local (Offline / Shared Sync)"))
             
             tb.Label(tab_local, text=self._tr("Current storage directory:"), font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
             
@@ -9300,8 +9363,7 @@ if HAS_DEPS:
             tb.Button(local_btn_frame, text=self._tr("Save Configuration"), bootstyle="success", command=save_local_config).pack(side=LEFT, padx=10)
             
             # --- TAB 2: SUPABASE CLOUD ---
-            tab_remote = tb.Frame(settings_notebook, padding=15)
-            settings_notebook.add(tab_remote, text=self._tr("Supabase Cloud Database"))
+            tab_remote_wrapper, tab_remote = _create_scrollable_tab(settings_notebook, self._tr("Supabase Cloud Database"))
             
             tb.Label(tab_remote, text=self._tr("Supabase DB Host / Project Endpoint:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
             db_host_var = tk.StringVar(value=config_data.get("supabase_host") or "db.xxxx.supabase.co")
@@ -9505,9 +9567,9 @@ if HAS_DEPS:
             
             
             if default_tab == "supabase" or config_data.get("mode") == "supabase":
-                settings_notebook.select(tab_remote)
+                settings_notebook.select(tab_remote_wrapper)
             else:
-                settings_notebook.select(tab_local)
+                settings_notebook.select(tab_local_wrapper)
 
         def load_employees(self, quiet=False):
             if quiet:
@@ -10034,7 +10096,7 @@ if HAS_DEPS:
             
             canvas = tk.Canvas(dialog, highlightthickness=0)
             scrollbar = tb.Scrollbar(dialog, orient="vertical", command=canvas.yview)
-            scrollable_frame = tb.Frame(canvas)
+            scrollable_frame = tb.Frame(canvas, padding=(10, 5))
 
             scrollable_frame.bind(
                 "<Configure>",
@@ -10043,8 +10105,33 @@ if HAS_DEPS:
                 )
             )
 
-            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
             canvas.configure(yscrollcommand=scrollbar.set)
+
+            def _sync_emp_width(event):
+                canvas.itemconfigure(canvas_window, width=event.width)
+
+            canvas.bind("<Configure>", _sync_emp_width)
+
+            def _on_emp_wheel(event):
+                try:
+                    delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else (1 if getattr(event, "num", 0) == 5 else -1)
+                    canvas.yview_scroll(delta, "units")
+                except Exception:
+                    pass
+
+            def _bind_emp_wheel(w):
+                try:
+                    w.bind("<MouseWheel>", _on_emp_wheel, add="+")
+                    w.bind("<Button-4>", _on_emp_wheel, add="+")
+                    w.bind("<Button-5>", _on_emp_wheel, add="+")
+                except Exception:
+                    pass
+                for child in w.winfo_children():
+                    _bind_emp_wheel(child)
+
+            dialog.after(100, lambda: _bind_emp_wheel(scrollable_frame))
+            dialog.after(100, lambda: _bind_emp_wheel(canvas))
 
             canvas.pack(side="left", fill="both", expand=True, padx=10, pady=10)
             scrollbar.pack(side="right", fill="y")
