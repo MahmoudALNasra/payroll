@@ -4075,29 +4075,35 @@ def ensure_document_file_available(filepath):
         base_name = os.path.basename(str(filepath).replace("\\", "/"))
         stem, ext = os.path.splitext(base_name)
         lookup_keys = [base_name, f"{stem}.jpg", f"{stem}.jpeg", f"{stem}.png", f"{stem}.pdf", stem]
-        placeholders = ", ".join(["?"] * len(lookup_keys))
+        placeholders = ", ".join(["%s"] * len(lookup_keys))
         try:
-            pg = get_shared_supabase_conn()
-            cur = pg.cursor()
-            cur.execute(
-                f"SELECT file_data FROM cloud_file_storage WHERE file_name IN ({placeholders}) OR file_key IN ({placeholders}) LIMIT 1",
-                tuple(lookup_keys + lookup_keys)
-            )
-            row = cur.fetchone()
-            if row and row[0]:
-                raw_bytes = row[0]
-                if isinstance(raw_bytes, str):
-                    import base64
-                    try:
-                        raw_bytes = base64.b64decode(raw_bytes)
-                    except Exception:
-                        raw_bytes = raw_bytes.encode("utf-8")
-                elif isinstance(raw_bytes, memoryview):
-                    raw_bytes = raw_bytes.tobytes()
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                with open(local_path, "wb") as f:
-                    f.write(raw_bytes)
-                return local_path
+            db_conn = _open_supabase_pg_conn(timeout=15)
+            try:
+                cur = db_conn.cursor()
+                cur.execute(
+                    f"SELECT file_data FROM cloud_file_storage WHERE file_name IN ({placeholders}) OR file_key IN ({placeholders}) LIMIT 1",
+                    tuple(lookup_keys + lookup_keys)
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    raw_bytes = row[0]
+                    if isinstance(raw_bytes, str):
+                        import base64
+                        try:
+                            raw_bytes = base64.b64decode(raw_bytes)
+                        except Exception:
+                            raw_bytes = raw_bytes.encode("utf-8")
+                    elif isinstance(raw_bytes, memoryview):
+                        raw_bytes = raw_bytes.tobytes()
+                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                    with open(local_path, "wb") as f:
+                        f.write(raw_bytes)
+                    return local_path
+            finally:
+                try:
+                    db_conn.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -4105,7 +4111,7 @@ def ensure_document_file_available(filepath):
 
 
 def _push_file_to_cloud_storage(file_path):
-    """Save a compressed file copy into cloud_file_storage in the background."""
+    """Save a compressed file copy into cloud_file_storage reliably."""
     if not file_path or not os.path.isfile(file_path):
         return
     if get_db_mode() != "supabase" or is_supabase_offline():
@@ -4119,28 +4125,35 @@ def _push_file_to_cloud_storage(file_path):
             token = base64.b64encode(data).decode("ascii")
             base_name = os.path.basename(file_path)
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            pg = get_shared_supabase_conn()
-            cur = pg.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cloud_file_storage (
-                    file_key TEXT PRIMARY KEY,
-                    file_name TEXT,
-                    file_data TEXT,
-                    file_size INTEGER,
-                    uploaded_at TEXT
+            db_conn = _open_supabase_pg_conn(timeout=15)
+            try:
+                cur = db_conn.cursor()
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS cloud_file_storage (
+                        file_key TEXT PRIMARY KEY,
+                        file_name TEXT,
+                        file_data TEXT,
+                        file_size INTEGER,
+                        uploaded_at TEXT
+                    )
+                    """
                 )
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO cloud_file_storage (file_key, file_name, file_data, file_size, uploaded_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (file_key) DO UPDATE SET file_data = EXCLUDED.file_data, uploaded_at = EXCLUDED.uploaded_at
-                """,
-                (base_name, base_name, token, len(data), now)
-            )
-            pg.commit()
+                db_conn.commit()
+                cur.execute(
+                    """
+                    INSERT INTO cloud_file_storage (file_key, file_name, file_data, file_size, uploaded_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (file_key) DO UPDATE SET file_data = EXCLUDED.file_data, uploaded_at = EXCLUDED.uploaded_at
+                    """,
+                    (base_name, base_name, token, len(data), now)
+                )
+                db_conn.commit()
+            finally:
+                try:
+                    db_conn.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -12557,7 +12570,7 @@ if HAS_DEPS:
                     row = tb.Frame(doc_list_holder)
                     row.pack(fill=X, pady=2)
                     name = os.path.basename(path)
-                    exists = os.path.isfile(path)
+                    exists = bool(os.path.isfile(path) or os.path.isfile(resolve_local_doc_path(path)) or get_db_mode() == "supabase")
                     link = tb.Label(
                         row,
                         text=f"📄 {name}" + ("" if exists else f" ({self._tr('missing')})"),
