@@ -8944,9 +8944,10 @@ if HAS_DEPS:
             
             tb.Label(header_frame, text=self._tr("👥 Employee Management"), font=("Segoe UI", 22, "bold"), bootstyle="primary").pack(side=LEFT)
             
-            tb.Button(header_frame, text=self._tr("🔑 Change App Password"), bootstyle="danger outline", cursor="hand2", command=self.change_login_password).pack(side=RIGHT, padx=10)
-            tb.Button(header_frame, text=self._tr("Change Username"), bootstyle="info outline", cursor="hand2", command=self.change_login_username).pack(side=RIGHT, padx=10)
-            tb.Button(header_frame, text=self._tr("📂 Database Settings"), bootstyle="secondary outline", cursor="hand2", command=self.change_db_location).pack(side=RIGHT, padx=10)
+            tb.Button(header_frame, text=self._tr("🔑 Change App Password"), bootstyle="danger outline", cursor="hand2", command=self.change_login_password).pack(side=RIGHT, padx=6)
+            tb.Button(header_frame, text=self._tr("Change Username"), bootstyle="info outline", cursor="hand2", command=self.change_login_username).pack(side=RIGHT, padx=6)
+            tb.Button(header_frame, text=self._tr("☁️ Cloud Upload / Sync"), bootstyle="success outline", cursor="hand2", command=lambda: self.change_db_location(default_tab="supabase")).pack(side=RIGHT, padx=6)
+            tb.Button(header_frame, text=self._tr("📂 Database Settings"), bootstyle="secondary outline", cursor="hand2", command=self.change_db_location).pack(side=RIGHT, padx=6)
             
             btn_frame = tb.Frame(self.tab_names)
             btn_frame.pack(fill=X, padx=25, pady=(0, 15))
@@ -9167,7 +9168,7 @@ if HAS_DEPS:
                 
             tb.Button(dialog, text="Update Password", bootstyle="success", command=save_password).pack(pady=20)
 
-        def change_db_location(self):
+        def change_db_location(self, default_tab=None):
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("Database Connection Settings"))
             dialog.geometry("640x650")
@@ -9503,7 +9504,7 @@ if HAS_DEPS:
             self._build_activity_and_backup_panel(tab_history)
             
             
-            if config_data.get("mode") == "supabase":
+            if default_tab == "supabase" or config_data.get("mode") == "supabase":
                 settings_notebook.select(tab_remote)
             else:
                 settings_notebook.select(tab_local)
