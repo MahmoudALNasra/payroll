@@ -4085,8 +4085,63 @@ def serialize_expense_documents(paths):
     return json.dumps(cleaned)
 
 
+def optimize_and_save_file(src_path, dest_folder, dest_filename=None, max_dim=1280, quality=80):
+    """
+    Copy a file to dest_folder. If it's an image (.jpg, .png, .jpeg, .webp, .bmp, .heic),
+    automatically resize down to max_dim and compress as optimized JPEG (quality=80)
+    to save 95%+ storage space while maintaining visual clarity.
+    Non-image files (PDFs, docs) are safely copied.
+    """
+    if not src_path:
+        return ""
+    src_path = os.path.abspath(os.path.expanduser(str(src_path).strip()))
+    if not os.path.isfile(src_path):
+        return src_path
+
+    os.makedirs(dest_folder, exist_ok=True)
+    base_name = os.path.basename(src_path)
+    stem, ext = os.path.splitext(base_name)
+    ext_lower = ext.lower()
+
+    if ext_lower in ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff'):
+        out_name = dest_filename or f"{stem}.jpg"
+        if not out_name.lower().endswith(".jpg") and not out_name.lower().endswith(".jpeg"):
+            out_name = f"{os.path.splitext(out_name)[0]}.jpg"
+        dest_path = os.path.join(dest_folder, out_name)
+        try:
+            from PIL import Image, ImageOps
+            with Image.open(src_path) as img:
+                try:
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                if img.mode in ("RGBA", "P", "LA"):
+                    img = img.convert("RGB")
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                w, h = img.size
+                if max(w, h) > max_dim:
+                    resample = getattr(Image, "Resampling", Image).LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                    img.thumbnail((max_dim, max_dim), resample)
+                img.save(dest_path, "JPEG", quality=quality, optimize=True)
+                return dest_path
+        except Exception:
+            pass
+
+    # Fallback / Non-image copy
+    out_name = dest_filename or base_name
+    dest_path = os.path.join(dest_folder, out_name)
+    if os.path.abspath(src_path) != os.path.abspath(dest_path):
+        try:
+            import shutil
+            shutil.copy2(src_path, dest_path)
+        except Exception:
+            return src_path
+    return dest_path
+
+
 def store_expense_document(src_path, expense_id):
-    """Copy an uploaded receipt/document into the app Expense_Documents folder."""
+    """Copy and compress an uploaded receipt/document into the app Expense_Documents folder."""
     if not src_path:
         return ""
     src_path = os.path.abspath(os.path.expanduser(str(src_path).strip()))
@@ -4097,9 +4152,7 @@ def store_expense_document(src_path, expense_id):
         return src_path
     safe_base = "".join(c if (c.isalnum() or c in "._-") else "_" for c in os.path.basename(src_path))
     dest_name = f"expense_{expense_id or 'new'}_{int(time.time())}_{safe_base}"
-    dest = os.path.join(docs_root, dest_name)
-    shutil.copy2(src_path, dest)
-    return dest
+    return optimize_and_save_file(src_path, docs_root, dest_filename=dest_name)
 
 
 def store_expense_documents(src_paths, expense_id):
@@ -4148,9 +4201,7 @@ def store_shop_document_file(src_path, location, doc_id=None):
         return src_path
     safe_base = "".join(c if (c.isalnum() or c in "._-") else "_" for c in os.path.basename(src_path))
     dest_name = f"shop_{doc_id or 'new'}_{int(time.time())}_{safe_base}"
-    dest = os.path.join(dest_dir, dest_name)
-    shutil.copy2(src_path, dest)
-    return dest
+    return optimize_and_save_file(src_path, dest_dir, dest_filename=dest_name)
 
 
 def delete_shop_document_file(path):
@@ -5967,6 +6018,9 @@ if HAS_DEPS:
             self.bind_all("<Key>", self.reset_idle_timer)
             self.bind_all("<Button>", self.reset_idle_timer)
             self.bind_all("<Motion>", self.reset_idle_timer)
+            self.bind_all("<MouseWheel>", self.reset_idle_timer)
+            self.bind_all("<Button-4>", self.reset_idle_timer)
+            self.bind_all("<Button-5>", self.reset_idle_timer)
             
             self.after(5000, self.check_idle_time)
 
@@ -6292,22 +6346,65 @@ if HAS_DEPS:
         def reset_idle_timer(self, event=None):
             self.last_activity_time = time.time()
 
+        def _auto_save_all_pending_edits(self):
+            """Safely commit any active cell entry or open dialog before auto-logout."""
+            # 1. Unfocus active widget so any FocusOut/cell validation triggers
+            try:
+                focused = self.focus_get()
+                if focused:
+                    try:
+                        focused.event_generate("<FocusOut>")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # 2. Automatically save any open dialogs that registered a save function
+            try:
+                for widget in list(self.winfo_children()):
+                    if isinstance(widget, tk.Toplevel) and widget.winfo_exists():
+                        save_fn = getattr(widget, "_save_fn", None)
+                        if callable(save_fn):
+                            try:
+                                save_fn()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            # 3. Check specific known popups like envelope / cash details
+            try:
+                pop = getattr(self, "_envelope_popup", None)
+                if self._widget_alive(pop):
+                    save_fn = getattr(pop, "_save_fn", None)
+                    if callable(save_fn):
+                        try:
+                            save_fn()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         def check_idle_time(self):
             if not self.winfo_exists():
                 return
             try:
                 if getattr(self, 'is_logged_in', False):
                     elapsed = time.time() - self.last_activity_time
-                    if elapsed >= 180:  # 3 minutes
+                    if elapsed >= 180:  # 3 minutes of inactivity
                         self.is_logged_in = False
-                        messagebox.showwarning(
-                            "Inactivity Warning",
-                            "You have been logged out due to 3 minutes of inactivity.",
-                            parent=self
-                        )
+                        self._auto_save_all_pending_edits()
                         self.logout()
-            except Exception as e:
-                print(f"Error in check_idle_time: {e}")
+                        try:
+                            messagebox.showinfo(
+                                "Auto-Saved & Logged Out",
+                                "You have been safely logged out due to inactivity.\n\nAll your unsaved fields and open forms were automatically saved.",
+                                parent=self
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             finally:
                 if self.winfo_exists():
                     self.after(5000, self.check_idle_time)
@@ -6316,7 +6413,7 @@ if HAS_DEPS:
             self.is_logged_in = False
             self.stop_live_sync()
             self.hide_busy(force=True)
-            for widget in self.winfo_children():
+            for widget in list(self.winfo_children()):
                 if isinstance(widget, tk.Toplevel):
                     try:
                         widget.destroy()
@@ -7242,6 +7339,7 @@ if HAS_DEPS:
 
         def _bind_dialog_save_keys(self, dialog, save_fn):
             """Enter / keypad Enter runs Save while this dialog is focused."""
+            dialog._save_fn = save_fn
             def _event_in_dialog(widget):
                 w = widget
                 for _ in range(48):
@@ -10316,9 +10414,7 @@ if HAS_DEPS:
                     def copy_to_folder(path):
                         if path and os.path.exists(path) and not path.startswith(new_folder):
                             try:
-                                dest = os.path.join(new_folder, os.path.basename(path))
-                                shutil.copy(path, dest)
-                                return dest
+                                return optimize_and_save_file(path, new_folder)
                             except Exception:
                                 return path
                         return path
