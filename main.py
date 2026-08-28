@@ -7278,13 +7278,13 @@ if HAS_DEPS:
                 by = btn.winfo_rooty() + btn.winfo_height() + 4
                 screen_w = self.winfo_screenwidth() or 1600
                 screen_h = self.winfo_screenheight() or 900
-                bw = min(1500, max(1200, screen_w - 30))
-                bh = min(620, max(500, screen_h - by - 20))
+                bw = min(880, max(680, int(screen_w * 0.55)))
+                bh = min(430, max(340, min(int(screen_h * 0.45), screen_h - by - 15)))
                 max_x = screen_w - bw - 10
                 px = max(10, min(bx, max_x))
                 pop.geometry(f"{bw}x{bh}+{px}+{by}")
             except Exception:
-                pop.geometry("1400x580")
+                pop.geometry("860x420")
             
             outer = tb.Frame(pop, padding=10, bootstyle="info", borderwidth=2, relief="ridge")
             outer.pack(fill=BOTH, expand=True)
@@ -8545,19 +8545,17 @@ if HAS_DEPS:
                 child.destroy()
             self.cycle_card_widgets = {}
 
-            # Configure 6 columns and 5 rows with uniform weights
-            for c in range(6):
+            # Configure 3 uniform columns for responsive compact layout
+            for c in range(3):
                 container.columnconfigure(c, weight=1, uniform="cycle_col")
-            for r in range(5):
-                container.rowconfigure(r, weight=1, uniform="cycle_row")
 
             year_cycles = cycles_for_year(self.rev_cal_year)
             metrics_map = getattr(self, "last_cycle_metrics", {}) or {}
             
-            # Continuous 14-day cycles (26-27 per year) across 5 rows x 6 columns
+            # Continuous 14-day cycles (26-27 per year) across 3 columns with full vertical scrolling
             for idx, ck in enumerate(year_cycles):
-                row_idx = idx // 6
-                col_idx = idx % 6
+                row_idx = idx // 3
+                col_idx = idx % 3
                 bounds = cycle_bounds(ck)
                 s_b = bounds[0][5:].replace('-', '/') if bounds else ""
                 e_b = bounds[1][5:].replace('-', '/') if bounds else ""
