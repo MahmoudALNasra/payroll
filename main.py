@@ -1181,11 +1181,9 @@ class PostgresCursorProxy:
                                     except Exception:
                                         pass
                                 if _is_connectivity_error(inner_e):
-                                    enter_supabase_offline_mode(str(inner_e))
+                                    pass
                                 raise inner_e
                     else:
-                        if _is_connectivity_error(inner_e):
-                            enter_supabase_offline_mode(str(inner_e))
                         raise
             finally:
                 pass
@@ -1200,8 +1198,6 @@ class PostgresCursorProxy:
                 except Exception:
                     pass
             except Exception as inner_e:
-                if _is_connectivity_error(inner_e):
-                    enter_supabase_offline_mode(str(inner_e))
                 raise
         if needs_savepoint:
             self._description = None
@@ -1314,6 +1310,7 @@ def _is_pg_conn_alive(conn):
         cur.execute("SELECT 1")
         cur.fetchone()
         cur.close()
+        conn.commit()
         return True
     except Exception:
         return False
@@ -1321,7 +1318,7 @@ def _is_pg_conn_alive(conn):
 def _open_supabase_pg_conn():
     import pg8000.dbapi
     config = get_db_config()
-    return pg8000.dbapi.connect(
+    conn = pg8000.dbapi.connect(
         host=config.get("supabase_host"),
         port=int(config.get("supabase_port", 5432)),
         user=config.get("supabase_user", "postgres"),
@@ -1329,6 +1326,11 @@ def _open_supabase_pg_conn():
         database=config.get("supabase_database", "postgres"),
         timeout=30,
     )
+    try:
+        conn.commit()
+    except Exception:
+        pass
+    return conn
 
 def get_shared_supabase_conn(force_reconnect=False):
     """Reuse one Postgres connection for the whole app session, auto-reconnecting if dead."""
@@ -4267,11 +4269,11 @@ VAGARO_API_ENDPOINT = "https://api.vagaro.com/v1/revenue"
 AUTHORIZED_MACHINE_ID = "ANY"
 
 # While logged in on Supabase, pull the other PC's changes this often (ms).
-LIVE_SYNC_INTERVAL_MS = 2000
+LIVE_SYNC_INTERVAL_MS = 30000  # Sync every 30 seconds
 # How often to refresh the local offline cache while online (seconds).
-OFFLINE_CACHE_PULL_SEC = 4
+OFFLINE_CACHE_PULL_SEC = 30
 # Minimum seconds between forced UI reloads when cloud data is unchanged.
-LIVE_SYNC_MIN_UI_REFRESH_SEC = 4
+LIVE_SYNC_MIN_UI_REFRESH_SEC = 10
 
 # --- INTERNAL GLOBALS ---
 # Sentinel used as the sqlite3.connect() "database" argument in Supabase mode
@@ -4298,7 +4300,7 @@ def commit_and_save(conn):
         conn.commit()
         if is_supabase_offline() or using_local_cache():
             _schedule_persist_offline_cache()
-            schedule_cloud_push()
+            schedule_cloud_push(0.05)
         return
     conn.commit()
     
@@ -7075,7 +7077,7 @@ if HAS_DEPS:
             if get_db_mode() == "supabase":
                 self.lbl_live_sync = tb.Label(
                     right_frame,
-                    text="☁️ Sync every 1 min",
+                    text="☁️ Sync every 30s",
                     font=("Segoe UI", 9),
                     bootstyle="inverse-primary",
                 )
