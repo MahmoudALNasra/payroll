@@ -4574,6 +4574,56 @@ def cycle_label_with_year(cycle_key):
     """Full human label e.g. 'August 2026 - Cycle 1 (08/03 - 08/16)'."""
     return cycle_label(cycle_key)
 
+def get_formatted_cycle_choices(active_cycle_key=None, start_from_june_2026=True):
+    """
+    Generate pay cycle choices starting from June 2026 onwards for easy selection.
+    Highlights/marks the active cycle with '✓ ' so users immediately know it's selected.
+    Returns: (display_choices_list, cycle_key_map_dict, active_display_label)
+    """
+    cycle_key_map = {}
+    display_choices = []
+    
+    cur_year = datetime.today().year
+    years_to_scan = range(2026, max(cur_year + 2, 2028))
+    
+    all_candidate_cycles = []
+    for yr in years_to_scan:
+        for ck in cycles_for_year(yr):
+            bounds = cycle_bounds(ck)
+            if start_from_june_2026:
+                # Filter out cycles that end before June 1, 2026
+                if bounds and bounds[1] < "2026-06-01":
+                    continue
+            all_candidate_cycles.append(ck)
+            
+    # If active_cycle_key is before June 2026, include it at the top so existing record works
+    if active_cycle_key and active_cycle_key not in all_candidate_cycles:
+        all_candidate_cycles.insert(0, active_cycle_key)
+        
+    active_display = None
+    for ck in all_candidate_cycles:
+        raw_lbl = cycle_label_with_year(ck)
+        no_yr_lbl = cycle_label(ck)
+        
+        is_active = (ck == active_cycle_key)
+        disp_lbl = f"✓ {raw_lbl}" if is_active else f"   {raw_lbl}"
+        
+        display_choices.append(disp_lbl)
+        cycle_key_map[disp_lbl] = ck
+        cycle_key_map[raw_lbl] = ck
+        cycle_key_map[no_yr_lbl] = ck
+        cycle_key_map[f"✓ {raw_lbl}"] = ck
+        cycle_key_map[f"   {raw_lbl}"] = ck
+        cycle_key_map[ck] = ck
+        
+        if is_active:
+            active_display = disp_lbl
+            
+    if not active_display and display_choices:
+        active_display = display_choices[0]
+        
+    return display_choices, cycle_key_map, active_display
+
 def add_cycles(cycle_key, delta):
     """Return the cycle_key offset by `delta` 14-day cycles (can be negative)."""
     parsed = parse_cycle_key(cycle_key)
@@ -10761,19 +10811,11 @@ if HAS_DEPS:
             # Cycle dropdown (row 2)
             today_str = datetime.today().strftime('%Y-%m-%d')
             init_ck = cycle_for_date(today_str)
-            p_cyc = parse_cycle_key(init_ck)
-            base_yr = p_cyc[0].year if (p_cyc and hasattr(p_cyc[0], 'year')) else datetime.today().year
-            cycle_choices = []
-            cycle_key_map = {}
-            for yr in (base_yr - 1, base_yr, base_yr + 1):
-                for ck in cycles_for_year(yr):
-                    lbl = cycle_label_with_year(ck)
-                    cycle_choices.append(lbl)
-                    cycle_key_map[lbl] = ck
+            cycle_choices, cycle_key_map, active_lbl = get_formatted_cycle_choices(init_ck, start_from_june_2026=True)
 
             tb.Label(card, text=self._tr("Cycle:"), font=("Segoe UI", 12, "bold"), bootstyle="warning").grid(row=2, column=0, **pad_opt)
             cbo_cycle = tb.Combobox(card, width=38, state="readonly", values=cycle_choices, font=("Segoe UI", 11), bootstyle="warning")
-            cbo_cycle.set(cycle_label_with_year(init_ck))
+            cbo_cycle.set(active_lbl)
             cbo_cycle.grid(row=2, column=1, **ent_pad)
             self.entry_vars['Cycle'] = cbo_cycle
 
@@ -10790,9 +10832,10 @@ if HAS_DEPS:
                     if d_val:
                         ck = cycle_for_date(d_val)
                         if ck:
-                            lbl = cycle_label_with_year(ck)
-                            if lbl in cycle_choices:
-                                cbo_cycle.set(lbl)
+                            new_choices, new_map, new_lbl = get_formatted_cycle_choices(ck, start_from_june_2026=True)
+                            cbo_cycle["values"] = new_choices
+                            cycle_key_map.update(new_map)
+                            cbo_cycle.set(new_lbl)
                 except Exception:
                     pass
 
@@ -12331,25 +12374,7 @@ if HAS_DEPS:
             if not _initial_cycle:
                 _initial_cycle = cycle_for_date(cur_date_str) or cycle_for_date(datetime.today().strftime('%Y-%m-%d'))
 
-            p_cyc = parse_cycle_key(_initial_cycle)
-            base_yr = p_cyc[0].year if (p_cyc and hasattr(p_cyc[0], 'year')) else datetime.today().year
-
-            cycle_choices = []
-            cycle_key_map = {}
-            for yr in (base_yr - 1, base_yr, base_yr + 1):
-                for ck in cycles_for_year(yr):
-                    lbl_w_yr = cycle_label_with_year(ck)
-                    lbl_no_yr = cycle_label(ck)
-                    cycle_choices.append(lbl_w_yr)
-                    cycle_key_map[lbl_w_yr] = ck
-                    cycle_key_map[lbl_no_yr] = ck
-                    cycle_key_map[ck] = ck
-
-            init_lbl = cycle_label_with_year(_initial_cycle)
-            if init_lbl not in cycle_choices:
-                cycle_choices.insert(0, init_lbl)
-                cycle_key_map[init_lbl] = _initial_cycle
-
+            cycle_choices, cycle_key_map, init_lbl = get_formatted_cycle_choices(_initial_cycle, start_from_june_2026=True)
             cycle_cbo["values"] = cycle_choices
             cycle_cbo.set(init_lbl)
             try:
@@ -12373,13 +12398,14 @@ if HAS_DEPS:
                     if d_val:
                         ck = cycle_for_date(d_val)
                         if ck:
-                            lbl = cycle_label_with_year(ck)
-                            if lbl in cycle_choices:
-                                cycle_cbo.set(lbl)
-                                try:
-                                    cycle_cbo.current(cycle_choices.index(lbl))
-                                except Exception:
-                                    pass
+                            new_choices, new_map, new_lbl = get_formatted_cycle_choices(ck, start_from_june_2026=True)
+                            cycle_cbo["values"] = new_choices
+                            cycle_key_map.update(new_map)
+                            cycle_cbo.set(new_lbl)
+                            try:
+                                cycle_cbo.current(new_choices.index(new_lbl))
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -13279,17 +13305,7 @@ if HAS_DEPS:
             if not detected_cycle:
                 detected_cycle = cycle_for_date(datetime.today().strftime('%Y-%m-%d'))
 
-            cycle_key_by_label = {}
-            p_cyc = parse_cycle_key(detected_cycle)
-            base_year = p_cyc[0].year if (p_cyc and hasattr(p_cyc[0], 'year')) else datetime.today().year
-            cycle_choices = []
-            for yr in (base_year - 1, base_year, base_year + 1):
-                for ck in cycles_for_year(yr):
-                    lbl = cycle_label_with_year(ck)
-                    cycle_key_by_label[lbl] = ck
-                    cycle_key_by_label[cycle_label(ck)] = ck
-                    cycle_key_by_label[ck] = ck
-                    cycle_choices.append(lbl)
+            cycle_choices, cycle_key_by_label, active_cycle_lbl = get_formatted_cycle_choices(detected_cycle, start_from_june_2026=True)
 
             dialog = tb.Toplevel(parent_win)
             dialog.title(self._tr("Import Sales Data"))
@@ -13326,7 +13342,7 @@ if HAS_DEPS:
 
             tb.Label(step1_lf, text=self._tr("Target Cycle:"), font=("Segoe UI", 10, "bold"), bootstyle="warning").grid(row=2, column=0, **pad)
             cb_cycle = tb.Combobox(step1_lf, values=cycle_choices, width=38, state="readonly", bootstyle="warning")
-            cb_cycle.set(cycle_label_with_year(detected_cycle))
+            cb_cycle.set(active_cycle_lbl)
             cb_cycle.grid(row=2, column=1, **ent_pad)
 
             # Step 2: Match Columns
