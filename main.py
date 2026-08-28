@@ -5187,6 +5187,15 @@ def _init_db_schema(cursor, seed=True):
     # On Supabase (online), money/rate columns are TEXT so encrypted ciphertext can be stored.
     num = "TEXT" if get_db_mode() == "supabase" and not is_supabase_offline() else "REAL"
 
+    def _commit_step():
+        try:
+            if hasattr(cursor, "conn") and hasattr(cursor.conn, "commit"):
+                cursor.conn.commit()
+            elif hasattr(cursor, "connection") and hasattr(cursor.connection, "commit"):
+                cursor.connection.commit()
+        except Exception:
+            pass
+
     # 0. Create database history log table
     try:
         cursor.execute('''
@@ -5201,6 +5210,7 @@ def _init_db_schema(cursor, seed=True):
                 new_data TEXT
             )
         ''')
+        _commit_step()
     except Exception:
         pass
 
@@ -5218,48 +5228,78 @@ def _init_db_schema(cursor, seed=True):
                 details TEXT
             )
         ''')
+        _commit_step()
+    except Exception:
+        pass
+
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cloud_backups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slot_key TEXT UNIQUE,
+                backup_date TEXT,
+                slot TEXT,
+                created_at TEXT,
+                created_by TEXT,
+                payload TEXT,
+                size_bytes INTEGER
+            )
+        ''')
+        _commit_step()
     except Exception:
         pass
 
     # 1. Create Users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password TEXT
-        )
-    ''')
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT
+            )
+        ''')
+        _commit_step()
+    except Exception:
+        pass
     
     # 2. Create Employees
-    cursor.execute(f'''
-        CREATE TABLE IF NOT EXISTS employees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            first_name TEXT,
-            last_name TEXT,
-            phone TEXT,
-            email TEXT,
-            hour_rate {num},
-            percentage {num},
-            use_tiered_payout INTEGER DEFAULT 0
-        )
-    ''')
+    try:
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS employees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                first_name TEXT,
+                last_name TEXT,
+                phone TEXT,
+                email TEXT,
+                hour_rate {num},
+                percentage {num},
+                use_tiered_payout INTEGER DEFAULT 0
+            )
+        ''')
+        _commit_step()
+    except Exception:
+        pass
     
     # 3. Create Payroll Records
-    cursor.execute(f'''
-        CREATE TABLE IF NOT EXISTS payroll_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            employee_id INTEGER,
-            record_date TEXT,
-            payment_amount {num},
-            payment_type TEXT,
-            revenue {num},
-            hours {num},
-            calculation {num},
-            notes TEXT,
-            written_up TEXT,
-            FOREIGN KEY(employee_id) REFERENCES employees(id)
-        )
-    ''')
+    try:
+        cursor.execute(f'''
+            CREATE TABLE IF NOT EXISTS payroll_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id INTEGER,
+                record_date TEXT,
+                payment_amount {num},
+                payment_type TEXT,
+                revenue {num},
+                hours {num},
+                calculation {num},
+                notes TEXT,
+                written_up TEXT,
+                FOREIGN KEY(employee_id) REFERENCES employees(id)
+            )
+        ''')
+        _commit_step()
+    except Exception:
+        pass
 
     # Create Expenses table
     try:
@@ -5276,6 +5316,7 @@ def _init_db_schema(cursor, seed=True):
                 FOREIGN KEY(employee_id) REFERENCES employees(id)
             )
         ''')
+        _commit_step()
     except Exception:
         pass
 
@@ -5287,6 +5328,7 @@ def _init_db_schema(cursor, seed=True):
                 pull_timestamp TEXT
             )
         ''')
+        _commit_step()
     except Exception:
         pass
 
@@ -5297,10 +5339,12 @@ def _init_db_schema(cursor, seed=True):
         ("cv_path", "TEXT"), ("id_photo_path", "TEXT"), ("personal_photo_path", "TEXT"),
         ("vagaro_id", "TEXT"), ("use_tiered_payout", "INTEGER DEFAULT 0"),
     ])
+    _commit_step()
             
     try:
         if get_db_mode() != "supabase":
             cursor.execute("UPDATE employees SET first_name = name, last_name = '', phone='', email='' WHERE first_name IS NULL OR first_name = ''")
+            _commit_step()
     except Exception:
         pass
 
@@ -5314,6 +5358,8 @@ def _init_db_schema(cursor, seed=True):
         ("tip_given", f"{num} DEFAULT 0"),
         ("cycle_key", "TEXT"),
     ])
+    _commit_step()
+
     _add_missing_columns(cursor, "payroll_records", [
         ("location", "TEXT"),
         ("product_sales", "REAL"),
@@ -5324,6 +5370,7 @@ def _init_db_schema(cursor, seed=True):
         ("percentage", "REAL"),
         ("cycle_key", "TEXT"),
     ])
+    _commit_step()
 
     # Backfill missing cycle_key values for historical records
     try:
@@ -5341,6 +5388,7 @@ def _init_db_schema(cursor, seed=True):
                 _ck = cycle_for_date(_r_date)
             if _ck:
                 cursor.execute("UPDATE payroll_records SET cycle_key=? WHERE id=?", (_ck, _r_id))
+        _commit_step()
     except Exception:
         pass
 
@@ -5351,21 +5399,25 @@ def _init_db_schema(cursor, seed=True):
                 _ck = cycle_for_date(_e_date)
                 if _ck:
                     cursor.execute("UPDATE expenses SET cycle_key=? WHERE id=?", (_ck, _e_id))
+        _commit_step()
     except Exception:
         pass
 
     try:
         cursor.execute("CREATE TABLE IF NOT EXISTS config_locations (name TEXT PRIMARY KEY)")
+        _commit_step()
     except Exception:
         pass
 
     try:
         cursor.execute("CREATE TABLE IF NOT EXISTS config_categories (name TEXT PRIMARY KEY)")
+        _commit_step()
     except Exception:
         pass
 
     try:
         cursor.execute("CREATE TABLE IF NOT EXISTS config_payments (name TEXT PRIMARY KEY)")
+        _commit_step()
     except Exception:
         pass
 
@@ -5377,6 +5429,7 @@ def _init_db_schema(cursor, seed=True):
                 locked_at TEXT
             )
         ''')
+        _commit_step()
     except Exception:
         pass
 
@@ -5390,12 +5443,15 @@ def _init_db_schema(cursor, seed=True):
                 kind TEXT DEFAULT 'service'
             )
         ''')
+        _commit_step()
     except Exception:
         pass
 
     _add_missing_columns(cursor, "payout_tiers", [("kind", "TEXT DEFAULT 'service'")])
+    _commit_step()
     try:
         cursor.execute("UPDATE payout_tiers SET kind='service' WHERE kind IS NULL OR TRIM(kind)=''")
+        _commit_step()
     except Exception:
         pass
 
@@ -5453,6 +5509,7 @@ def _init_db_schema(cursor, seed=True):
                 created_at TEXT
             )
         ''')
+        _commit_step()
     except Exception:
         pass
 
