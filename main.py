@@ -1296,7 +1296,8 @@ def _is_dead_pg_error(exc):
         or "interfaceerror" in msg
         or "operationalerror" in msg
         or "connection reset" in msg
-        or "connection timed out" in msg
+        or "timed out" in msg
+        or "timeout" in msg
     )
 
 def _is_pg_conn_alive(conn):
@@ -1324,7 +1325,7 @@ def _open_supabase_pg_conn():
         user=config.get("supabase_user", "postgres"),
         password=config.get("supabase_password"),
         database=config.get("supabase_database", "postgres"),
-        timeout=30,
+        timeout=60,
     )
     try:
         conn.commit()
@@ -1696,7 +1697,7 @@ def enable_local_first_mode():
     return path
 
 
-def sync_local_cache_with_cloud(progress_cb=None, backfill=True):
+def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=False):
     """Flush local edits to Supabase, then download the latest copy into the local cache."""
     global _SYNC_IN_PROGRESS, _SUPABASE_OFFLINE, _LAST_SYNC_ERROR
     if get_db_mode() != "supabase":
@@ -1715,15 +1716,16 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=True):
         except Exception:
             get_shared_supabase_conn(force_reconnect=True)
         _SUPABASE_OFFLINE = False
-        try:
-            cur = get_shared_supabase_conn().cursor()
-            _init_db_schema(cur, seed=False)
-            _ensure_audit_backup_schema(cur)
-            _add_missing_columns(cur, "payout_tiers", [("kind", "TEXT DEFAULT 'service'")])
-            _add_missing_columns(cur, "expenses", [("tip_given", "TEXT DEFAULT 0")])
-            get_shared_supabase_conn().commit()
-        except Exception:
-            pass
+        if init_schema:
+            try:
+                cur = get_shared_supabase_conn().cursor()
+                _init_db_schema(cur, seed=False)
+                _ensure_audit_backup_schema(cur)
+                _add_missing_columns(cur, "payout_tiers", [("kind", "TEXT DEFAULT 'service'")])
+                _add_missing_columns(cur, "expenses", [("tip_given", "TEXT DEFAULT 0")])
+                get_shared_supabase_conn().commit()
+            except Exception:
+                pass
         if progress_cb:
             progress_cb("Uploading local changes…")
         ok, msg, _flushed = flush_offline_queue_to_cloud()
@@ -3487,9 +3489,6 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
     placeholders = ", ".join(["?"] * len(use_cols))
     id_idx = use_cols.index("id")
     queued_ids = _queued_row_ids_for_table(lcur, tbl)
-    keep_ids = set(queued_ids)
-    if tbl == "expenses":
-        keep_ids |= _active_protected_expense_ids()
 
     envelope_snaps = []
     local_envelope_ids = set()
@@ -3517,15 +3516,23 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
 
     taken_ids = set(cloud_ids) | set(local_envelope_ids)
 
+    # 1. Clean up local records deleted from cloud (except envelopes & un-pushed local queue)
+    if cloud_ids:
+        try:
+            lcur.execute(f"SELECT id FROM {tbl}")
+            local_all_ids = {r[0] for r in (lcur.fetchall() or []) if r and r[0] is not None}
+            del_ids = local_all_ids - cloud_ids - queued_ids - local_envelope_ids
+            for did in del_ids:
+                lcur.execute(f"DELETE FROM {tbl} WHERE id = ?", (did,))
+        except Exception:
+            pass
+
     for row in packed_rows or []:
         row = list(row)
         rid = _row_id_value(use_cols, row)
         cloud_is_envelope = tbl == "expenses" and is_envelope_category(
             _row_category(use_cols, row)
         )
-        # If a local cash envelope occupies this id, move it so the incoming
-        # expense from the other PC is not thrown away — and never restore
-        # the envelope back on top of that expense.
         if (
             tbl == "expenses"
             and rid is not None
@@ -3542,9 +3549,6 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
                 local_envelope_ids.discard(rid)
                 local_envelope_ids.add(new_id)
                 taken_ids.add(new_id)
-                if rid in keep_ids:
-                    keep_ids.discard(rid)
-                    keep_ids.add(new_id)
                 if rid in queued_ids:
                     queued_ids.discard(rid)
                     queued_ids.add(new_id)
@@ -3553,7 +3557,7 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
                         snap[id_idx] = new_id
             except Exception:
                 pass
-        if rid is not None and rid in keep_ids:
+        if rid is not None and rid in queued_ids:
             continue
         lcur.execute(
             f"INSERT OR REPLACE INTO {tbl} ({col_list}) VALUES ({placeholders})",
@@ -3775,13 +3779,38 @@ def cloud_data_fingerprint():
                 ) & 0x7FFFFFFF
         except Exception:
             pass
-        cur.execute("SELECT COUNT(*) FROM employees")
-        em = cur.fetchone() or (0,)
+        cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM employees")
+        em = cur.fetchone() or (0, 0)
         try:
             cur.execute("SELECT COUNT(*) FROM cash_month_locks")
             locks = cur.fetchone() or (0,)
         except Exception:
             locks = (0,)
+        try:
+            cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM shop_documents")
+            docs = cur.fetchone() or (0, 0)
+        except Exception:
+            docs = (0, 0)
+        try:
+            cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM payout_tiers")
+            tiers = cur.fetchone() or (0, 0)
+        except Exception:
+            tiers = (0, 0)
+        try:
+            cur.execute("SELECT COUNT(*) FROM config_locations")
+            locs = cur.fetchone() or (0,)
+        except Exception:
+            locs = (0,)
+        try:
+            cur.execute("SELECT COUNT(*) FROM config_categories")
+            cats = cur.fetchone() or (0,)
+        except Exception:
+            cats = (0,)
+        try:
+            cur.execute("SELECT COUNT(*) FROM config_payments")
+            pmts = cur.fetchone() or (0,)
+        except Exception:
+            pmts = (0,)
         conn.close()
         return (
             int(p[0] or 0),
@@ -3793,7 +3822,14 @@ def cloud_data_fingerprint():
             round(to_float(e[3], 0.0), 2),
             int(sig),
             int(em[0] or 0),
+            int(em[1] or 0),
             int(locks[0] or 0),
+            int(docs[0] or 0),
+            int(docs[1] or 0),
+            int(tiers[0] or 0),
+            int(locs[0] or 0),
+            int(cats[0] or 0),
+            int(pmts[0] or 0),
         )
     except Exception:
         return None
@@ -6284,7 +6320,7 @@ if HAS_DEPS:
 
                     # 2. In Supabase mode, synchronize local cache with cloud ahead of time
                     if get_db_mode() == "supabase":
-                        ok, msg = sync_local_cache_with_cloud(backfill=True)
+                        ok, msg = sync_local_cache_with_cloud(backfill=True, init_schema=True)
                         self._prelogin_sync_result["ok"] = ok
                         self._prelogin_sync_result["msg"] = msg
                         try:
@@ -7707,7 +7743,7 @@ if HAS_DEPS:
                             after = None
                             try:
                                 before = cloud_data_fingerprint()
-                                ok, msg = sync_local_cache_with_cloud(backfill=True)
+                                ok, msg = sync_local_cache_with_cloud(backfill=False, init_schema=False)
                                 after = cloud_data_fingerprint()
                                 changed = after != before or after != getattr(
                                     self, "_last_sync_fingerprint", None
