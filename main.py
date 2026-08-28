@@ -1,4 +1,3 @@
-
 """A standalone local Payroll Application using ttkbootstrap with AES Encryption."""
 
 import warnings
@@ -1100,7 +1099,16 @@ class PostgresCursorProxy:
         # Savepoints for any mutating statement so one failure cannot abort
         # the shared connection (Postgres "commands ignored until end of transaction").
         q0 = translated_query.lstrip().upper()
-        needs_savepoint = not (q0.startswith("SELECT") or q0.startswith("WITH") or q0.startswith("PRAGMA"))
+        needs_savepoint = not (
+            q0.startswith("SELECT")
+            or q0.startswith("WITH")
+            or q0.startswith("PRAGMA")
+            or q0.startswith("CREATE")
+            or q0.startswith("ALTER")
+            or q0.startswith("DROP")
+            or q0.startswith("SET")
+            or q0.startswith("SHOW")
+        )
         self._pending_rows = []
 
         def _buffer_results():
@@ -1116,17 +1124,16 @@ class PostgresCursorProxy:
         if needs_savepoint:
             self._savepoint_seq += 1
             sp_name = f"sp_payroll_{self._savepoint_seq}"
-            ctrl = self.conn.cursor()
             try:
-                ctrl.execute(f"SAVEPOINT {sp_name}")
+                self.cursor.execute(f"SAVEPOINT {sp_name}")
                 try:
                     self.cursor.execute(translated_query, encrypted_p or ())
                     _buffer_results()
-                    ctrl.execute(f"RELEASE SAVEPOINT {sp_name}")
+                    self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
                 except Exception as inner_e:
                     try:
-                        ctrl.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
-                        ctrl.execute(f"RELEASE SAVEPOINT {sp_name}")
+                        self.cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}")
+                        self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}")
                     except Exception:
                         try:
                             self.conn.rollback()
@@ -1144,15 +1151,15 @@ class PostgresCursorProxy:
                     if needs_type_fix and get_db_mode() == "supabase" and not is_supabase_offline():
                         try:
                             ensure_numeric_columns_are_text()
-                            ctrl.execute(f"SAVEPOINT {sp_name}_r")
+                            self.cursor.execute(f"SAVEPOINT {sp_name}_r")
                             self.cursor.execute(translated_query, encrypted_p or ())
                             _buffer_results()
-                            ctrl.execute(f"RELEASE SAVEPOINT {sp_name}_r")
+                            self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}_r")
                             # recovered after migrating column types
                         except Exception as retry_e:
                             try:
-                                ctrl.execute(f"ROLLBACK TO SAVEPOINT {sp_name}_r")
-                                ctrl.execute(f"RELEASE SAVEPOINT {sp_name}_r")
+                                self.cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}_r")
+                                self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}_r")
                             except Exception:
                                 try:
                                     self.conn.rollback()
@@ -1160,14 +1167,14 @@ class PostgresCursorProxy:
                                     pass
                             # Last resort: write plaintext numbers if TEXT migration is blocked
                             try:
-                                ctrl.execute(f"SAVEPOINT {sp_name}_p")
+                                self.cursor.execute(f"SAVEPOINT {sp_name}_p")
                                 self.cursor.execute(translated_query, params or ())
                                 _buffer_results()
-                                ctrl.execute(f"RELEASE SAVEPOINT {sp_name}_p")
+                                self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}_p")
                             except Exception:
                                 try:
-                                    ctrl.execute(f"ROLLBACK TO SAVEPOINT {sp_name}_p")
-                                    ctrl.execute(f"RELEASE SAVEPOINT {sp_name}_p")
+                                    self.cursor.execute(f"ROLLBACK TO SAVEPOINT {sp_name}_p")
+                                    self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}_p")
                                 except Exception:
                                     try:
                                         self.conn.rollback()
@@ -1181,10 +1188,7 @@ class PostgresCursorProxy:
                             enter_supabase_offline_mode(str(inner_e))
                         raise
             finally:
-                try:
-                    ctrl.close()
-                except Exception:
-                    pass
+                pass
         else:
             try:
                 self.cursor.execute(translated_query, encrypted_p or ())
@@ -1377,6 +1381,8 @@ OFFLINE_SYNC_TABLES = (
     "vagaro_pull_logs",
     "payout_tiers",
     "cash_month_locks",
+    "user_action_log",
+    "database_history_log",
 )
 _LOCAL_FIRST = False
 _SYNC_IN_PROGRESS = False
@@ -1387,6 +1393,33 @@ _persist_lock = threading.Lock()
 _LAST_SYNC_ERROR = ""
 _LOCAL_PROTECTED_EXPENSE_IDS = set()
 _SKIP_EXPENSE_PULL_UNTIL = 0.0
+
+
+def save_local_daily_snapshot():
+    """Create a local encrypted backup snapshot for today so records are always preserved on disk."""
+    try:
+        app_dir = get_app_dir()
+        backups_dir = os.path.join(app_dir, "local_daily_backups")
+        os.makedirs(backups_dir, exist_ok=True)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        daily_backup_file = os.path.join(backups_dir, f"payroll_backup_{today_str}.enc")
+
+        if os.path.exists(CLOUD_CACHE_FILE):
+            import shutil
+            shutil.copy2(CLOUD_CACHE_FILE, daily_backup_file)
+
+        # Keep latest 60 daily backups on disk
+        existing = sorted(
+            [f for f in os.listdir(backups_dir) if f.startswith("payroll_backup_") and f.endswith(".enc")]
+        )
+        if len(existing) > 60:
+            for old_f in existing[:-60]:
+                try:
+                    os.remove(os.path.join(backups_dir, old_f))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def protect_local_expense_id(row_id):
@@ -1441,7 +1474,7 @@ def _sync_log(msg):
 
 
 def _persist_offline_cache():
-    """Encrypt the offline working SQLite file to disk."""
+    """Encrypt the offline working SQLite file to disk and update daily local snapshot."""
     global _OFFLINE_CACHE_CIPHER, _OFFLINE_CACHE_SALT
     path = OFFLINE_TEMP_DB_PATH
     if not path or not os.path.exists(path):
@@ -1462,6 +1495,8 @@ def _persist_offline_cache():
         encrypted = _OFFLINE_CACHE_CIPHER.encrypt(data)
         with open(CLOUD_CACHE_FILE, "wb") as f:
             f.write(_OFFLINE_CACHE_SALT + encrypted)
+        # Save timestamped daily snapshot on disk
+        save_local_daily_snapshot()
     except Exception:
         pass
 
@@ -4697,7 +4732,15 @@ def upload_local_database_to_supabase(progress_cb=None):
         # Build schema via app helpers
         cur = pg_proxy.cursor()
         _init_db_schema(cur, seed=False)
+        try:
+            pg_proxy.commit()
+        except Exception:
+            pass
         ensure_numeric_columns_are_text()
+        try:
+            pg_proxy.commit()
+        except Exception:
+            pass
 
         # Connect fresh for clean bulk copy transaction
         pg_proxy = get_shared_supabase_conn(force_reconnect=True)
@@ -4705,6 +4748,7 @@ def upload_local_database_to_supabase(progress_cb=None):
         raw = pg.cursor()
 
         tables = [
+            "user_action_log",
             "database_history_log",
             "payroll_records",
             "expenses",
@@ -4717,6 +4761,7 @@ def upload_local_database_to_supabase(progress_cb=None):
             "config_locations",
             "config_categories",
             "config_payments",
+            "cloud_backups",
         ]
 
         if progress_cb:
@@ -4731,6 +4776,11 @@ def upload_local_database_to_supabase(progress_cb=None):
                     raw = pg.cursor()
                     try:
                         raw.execute(f"DELETE FROM {tbl}")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        pg.rollback()
                     except Exception:
                         pass
         try:
@@ -4750,6 +4800,8 @@ def upload_local_database_to_supabase(progress_cb=None):
             "payout_tiers",
             "cash_month_locks",
             "vagaro_pull_logs",
+            "user_action_log",
+            "database_history_log",
         ]
 
         lite_cur = lite_conn.cursor()
