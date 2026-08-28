@@ -4730,7 +4730,7 @@ def upload_local_database_to_supabase(progress_cb=None):
             progress_cb("Connecting to Supabase...")
         pg_proxy = get_shared_supabase_conn(force_reconnect=True)
         
-        # Build schema via app helpers
+        # 1. Build schema via app helpers
         cur = pg_proxy.cursor()
         _init_db_schema(cur, seed=False)
         _ensure_audit_backup_schema(cur)
@@ -4744,152 +4744,147 @@ def upload_local_database_to_supabase(progress_cb=None):
         except Exception:
             pass
 
-        # Connect fresh for clean bulk copy transaction
-        pg_proxy = get_shared_supabase_conn(force_reconnect=True)
-        pg = pg_proxy.conn
-        raw = pg.cursor()
-
-        tables = [
-            "user_action_log",
-            "database_history_log",
-            "payroll_records",
-            "expenses",
-            "shop_documents",
-            "payout_tiers",
-            "cash_month_locks",
-            "vagaro_pull_logs",
-            "employees",
-            "users",
-            "config_locations",
-            "config_categories",
-            "config_payments",
-            "cloud_backups",
-        ]
-
-        if progress_cb:
-            progress_cb("Clearing cloud tables...")
-        for tbl in tables:
-            try:
-                raw.execute(f"DELETE FROM {tbl}")
-            except Exception as e:
-                if _is_dead_pg_error(e):
-                    pg_proxy = get_shared_supabase_conn(force_reconnect=True)
-                    pg = pg_proxy.conn
-                    raw = pg.cursor()
-                    try:
-                        raw.execute(f"DELETE FROM {tbl}")
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        pg.rollback()
-                    except Exception:
-                        pass
+        # 2. Open dedicated connection for fast bulk copy
+        db_conn = _open_supabase_pg_conn()
         try:
-            pg.commit()
-        except Exception:
-            pass
+            db_cur = db_conn.cursor()
 
-        copy_order = [
-            "users",
-            "employees",
-            "config_locations",
-            "config_categories",
-            "config_payments",
-            "payroll_records",
-            "expenses",
-            "shop_documents",
-            "payout_tiers",
-            "cash_month_locks",
-            "vagaro_pull_logs",
-            "user_action_log",
-            "database_history_log",
-        ]
+            tables_to_clear = [
+                "user_action_log",
+                "database_history_log",
+                "payroll_records",
+                "expenses",
+                "shop_documents",
+                "payout_tiers",
+                "cash_month_locks",
+                "vagaro_pull_logs",
+                "employees",
+                "users",
+                "config_locations",
+                "config_categories",
+                "config_payments",
+                "cloud_backups",
+            ]
 
-        lite_cur = lite_conn.cursor()
-        for tbl in copy_order:
             if progress_cb:
-                progress_cb(f"Uploading {tbl}...")
-            try:
-                lite_cur.execute(f"PRAGMA table_info({tbl})")
-                cols = [r[1] for r in lite_cur.fetchall()]
-                if not cols:
-                    continue
-                lite_cur.execute(f"SELECT * FROM {tbl}")
-                rows = lite_cur.fetchall()
-                if not rows:
-                    continue
-
-                # Query cloud columns with reconnect retry
-                cloud_cols = set()
+                progress_cb("Clearing cloud tables...")
+            for tbl in tables_to_clear:
                 try:
-                    raw.execute(
-                        "SELECT column_name FROM information_schema.columns "
-                        "WHERE table_schema = 'public' AND table_name = %s",
-                        (tbl,),
-                    )
-                    cloud_cols = {r[0] for r in (raw.fetchall() or [])}
-                except Exception as e:
-                    if _is_dead_pg_error(e):
-                        pg_proxy = get_shared_supabase_conn(force_reconnect=True)
-                        pg = pg_proxy.conn
-                        raw = pg.cursor()
-                        raw.execute(
-                            "SELECT column_name FROM information_schema.columns "
-                            "WHERE table_schema = 'public' AND table_name = %s",
-                            (tbl,),
-                        )
-                        cloud_cols = {r[0] for r in (raw.fetchall() or [])}
-                    else:
-                        raise
-
-                use_cols = [c for c in cols if c in cloud_cols]
-                if not use_cols:
-                    continue
-                col_indexes = [cols.index(c) for c in use_cols]
-                col_list = ", ".join(use_cols)
-                placeholders = ", ".join(["%s"] * len(use_cols))
-                insert_sql = f"INSERT INTO {tbl} ({col_list}) VALUES ({placeholders})"
-                for row in rows:
-                    cleaned = []
-                    for idx, col_name in zip(col_indexes, use_cols):
-                        val = row[idx]
-                        # Normalize any legacy ciphertext, then encrypt for cloud at-rest storage
-                        if isinstance(val, str) and (val.startswith("enc:") or val.startswith("denc:")):
-                            val = decrypt_val(val)
-                        if col_name.lower() in ALL_ENCRYPT_COLS:
-                            cleaned.append(_encrypt_for_col(col_name, val))
-                        else:
-                            cleaned.append(val)
+                    db_cur.execute(f"DELETE FROM {tbl}")
+                    db_conn.commit()
+                except Exception:
                     try:
-                        raw.execute(insert_sql, cleaned)
-                    except Exception as ins_e:
-                        if _is_dead_pg_error(ins_e):
-                            pg_proxy = get_shared_supabase_conn(force_reconnect=True)
-                            pg = pg_proxy.conn
-                            raw = pg.cursor()
-                            raw.execute(insert_sql, cleaned)
-                        else:
-                            raise
-                if "id" in use_cols:
-                    try:
-                        raw.execute(
-                            f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
-                            f"COALESCE((SELECT MAX(id) FROM {tbl}), 1))"
-                        )
+                        db_conn.rollback()
                     except Exception:
                         pass
-                try:
-                    pg.commit()
-                except Exception:
-                    pass
-            except Exception as e:
-                raise RuntimeError(f"Failed uploading table {tbl}: {e}") from e
 
-        try:
-            raw.close()
-        except Exception:
-            pass
+            copy_order = [
+                "users",
+                "employees",
+                "config_locations",
+                "config_categories",
+                "config_payments",
+                "payroll_records",
+                "expenses",
+                "shop_documents",
+                "payout_tiers",
+                "cash_month_locks",
+                "vagaro_pull_logs",
+                "user_action_log",
+                "database_history_log",
+            ]
+
+            lite_cur = lite_conn.cursor()
+            for tbl in copy_order:
+                if progress_cb:
+                    progress_cb(f"Uploading {tbl}...")
+                try:
+                    lite_cur.execute(f"PRAGMA table_info({tbl})")
+                    cols = [r[1] for r in lite_cur.fetchall()]
+                    if not cols:
+                        continue
+                    lite_cur.execute(f"SELECT * FROM {tbl}")
+                    rows = lite_cur.fetchall()
+                    if not rows:
+                        continue
+
+                    # Query cloud columns with reconnect retry
+                    cloud_cols = set()
+                    for _attempt in range(3):
+                        try:
+                            db_cur.execute(
+                                "SELECT column_name FROM information_schema.columns "
+                                "WHERE table_schema = 'public' AND table_name = %s",
+                                (tbl,),
+                            )
+                            cloud_cols = {r[0] for r in (db_cur.fetchall() or [])}
+                            break
+                        except Exception as e:
+                            if _is_dead_pg_error(e):
+                                try:
+                                    db_conn.close()
+                                except Exception:
+                                    pass
+                                db_conn = _open_supabase_pg_conn()
+                                db_cur = db_conn.cursor()
+                            else:
+                                raise
+
+                    use_cols = [c for c in cols if c in cloud_cols]
+                    if not use_cols:
+                        continue
+                    col_indexes = [cols.index(c) for c in use_cols]
+                    col_list = ", ".join(use_cols)
+                    placeholders = ", ".join(["%s"] * len(use_cols))
+                    insert_sql = f"INSERT INTO {tbl} ({col_list}) VALUES ({placeholders})"
+                    for row in rows:
+                        cleaned = []
+                        for idx, col_name in zip(col_indexes, use_cols):
+                            val = row[idx]
+                            # Normalize any legacy ciphertext, then encrypt for cloud at-rest storage
+                            if isinstance(val, str) and (val.startswith("enc:") or val.startswith("denc:")):
+                                val = decrypt_val(val)
+                            if col_name.lower() in ALL_ENCRYPT_COLS:
+                                cleaned.append(_encrypt_for_col(col_name, val))
+                            else:
+                                cleaned.append(val)
+                        for _ins_attempt in range(3):
+                            try:
+                                db_cur.execute(insert_sql, cleaned)
+                                break
+                            except Exception as ins_e:
+                                if _is_dead_pg_error(ins_e):
+                                    try:
+                                        db_conn.close()
+                                    except Exception:
+                                        pass
+                                    db_conn = _open_supabase_pg_conn()
+                                    db_cur = db_conn.cursor()
+                                else:
+                                    raise
+                    if "id" in use_cols:
+                        try:
+                            db_cur.execute(
+                                f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
+                                f"COALESCE((SELECT MAX(id) FROM {tbl}), 1))"
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        db_conn.commit()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    raise RuntimeError(f"Failed uploading table {tbl}: {e}") from e
+        finally:
+            try:
+                db_cur.close()
+            except Exception:
+                pass
+            try:
+                db_conn.close()
+            except Exception:
+                pass
         if progress_cb:
             progress_cb("Cleaning duplicates...")
         cleanup_supabase_duplicates()
