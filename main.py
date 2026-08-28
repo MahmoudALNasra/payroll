@@ -4073,12 +4073,15 @@ def ensure_document_file_available(filepath):
     # If not found locally and cloud mode is active, try to fetch from Supabase
     if get_db_mode() == "supabase" and not is_supabase_offline():
         base_name = os.path.basename(str(filepath).replace("\\", "/"))
+        stem, ext = os.path.splitext(base_name)
+        lookup_keys = [base_name, f"{stem}.jpg", f"{stem}.jpeg", f"{stem}.png", f"{stem}.pdf", stem]
+        placeholders = ", ".join(["?"] * len(lookup_keys))
         try:
             pg = get_shared_supabase_conn()
             cur = pg.cursor()
             cur.execute(
-                "SELECT file_data FROM cloud_file_storage WHERE file_name = ? OR file_key = ? LIMIT 1",
-                (base_name, base_name)
+                f"SELECT file_data FROM cloud_file_storage WHERE file_name IN ({placeholders}) OR file_key IN ({placeholders}) LIMIT 1",
+                tuple(lookup_keys + lookup_keys)
             )
             row = cur.fetchone()
             if row and row[0]:
@@ -8046,13 +8049,6 @@ if HAS_DEPS:
                 )
                 return
             path = doc.get("file_path") or ""
-            if not path or not os.path.isfile(path):
-                messagebox.showerror(
-                    "Error",
-                    self._tr("Document file was not found."),
-                    parent=parent,
-                )
-                return
             self.preview_expense_document(path, parent=parent)
 
         def _shop_files_delete_selected(self):
@@ -11161,12 +11157,7 @@ if HAS_DEPS:
                 filename = listbox.item(sel[0])['values'][0]
                 filepath = os.path.join(folder, filename)
                 try:
-                    if platform.system() == "Windows":
-                        os.startfile(filepath)
-                    elif platform.system() == "Darwin":
-                        subprocess.call(["open", filepath])
-                    else:
-                        subprocess.call(["xdg-open", filepath])
+                    open_path_with_default_app(filepath)
                 except Exception as e:
                     messagebox.showerror("Error", str(e), parent=win)
 
