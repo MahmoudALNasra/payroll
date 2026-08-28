@@ -5275,6 +5275,80 @@ def ensure_all_supabase_tables(db_conn):
                 pass
 
 
+def sync_all_local_files_to_cloud(progress_cb=None):
+    """Scan Expense_Documents, Shop_Files, and Employee_Folders and upload all documents to cloud_file_storage in Supabase."""
+    if get_db_mode() != "supabase" or is_supabase_offline():
+        return False, "Cloud is offline"
+    
+    app_dir = get_app_dir()
+    folders_to_scan = [
+        os.path.join(app_dir, "Expense_Documents"),
+        os.path.join(app_dir, "Shop_Files"),
+        os.path.join(app_dir, "Employee_Folders"),
+    ]
+    
+    all_files = []
+    for fld in folders_to_scan:
+        if os.path.exists(fld):
+            for root, _, files in os.walk(fld):
+                for fname in files:
+                    full_p = os.path.join(root, fname)
+                    if os.path.isfile(full_p) and not fname.startswith(".") and not fname.endswith(".db"):
+                        all_files.append(full_p)
+                        
+    if not all_files:
+        return True, "No local files found to sync"
+        
+    try:
+        db_conn = _open_supabase_pg_conn(timeout=15)
+        cur = db_conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cloud_file_storage (
+                file_key TEXT PRIMARY KEY,
+                file_name TEXT,
+                file_data TEXT,
+                file_size INTEGER,
+                uploaded_at TEXT
+            )
+            """
+        )
+        db_conn.commit()
+        
+        total = len(all_files)
+        for idx, fpath in enumerate(all_files):
+            if progress_cb:
+                progress_cb(f"Syncing file {idx + 1}/{total}: {os.path.basename(fpath)}")
+            try:
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                import base64
+                token = base64.b64encode(data).decode("ascii")
+                base_name = os.path.basename(fpath)
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO cloud_file_storage (file_key, file_name, file_data, file_size, uploaded_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (file_key) DO UPDATE SET file_data = EXCLUDED.file_data, uploaded_at = EXCLUDED.uploaded_at
+                    """,
+                    (base_name, base_name, token, len(data), now)
+                )
+                db_conn.commit()
+            except Exception:
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
+        try:
+            db_conn.close()
+        except Exception:
+            pass
+        return True, f"Successfully synced {total} files to cloud"
+    except Exception as e:
+        return False, str(e)
+
+
 def upload_local_database_to_supabase(progress_cb=None):
     """
     First-sync: replace cloud tables with the contents of the local encrypted DB.
@@ -5440,6 +5514,12 @@ def upload_local_database_to_supabase(progress_cb=None):
                 db_conn.close()
             except Exception:
                 pass
+        if progress_cb:
+            progress_cb("Syncing documents & photos to cloud...")
+        try:
+            sync_all_local_files_to_cloud(progress_cb=progress_cb)
+        except Exception:
+            pass
         if progress_cb:
             progress_cb("Finalizing upload...")
         try:
@@ -9811,10 +9891,24 @@ if HAS_DEPS:
                     self.hide_busy()
                     self.show_app_error("Cleanup Failed", e, parent=dialog)
             
+            def do_sync_files():
+                self.show_busy("Syncing documents to cloud…")
+                try:
+                    ok, msg = sync_all_local_files_to_cloud()
+                    self.hide_busy()
+                    if ok:
+                        messagebox.showinfo("Files Synced", str(msg), parent=dialog)
+                    else:
+                        messagebox.showerror("Sync Failed", str(msg), parent=dialog)
+                except Exception as e:
+                    self.hide_busy()
+                    messagebox.showerror("Sync Error", str(e), parent=dialog)
+
             btn_row = tb.Frame(tab_remote)
             btn_row.pack(pady=10, fill=X)
             tb.Button(btn_row, text=self._tr("Verify & Save Configuration"), bootstyle="success", command=test_and_save_supabase).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="Upload Local → Cloud", bootstyle="warning", command=do_upload_local_to_cloud).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_row, text="📁 Sync Local Files → Cloud", bootstyle="info", command=do_sync_files).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="Clean Up Cloud Duplicates", bootstyle="secondary", command=do_cleanup_cloud).pack(side=LEFT)
             
             # --- TAB 3: ACTIVITY LOG & BACKUPS ---
