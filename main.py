@@ -1362,6 +1362,13 @@ def _clean_supabase_config(config):
         host = h_parts[0]
         port = h_parts[1]
 
+    # Auto-fix missing db. prefix for Supabase database hosts
+    if host.endswith(".supabase.co") and not host.startswith("db."):
+        host = "db." + host
+    elif "." not in host and len(host) >= 12 and not host.startswith("db."):
+        # Bare project reference pasted
+        host = f"db.{host}.supabase.co"
+
     # Clean port
     try:
         port = int(port)
@@ -1375,7 +1382,7 @@ def _clean_supabase_config(config):
     cfg["supabase_database"] = database
     return cfg
 
-def _open_supabase_pg_conn():
+def _open_supabase_pg_conn(timeout=6):
     import pg8000.dbapi
     raw_config = get_db_config()
     config = _clean_supabase_config(raw_config)
@@ -1385,7 +1392,7 @@ def _open_supabase_pg_conn():
         user=config.get("supabase_user", "postgres"),
         password=config.get("supabase_password"),
         database=config.get("supabase_database", "postgres"),
-        timeout=60,
+        timeout=timeout,
     )
     try:
         conn.commit()
@@ -1393,25 +1400,27 @@ def _open_supabase_pg_conn():
         pass
     return conn
 
-def get_shared_supabase_conn(force_reconnect=False):
+def get_shared_supabase_conn(force_reconnect=False, timeout=6):
     """Reuse one Postgres connection for the whole app session, auto-reconnecting if dead."""
     global _SUPABASE_PG_CONN
-    with _SUPABASE_LOCK:
-        if force_reconnect and _SUPABASE_PG_CONN is not None:
-            try:
-                _SUPABASE_PG_CONN.close()
-            except Exception:
-                pass
-            _SUPABASE_PG_CONN = None
-        if _SUPABASE_PG_CONN is None or not _is_pg_conn_alive(_SUPABASE_PG_CONN):
+    if force_reconnect and _SUPABASE_PG_CONN is not None:
+        with _SUPABASE_LOCK:
             if _SUPABASE_PG_CONN is not None:
                 try:
                     _SUPABASE_PG_CONN.close()
                 except Exception:
                     pass
                 _SUPABASE_PG_CONN = None
-            _SUPABASE_PG_CONN = _open_supabase_pg_conn()
-        return PostgresConnectionProxy(_SUPABASE_PG_CONN, shared=True)
+    if _SUPABASE_PG_CONN is None or not _is_pg_conn_alive(_SUPABASE_PG_CONN):
+        new_conn = _open_supabase_pg_conn(timeout=timeout)
+        with _SUPABASE_LOCK:
+            if _SUPABASE_PG_CONN is not None:
+                try:
+                    _SUPABASE_PG_CONN.close()
+                except Exception:
+                    pass
+            _SUPABASE_PG_CONN = new_conn
+    return PostgresConnectionProxy(_SUPABASE_PG_CONN, shared=True)
 
 def close_shared_supabase_conn():
     global _SUPABASE_PG_CONN
@@ -1593,7 +1602,7 @@ def schedule_cloud_push(delay=0.08):
         _push_timer = None
         if get_db_mode() != "supabase":
             return
-        acquired = _SYNC_LOCK.acquire(blocking=True, timeout=25)
+        acquired = _SYNC_LOCK.acquire(blocking=False)
         if not acquired:
             if offline_pending_count():
                 schedule_cloud_push(2.0)
@@ -5220,16 +5229,12 @@ def init_db(defer_heavy_migrations=False):
     global SUPABASE_HISTORY_ENABLED
     history_prev = SUPABASE_HISTORY_ENABLED
     SUPABASE_HISTORY_ENABLED = False
-    conn = sqlite3.connect(TEMP_DB_PATH)
+    path = TEMP_DB_PATH or ensure_offline_cache_open()
+    conn = _original_sqlite3_connect(path, timeout=10)
     cursor = conn.cursor()
     try:
         _init_db_schema(cursor, seed=True)
-        commit_and_save(conn)
-        if get_db_mode() == "supabase" and not defer_heavy_migrations:
-            try:
-                migrate_supabase_encryption()
-            except Exception:
-                pass
+        conn.commit()
     finally:
         SUPABASE_HISTORY_ENABLED = history_prev
         conn.close()
@@ -7137,20 +7142,6 @@ if HAS_DEPS:
             
             self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
             self.start_live_sync()
-            # Defer heavy cloud migrations / offline cache refresh so login stays fast.
-            if get_db_mode() == "supabase":
-                self.after(800, self._schedule_deferred_cloud_maintenance)
-
-        def _schedule_deferred_cloud_maintenance(self):
-            import threading
-
-            def work():
-                try:
-                    run_deferred_cloud_maintenance()
-                except Exception:
-                    pass
-
-            threading.Thread(target=work, daemon=True).start()
 
         def open_shop_files_window(self):
             """Single-window shop document archive: pick location → browse/add files."""
