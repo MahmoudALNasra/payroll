@@ -1715,9 +1715,10 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=True):
         _SUPABASE_OFFLINE = False
         try:
             cur = get_shared_supabase_conn().cursor()
+            _init_db_schema(cur, seed=False)
+            _ensure_audit_backup_schema(cur)
             _add_missing_columns(cur, "payout_tiers", [("kind", "TEXT DEFAULT 'service'")])
             _add_missing_columns(cur, "expenses", [("tip_given", "TEXT DEFAULT 0")])
-            _ensure_audit_backup_schema(cur)
             get_shared_supabase_conn().commit()
         except Exception:
             pass
@@ -4732,6 +4733,7 @@ def upload_local_database_to_supabase(progress_cb=None):
         # Build schema via app helpers
         cur = pg_proxy.cursor()
         _init_db_schema(cur, seed=False)
+        _ensure_audit_backup_schema(cur)
         try:
             pg_proxy.commit()
         except Exception:
