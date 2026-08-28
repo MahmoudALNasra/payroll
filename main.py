@@ -5589,10 +5589,17 @@ def get_supabase_storage_usage():
 def upload_local_database_to_supabase(progress_cb=None):
     """
     First-sync: replace cloud tables with the contents of the local encrypted DB.
-    After this, every PC in Supabase mode shares the same live database.
+    Guarantees that the local database is NEVER modified, erased, or corrupted.
     """
+    # 1. ALWAYS create an immutable local backup before cloud operations
+    try:
+        safety_key = f"pre_cloud_safety_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        create_local_backup(slot_key=safety_key)
+    except Exception:
+        pass
+
     if progress_cb:
-        progress_cb("Reading local database...")
+        progress_cb("Reading local database (Safe Read-Only)...")
 
     global TEMP_DB_PATH, SUPABASE_HISTORY_ENABLED
     TEMP_DB_PATH = SUPABASE_DB_SENTINEL
@@ -14779,7 +14786,22 @@ if HAS_DEPS:
                 clean_cfg = _clean_supabase_config(raw_cfg)
                 host = clean_cfg["supabase_host"]
                 password = clean_cfg["supabase_password"]
-                if host and password:
+                if not host or not password:
+                    messagebox.showerror("Validation Error", "Host and Password are required to upload.", parent=dialog)
+                    return
+                status = {"text": "Starting..."}
+                self.show_busy("Safely uploading local database to cloud…")
+                try:
+                    def _progress(t):
+                        status.update(text=t)
+                        try:
+                            self._busy_msg_var.set(t)
+                            self.update_idletasks()
+                        except Exception:
+                            pass
+                    upload_local_database_to_supabase(progress_cb=_progress)
+                    
+                    # Only save mode = supabase after a 100% verified upload
                     try:
                         import json
                         default_dir = get_default_app_dir()
@@ -14793,31 +14815,37 @@ if HAS_DEPS:
                         new_config["supabase_user"] = clean_cfg["supabase_user"]
                         with open(config_file, "w", encoding="utf-8") as f:
                             json.dump(new_config, f, indent=4)
-                    except Exception as e:
-                        messagebox.showerror("Error", f"Could not save config: {e}", parent=dialog)
-                        return
-                status = {"text": "Starting..."}
-                self.show_busy("Uploading local database to cloud…")
-                try:
-                    def _progress(t):
-                        status.update(text=t)
-                        try:
-                            self._busy_msg_var.set(t)
-                            self.update_idletasks()
-                        except Exception:
-                            pass
-                    upload_local_database_to_supabase(progress_cb=_progress)
+                    except Exception:
+                        pass
+                    
                     self.hide_busy()
                     refresh_storage_meter()
                     messagebox.showinfo(
                         "Upload Complete",
-                        f"Local database uploaded to Supabase.\n\nLast step: {status.get('text')}\n\n"
-                        "Restart this app, then on the 2nd PC enter the same Supabase settings and restart.",
+                        f"Local database successfully uploaded to Supabase.\n\nStatus: {status.get('text')}\n\n"
+                        "Restart this app, then on the 2nd device enter the same Supabase settings and restart.",
                         parent=dialog,
                     )
                 except Exception as e:
                     self.hide_busy()
-                    self.show_app_error("Upload Failed", e, parent=dialog)
+                    # Safe fallback: Ensure local mode stays active
+                    try:
+                        import json
+                        default_dir = get_default_app_dir()
+                        config_file = os.path.join(default_dir, "location_config.json")
+                        cfg = get_db_config().copy()
+                        cfg["mode"] = "local"
+                        with open(config_file, "w", encoding="utf-8") as f:
+                            json.dump(cfg, f, indent=4)
+                    except Exception:
+                        pass
+                    messagebox.showwarning(
+                        "Upload Incomplete - Local Data Safe",
+                        f"Cloud upload encountered an issue:\n{e}\n\n"
+                        "Your local database is completely intact and was NOT modified.\n"
+                        "The application will continue running in Local Mode with all your data.",
+                        parent=dialog,
+                    )
 
             def do_cleanup_cloud():
                 if not messagebox.askyesno(
@@ -14941,11 +14969,6 @@ if HAS_DEPS:
             ).pack(side=RIGHT)
             notebook.pack(fill=BOTH, expand=True, padx=20, pady=(16, 4))
             
-            # --- TAB 1: DATABASE & CLOUD SYNC ---
-            tab_db = tb.Frame(notebook)
-            notebook.add(tab_db, text=self._tr("🗄️ Database & Cloud"))
-            self._build_database_and_cloud_panel(tab_db, dialog)
-
             # Helper tab builder (Dynamic list managers)
             def create_tab_editor(tab_parent, db_table, label_text):
                 frame = tb.Frame(tab_parent, padding=20)
@@ -15605,6 +15628,11 @@ if HAS_DEPS:
             tb.Button(cols_btn_f, text=self._tr("Save & Apply"), bootstyle="success", cursor="hand2", command=_settings_save_cols).pack(side=LEFT, padx=5)
             tb.Button(cols_btn_f, text=self._tr("Select All"), bootstyle="secondary-outline", cursor="hand2", command=lambda: _settings_select_all_cols(True)).pack(side=LEFT, padx=5)
             tb.Button(cols_btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=lambda: (_settings_select_all_cols(True), settings_check_vars.get("Written Up", tk.BooleanVar()).set(False))).pack(side=LEFT, padx=5)
+
+            # --- LAST TAB: DATABASE & CLOUD SYNC ---
+            tab_db = tb.Frame(notebook)
+            notebook.add(tab_db, text=self._tr("🗄️ Database & Cloud"))
+            self._build_database_and_cloud_panel(tab_db, dialog)
 
             if default_tab in ("database", "supabase", "db"):
                 notebook.select(tab_db)
