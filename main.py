@@ -938,7 +938,15 @@ class PostgresConnectionProxy:
 
     def commit(self):
         with _SUPABASE_LOCK:
-            self.conn.commit()
+            try:
+                self.conn.commit()
+            except Exception as e:
+                if "failed transaction block" in str(e).lower() or "aborted" in str(e).lower():
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                raise
 
     def rollback(self):
         with _SUPABASE_LOCK:
@@ -4765,7 +4773,7 @@ def _seed_defaults_if_empty(cursor):
 def cleanup_supabase_duplicates():
     """Remove duplicate Shop/config rows and wipe noisy history on the shared cloud DB."""
     if get_db_mode() != "supabase":
-        raise RuntimeError("Cleanup only applies in Supabase mode.")
+        return
 
     global TEMP_DB_PATH, SUPABASE_HISTORY_ENABLED
     if TEMP_DB_PATH != SUPABASE_DB_SENTINEL:
@@ -4774,52 +4782,70 @@ def cleanup_supabase_duplicates():
 
     history_prev = SUPABASE_HISTORY_ENABLED
     SUPABASE_HISTORY_ENABLED = False
-    conn = get_shared_supabase_conn()
     try:
-        # Ensure schema exists, then repair/dedupe.
-        cur = conn.cursor()
-        _init_db_schema(cur, seed=False)
-        _repair_employee_names_and_shop(cur)
-
-        raw = conn.conn.cursor()
+        db_conn = _open_supabase_pg_conn(timeout=10)
         try:
-            raw.execute("DELETE FROM database_history_log")
-        except Exception:
-            pass
+            raw = db_conn.cursor()
+            try:
+                raw.execute("DELETE FROM database_history_log")
+                db_conn.commit()
+            except Exception:
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
 
-        # Extra safety: collapse duplicate employee names (keep lowest id).
-        try:
-            raw.execute("SELECT id, name FROM employees ORDER BY id")
-            rows = raw.fetchall() or []
-            seen = {}
-            for eid, name in rows:
-                plain = decrypt_val(name)
-                if plain in seen:
-                    keep = seen[plain]
-                    raw.execute(
-                        "UPDATE payroll_records SET employee_id = %s WHERE employee_id = %s",
-                        (keep, eid),
-                    )
-                    raw.execute(
-                        "UPDATE expenses SET employee_id = %s WHERE employee_id = %s",
-                        (keep, eid),
-                    )
-                    raw.execute("DELETE FROM employees WHERE id = %s", (eid,))
-                else:
-                    seen[plain] = eid
-                    if plain != name:
-                        raw.execute(
-                            "UPDATE employees SET name = %s WHERE id = %s",
-                            (plain, eid),
-                        )
-        except Exception:
-            pass
+            # Extra safety: collapse duplicate employee names (keep lowest id).
+            try:
+                raw.execute("SELECT id, name FROM employees ORDER BY id")
+                rows = raw.fetchall() or []
+                seen = {}
+                for eid, name in rows:
+                    plain = decrypt_val(name)
+                    if plain in seen:
+                        keep = seen[plain]
+                        try:
+                            raw.execute(
+                                "UPDATE payroll_records SET employee_id = %s WHERE employee_id = %s",
+                                (keep, eid),
+                            )
+                            raw.execute(
+                                "UPDATE expenses SET employee_id = %s WHERE employee_id = %s",
+                                (keep, eid),
+                            )
+                            raw.execute("DELETE FROM employees WHERE id = %s", (eid,))
+                        except Exception:
+                            pass
+                    else:
+                        seen[plain] = eid
+                        if plain != name:
+                            try:
+                                raw.execute(
+                                    "UPDATE employees SET name = %s WHERE id = %s",
+                                    (plain, eid),
+                                )
+                            except Exception:
+                                pass
+                db_conn.commit()
+            except Exception:
+                try:
+                    db_conn.rollback()
+                except Exception:
+                    pass
 
-        raw.close()
-        conn.commit()
+            try:
+                raw.close()
+            except Exception:
+                pass
+        finally:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
     finally:
         SUPABASE_HISTORY_ENABLED = history_prev
-        conn.close()
 
 
 def _open_local_sqlite_readonly():
@@ -5234,8 +5260,11 @@ def upload_local_database_to_supabase(progress_cb=None):
             except Exception:
                 pass
         if progress_cb:
-            progress_cb("Cleaning duplicates...")
-        cleanup_supabase_duplicates()
+            progress_cb("Finalizing upload...")
+        try:
+            cleanup_supabase_duplicates()
+        except Exception:
+            pass
         if progress_cb:
             progress_cb("Done.")
     finally:
