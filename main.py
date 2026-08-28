@@ -4028,10 +4028,129 @@ def get_expense_docs_dir():
 EXPENSE_DOCS_DIR = get_expense_docs_dir()
 
 
+def resolve_local_doc_path(filepath):
+    """Resolve cross-platform and cross-device document paths (Windows <-> Mac <-> Linux)."""
+    if not filepath:
+        return ""
+    sp = str(filepath).strip()
+    if not sp:
+        return ""
+    
+    # 1. Direct path check
+    if os.path.isfile(sp):
+        return os.path.abspath(sp)
+    
+    norm = sp.replace("\\", "/")
+    app_dir = get_app_dir()
+    
+    # 2. Check for known subfolders: Expense_Documents, Shop_Files, Employee_Folders
+    for marker in ("Expense_Documents", "Shop_Files", "Employee_Folders"):
+        if marker in norm:
+            rel = norm[norm.index(marker):]
+            candidate = os.path.join(app_dir, *rel.split("/"))
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+            return os.path.abspath(candidate)
+            
+    # 3. Check by basename
+    base = os.path.basename(norm)
+    for folder_name in ("Expense_Documents", "Shop_Files", "Employee_Folders"):
+        candidate = os.path.join(app_dir, folder_name, base)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+            
+    return os.path.join(get_expense_docs_dir(), base)
+
+
+def ensure_document_file_available(filepath):
+    """Ensure the file is on local disk. If missing on this PC, fetch it from Supabase cloud_file_storage."""
+    if not filepath:
+        return ""
+    local_path = resolve_local_doc_path(filepath)
+    if os.path.isfile(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
+
+    # If not found locally and cloud mode is active, try to fetch from Supabase
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        base_name = os.path.basename(str(filepath).replace("\\", "/"))
+        try:
+            pg = get_shared_supabase_conn()
+            cur = pg.cursor()
+            cur.execute(
+                "SELECT file_data FROM cloud_file_storage WHERE file_name = ? OR file_key = ? LIMIT 1",
+                (base_name, base_name)
+            )
+            row = cur.fetchone()
+            if row and row[0]:
+                raw_bytes = row[0]
+                if isinstance(raw_bytes, str):
+                    import base64
+                    try:
+                        raw_bytes = base64.b64decode(raw_bytes)
+                    except Exception:
+                        raw_bytes = raw_bytes.encode("utf-8")
+                elif isinstance(raw_bytes, memoryview):
+                    raw_bytes = raw_bytes.tobytes()
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                with open(local_path, "wb") as f:
+                    f.write(raw_bytes)
+                return local_path
+        except Exception:
+            pass
+
+    return local_path if os.path.isfile(local_path) else None
+
+
+def _push_file_to_cloud_storage(file_path):
+    """Save a compressed file copy into cloud_file_storage in the background."""
+    if not file_path or not os.path.isfile(file_path):
+        return
+    if get_db_mode() != "supabase" or is_supabase_offline():
+        return
+
+    def _bg():
+        try:
+            with open(file_path, "rb") as f:
+                data = f.read()
+            import base64
+            token = base64.b64encode(data).decode("ascii")
+            base_name = os.path.basename(file_path)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            pg = get_shared_supabase_conn()
+            cur = pg.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cloud_file_storage (
+                    file_key TEXT PRIMARY KEY,
+                    file_name TEXT,
+                    file_data TEXT,
+                    file_size INTEGER,
+                    uploaded_at TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT INTO cloud_file_storage (file_key, file_name, file_data, file_size, uploaded_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (file_key) DO UPDATE SET file_data = EXCLUDED.file_data, uploaded_at = EXCLUDED.uploaded_at
+                """,
+                (base_name, base_name, token, len(data), now)
+            )
+            pg.commit()
+        except Exception:
+            pass
+
+    import threading
+    threading.Thread(target=_bg, daemon=True).start()
+
+
 def open_path_with_default_app(filepath):
-    """Open a file with the OS default application."""
-    if not filepath or not os.path.isfile(filepath):
-        raise FileNotFoundError(filepath or "No file")
+    """Open a file with the OS default application, auto-downloading from cloud if missing."""
+    actual_path = ensure_document_file_available(filepath)
+    if not actual_path or not os.path.isfile(actual_path):
+        raise FileNotFoundError(f"Document was not found: {filepath}")
+    filepath = actual_path
     system = platform.system()
     if system == "Windows":
         os.startfile(filepath)
@@ -4124,6 +4243,7 @@ def optimize_and_save_file(src_path, dest_folder, dest_filename=None, max_dim=12
                     resample = getattr(Image, "Resampling", Image).LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
                     img.thumbnail((max_dim, max_dim), resample)
                 img.save(dest_path, "JPEG", quality=quality, optimize=True)
+                _push_file_to_cloud_storage(dest_path)
                 return dest_path
         except Exception:
             pass
@@ -4137,6 +4257,7 @@ def optimize_and_save_file(src_path, dest_folder, dest_filename=None, max_dim=12
             shutil.copy2(src_path, dest_path)
         except Exception:
             return src_path
+    _push_file_to_cloud_storage(dest_path)
     return dest_path
 
 
@@ -5083,6 +5204,15 @@ def ensure_all_supabase_tables(db_conn):
         """
         CREATE TABLE IF NOT EXISTS config_payments (
             name TEXT PRIMARY KEY
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cloud_file_storage (
+            file_key TEXT PRIMARY KEY,
+            file_name TEXT,
+            file_data TEXT,
+            file_size INTEGER,
+            uploaded_at TEXT
         )
         """
     ]
@@ -12660,7 +12790,7 @@ if HAS_DEPS:
         def preview_expense_document(self, filepath, parent=None):
             """Show an in-app preview for images, or open PDF/other files for preview."""
             parent = parent or self
-            path = os.path.abspath(os.path.expanduser(str(filepath or "").strip()))
+            path = ensure_document_file_available(filepath)
             if not path or not os.path.isfile(path):
                 messagebox.showerror("Error", "Document file was not found.", parent=parent)
                 return
