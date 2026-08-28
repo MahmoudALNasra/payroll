@@ -1787,12 +1787,14 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         _SUPABASE_OFFLINE = False
         if init_schema:
             try:
-                cur = get_shared_supabase_conn().cursor()
-                _init_db_schema(cur, seed=False)
-                _ensure_audit_backup_schema(cur)
-                _add_missing_columns(cur, "payout_tiers", [("kind", "TEXT DEFAULT 'service'")])
-                _add_missing_columns(cur, "expenses", [("tip_given", "TEXT DEFAULT 0")])
-                get_shared_supabase_conn().commit()
+                db_conn = _open_supabase_pg_conn(timeout=10)
+                try:
+                    ensure_all_supabase_tables(db_conn)
+                finally:
+                    try:
+                        db_conn.close()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if progress_cb:
@@ -4816,6 +4818,227 @@ def _open_local_sqlite_readonly():
     return path, lite
 
 
+def ensure_all_supabase_tables(db_conn):
+    """Ensure every required Postgres table and column exists on Supabase with native PostgreSQL types."""
+    ddls = [
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS employees (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE,
+            first_name TEXT,
+            last_name TEXT,
+            phone TEXT,
+            email TEXT,
+            hour_rate TEXT,
+            percentage TEXT,
+            ssn TEXT,
+            address TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            cv_path TEXT,
+            id_photo_path TEXT,
+            personal_photo_path TEXT,
+            vagaro_id TEXT,
+            use_tiered_payout INTEGER DEFAULT 0
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS payroll_records (
+            id SERIAL PRIMARY KEY,
+            employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            record_date TEXT,
+            payment_amount TEXT,
+            payment_type TEXT,
+            revenue TEXT,
+            hours TEXT,
+            calculation TEXT,
+            notes TEXT,
+            written_up TEXT,
+            location TEXT,
+            product_sales TEXT,
+            tip TEXT,
+            written_up_desc TEXT,
+            service_addon_sales TEXT DEFAULT '0.0',
+            hour_rate TEXT,
+            percentage TEXT,
+            cycle_key TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS expenses (
+            id SERIAL PRIMARY KEY,
+            expense_date TEXT,
+            category TEXT,
+            amount TEXT,
+            description TEXT,
+            employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+            status TEXT,
+            payment_type TEXT,
+            location TEXT,
+            is_tip TEXT DEFAULT 'No',
+            assignee_id INTEGER,
+            document_path TEXT,
+            tip_given TEXT DEFAULT '0',
+            cycle_key TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS shop_documents (
+            id SERIAL PRIMARY KEY,
+            location TEXT,
+            title TEXT,
+            doc_date TEXT,
+            description TEXT,
+            file_path TEXT,
+            created_at TEXT,
+            category TEXT,
+            date_entered TEXT,
+            notes TEXT,
+            file_size INTEGER,
+            file_type TEXT,
+            filename TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS payout_tiers (
+            id SERIAL PRIMARY KEY,
+            from_sales TEXT,
+            to_sales TEXT,
+            percentage TEXT,
+            kind TEXT DEFAULT 'service'
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cash_month_locks (
+            year_month TEXT PRIMARY KEY,
+            locked_by TEXT,
+            locked_at TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS vagaro_pull_logs (
+            pulled_date TEXT PRIMARY KEY,
+            pull_timestamp TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS database_history_log (
+            id SERIAL PRIMARY KEY,
+            change_timestamp TEXT,
+            user_name TEXT,
+            table_name TEXT,
+            record_id INTEGER,
+            action_type TEXT,
+            old_data TEXT,
+            new_data TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS user_action_log (
+            id SERIAL PRIMARY KEY,
+            log_uid TEXT UNIQUE,
+            created_at TEXT,
+            user_name TEXT,
+            action TEXT,
+            table_name TEXT,
+            record_id TEXT,
+            summary TEXT,
+            details TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cloud_backups (
+            id SERIAL PRIMARY KEY,
+            slot_key TEXT UNIQUE,
+            backup_date TEXT,
+            slot TEXT,
+            created_at TEXT,
+            created_by TEXT,
+            payload TEXT,
+            size_bytes INTEGER
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS config_locations (
+            name TEXT PRIMARY KEY
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS config_categories (
+            name TEXT PRIMARY KEY
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS config_payments (
+            name TEXT PRIMARY KEY
+        )
+        """
+    ]
+    cur = db_conn.cursor()
+    for ddl in ddls:
+        try:
+            cur.execute(ddl)
+            db_conn.commit()
+        except Exception:
+            try:
+                db_conn.rollback()
+            except Exception:
+                pass
+
+    col_migrations = [
+        ("employees", "first_name", "TEXT"),
+        ("employees", "last_name", "TEXT"),
+        ("employees", "phone", "TEXT"),
+        ("employees", "email", "TEXT"),
+        ("employees", "ssn", "TEXT"),
+        ("employees", "address", "TEXT"),
+        ("employees", "start_date", "TEXT"),
+        ("employees", "end_date", "TEXT"),
+        ("employees", "cv_path", "TEXT"),
+        ("employees", "id_photo_path", "TEXT"),
+        ("employees", "personal_photo_path", "TEXT"),
+        ("employees", "vagaro_id", "TEXT"),
+        ("employees", "use_tiered_payout", "INTEGER DEFAULT 0"),
+        ("payroll_records", "location", "TEXT"),
+        ("payroll_records", "product_sales", "TEXT"),
+        ("payroll_records", "tip", "TEXT"),
+        ("payroll_records", "written_up_desc", "TEXT"),
+        ("payroll_records", "service_addon_sales", "TEXT DEFAULT '0.0'"),
+        ("payroll_records", "hour_rate", "TEXT"),
+        ("payroll_records", "percentage", "TEXT"),
+        ("payroll_records", "cycle_key", "TEXT"),
+        ("expenses", "payment_type", "TEXT"),
+        ("expenses", "location", "TEXT"),
+        ("expenses", "is_tip", "TEXT DEFAULT 'No'"),
+        ("expenses", "assignee_id", "INTEGER"),
+        ("expenses", "document_path", "TEXT"),
+        ("expenses", "tip_given", "TEXT DEFAULT '0'"),
+        ("expenses", "cycle_key", "TEXT"),
+        ("payout_tiers", "kind", "TEXT DEFAULT 'service'"),
+        ("shop_documents", "category", "TEXT"),
+        ("shop_documents", "date_entered", "TEXT"),
+        ("shop_documents", "notes", "TEXT"),
+        ("shop_documents", "file_size", "INTEGER"),
+        ("shop_documents", "file_type", "TEXT"),
+        ("shop_documents", "filename", "TEXT"),
+    ]
+    for tbl, col, col_type in col_migrations:
+        try:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {col_type}")
+            db_conn.commit()
+        except Exception:
+            try:
+                db_conn.rollback()
+            except Exception:
+                pass
+
+
 def upload_local_database_to_supabase(progress_cb=None):
     """
     First-sync: replace cloud tables with the contents of the local encrypted DB.
@@ -4835,24 +5058,13 @@ def upload_local_database_to_supabase(progress_cb=None):
     try:
         if progress_cb:
             progress_cb("Connecting to Supabase...")
-        pg_proxy = get_shared_supabase_conn(force_reconnect=True)
+        db_conn = _open_supabase_pg_conn(timeout=15)
         
-        # 1. Build schema via app helpers
-        cur = pg_proxy.cursor()
-        _init_db_schema(cur, seed=False)
-        _ensure_audit_backup_schema(cur)
-        try:
-            pg_proxy.commit()
-        except Exception:
-            pass
+        # 1. Ensure all native tables and columns exist in Postgres
+        if progress_cb:
+            progress_cb("Creating cloud tables...")
+        ensure_all_supabase_tables(db_conn)
         ensure_numeric_columns_are_text()
-        try:
-            pg_proxy.commit()
-        except Exception:
-            pass
-
-        # 2. Open dedicated connection for fast bulk copy
-        db_conn = _open_supabase_pg_conn()
         try:
             db_cur = db_conn.cursor()
 
