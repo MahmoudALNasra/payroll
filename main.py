@@ -5860,23 +5860,8 @@ if HAS_DEPS:
             
             if get_db_mode() == "supabase":
                 init_supabase_cipher()
-                # Always work from the local cache so every save is queued for upload.
+                # Work from the local cache immediately for instantaneous startup.
                 enable_local_first_mode()
-                try:
-                    conn = get_shared_supabase_conn(force_reconnect=True)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT 1")
-                    cursor.fetchone()
-                    leave_supabase_offline_mode()
-                    # Heavy migrations + full offline cache refresh run AFTER login
-                    # (see run_deferred_cloud_maintenance) so the login screen appears quickly.
-                except Exception as e:
-                    enter_supabase_offline_mode(str(e))
-                    self._startup_offline_warning = (
-                        "Could not reach Supabase. The app will keep working with a local copy.\n"
-                        "Changes will upload automatically when the internet is back.\n\n"
-                        f"Pending uploads: {offline_pending_count()}\n\nDetails: {e}"
-                    )
                 return
 
             password = DEFAULT_ENCRYPTION_PASSWORD
@@ -6380,7 +6365,7 @@ if HAS_DEPS:
 
                     # 2. In Supabase mode, synchronize local cache with cloud ahead of time
                     if get_db_mode() == "supabase":
-                        ok, msg = sync_local_cache_with_cloud(backfill=True, init_schema=True)
+                        ok, msg = sync_local_cache_with_cloud(backfill=False, init_schema=False)
                         self._prelogin_sync_result["ok"] = ok
                         self._prelogin_sync_result["msg"] = msg
                         try:
@@ -6419,13 +6404,6 @@ if HAS_DEPS:
 
             self.show_busy(self._tr("Signing in…"))
             try:
-                # Prefer live cloud if we were offline
-                try:
-                    if get_db_mode() == "supabase" and is_supabase_offline():
-                        try_reconnect_supabase()
-                except Exception:
-                    pass
-
                 conn = sqlite3.connect(TEMP_DB_PATH)
                 cursor = conn.cursor()
 
@@ -7045,64 +7023,12 @@ if HAS_DEPS:
                 pass
 
         def _finish_login_and_sync(self):
-            """After a valid password, transition immediately if pre-login sync finished, or wait briefly if still in progress."""
-            if get_db_mode() != "supabase":
-                try:
-                    log_user_action("login", extra_summary="Logged in")
-                except Exception:
-                    pass
-                self.show_main_application()
-                return
-
-            if getattr(self, "_login_syncing", False):
-                return
-            self._login_syncing = True
-
-            ev = getattr(self, "_prelogin_sync_event", None)
-            # If pre-login sync already completed while user was typing, open immediately!
-            if ev is not None and ev.is_set():
-                self._login_syncing = False
-                try:
-                    log_user_action("login", extra_summary="Logged in")
-                except Exception:
-                    pass
-                try:
-                    maybe_run_scheduled_cloud_backup()
-                except Exception:
-                    pass
-                self.show_main_application()
-                return
-
-            # If still running, show progress and wait for background sync to complete
+            """After a valid password, transition immediately to main application with zero delay."""
             try:
-                self._login_progress.grid()
-                self._login_progress["value"] = 50
-                self._login_status.config(text=self._tr("Finishing data sync…"))
+                log_user_action("login", extra_summary="Logged in")
             except Exception:
                 pass
-
-            def _wait_and_open():
-                if ev is not None:
-                    ev.wait(timeout=12)
-                try:
-                    log_user_action("login", extra_summary="Logged in")
-                except Exception:
-                    pass
-                try:
-                    maybe_run_scheduled_cloud_backup()
-                except Exception:
-                    pass
-
-                def _ui():
-                    self._login_syncing = False
-                    self.show_main_application()
-
-                try:
-                    self.after(0, _ui)
-                except Exception:
-                    self._login_syncing = False
-
-            threading.Thread(target=_wait_and_open, daemon=True).start()
+            self.show_main_application()
 
         def _tr(self, text):
             if not hasattr(self, 'lang'):
