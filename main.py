@@ -1316,9 +1316,69 @@ def _is_pg_conn_alive(conn):
     except Exception:
         return False
 
+def _clean_supabase_config(config):
+    """Auto-clean and parse host, full URI, port, user, and database."""
+    cfg = dict(config or {})
+    host = str(cfg.get("supabase_host") or "").strip()
+    port = str(cfg.get("supabase_port") or "5432").strip()
+    user = str(cfg.get("supabase_user") or "postgres").strip()
+    password = str(cfg.get("supabase_password") or "").strip()
+    database = str(cfg.get("supabase_database") or "postgres").strip()
+
+    # Handle full connection URI if pasted in host
+    if host.startswith("postgres://") or host.startswith("postgresql://"):
+        try:
+            import urllib.parse
+            u = urllib.parse.urlparse(host)
+            if u.hostname:
+                host = u.hostname
+            if u.port:
+                port = str(u.port)
+            if u.username:
+                user = urllib.parse.unquote(u.username)
+            if u.password:
+                password = urllib.parse.unquote(u.password)
+            if u.path and len(u.path) > 1:
+                database = u.path.lstrip("/")
+        except Exception:
+            pass
+
+    # Strip http:// or https://
+    if host.startswith("http://"):
+        host = host[7:]
+    elif host.startswith("https://"):
+        host = host[8:]
+
+    # Strip trailing path / slashes
+    if "/" in host:
+        parts = host.split("/", 1)
+        host = parts[0]
+        if not database or database == "postgres":
+            database = parts[1].strip() or "postgres"
+
+    # Strip trailing port in host (e.g. host:5432 or host:6543)
+    if ":" in host:
+        h_parts = host.split(":")
+        host = h_parts[0]
+        port = h_parts[1]
+
+    # Clean port
+    try:
+        port = int(port)
+    except Exception:
+        port = 5432
+
+    cfg["supabase_host"] = host
+    cfg["supabase_port"] = port
+    cfg["supabase_user"] = user
+    cfg["supabase_password"] = password
+    cfg["supabase_database"] = database
+    return cfg
+
 def _open_supabase_pg_conn():
     import pg8000.dbapi
-    config = get_db_config()
+    raw_config = get_db_config()
+    config = _clean_supabase_config(raw_config)
     conn = pg8000.dbapi.connect(
         host=config.get("supabase_host"),
         port=int(config.get("supabase_port", 5432)),
@@ -9157,11 +9217,25 @@ if HAS_DEPS:
             ).pack(anchor=W, pady=(0, 12))
 
             def test_and_save_supabase():
-                host = db_host_var.get().strip()
-                password = db_password_var.get().strip()
-                port = db_port_var.get().strip()
-                database = db_name_var.get().strip()
-                username = db_user_var.get().strip()
+                raw_cfg = {
+                    "supabase_host": db_host_var.get().strip(),
+                    "supabase_password": db_password_var.get().strip(),
+                    "supabase_port": db_port_var.get().strip(),
+                    "supabase_database": db_name_var.get().strip(),
+                    "supabase_user": db_user_var.get().strip(),
+                }
+                clean_cfg = _clean_supabase_config(raw_cfg)
+                host = clean_cfg["supabase_host"]
+                password = clean_cfg["supabase_password"]
+                port = clean_cfg["supabase_port"]
+                database = clean_cfg["supabase_database"]
+                username = clean_cfg["supabase_user"]
+
+                # Update UI entries with cleaned values
+                db_host_var.set(host)
+                db_port_var.set(str(port))
+                db_user_var.set(username)
+                db_name_var.set(database)
                 
                 if not host or not password:
                     messagebox.showerror("Validation Error", "Host and Password are required.", parent=dialog)
@@ -9178,7 +9252,7 @@ if HAS_DEPS:
                         user=username,
                         password=password,
                         database=database,
-                        timeout=5
+                        timeout=10
                     )
                     cursor = conn.cursor()
                     cursor.execute("SELECT 1")
@@ -9195,7 +9269,7 @@ if HAS_DEPS:
                     new_config["mode"] = "supabase"
                     new_config["supabase_host"] = host
                     new_config["supabase_password"] = password
-                    new_config["supabase_port"] = port
+                    new_config["supabase_port"] = str(port)
                     new_config["supabase_database"] = database
                     new_config["supabase_user"] = username
                     with open(config_file, "w", encoding="utf-8") as f:
@@ -9221,8 +9295,16 @@ if HAS_DEPS:
                 ):
                     return
                 # Persist credentials first if fields are filled
-                host = db_host_var.get().strip()
-                password = db_password_var.get().strip()
+                raw_cfg = {
+                    "supabase_host": db_host_var.get().strip(),
+                    "supabase_password": db_password_var.get().strip(),
+                    "supabase_port": db_port_var.get().strip(),
+                    "supabase_database": db_name_var.get().strip(),
+                    "supabase_user": db_user_var.get().strip(),
+                }
+                clean_cfg = _clean_supabase_config(raw_cfg)
+                host = clean_cfg["supabase_host"]
+                password = clean_cfg["supabase_password"]
                 if host and password:
                     try:
                         import json
@@ -9232,9 +9314,9 @@ if HAS_DEPS:
                         new_config["mode"] = "supabase"
                         new_config["supabase_host"] = host
                         new_config["supabase_password"] = password
-                        new_config["supabase_port"] = db_port_var.get().strip() or "5432"
-                        new_config["supabase_database"] = db_name_var.get().strip() or "postgres"
-                        new_config["supabase_user"] = db_user_var.get().strip() or "postgres"
+                        new_config["supabase_port"] = str(clean_cfg["supabase_port"])
+                        new_config["supabase_database"] = clean_cfg["supabase_database"]
+                        new_config["supabase_user"] = clean_cfg["supabase_user"]
                         with open(config_file, "w", encoding="utf-8") as f:
                             json.dump(new_config, f, indent=4)
                     except Exception as e:
