@@ -2197,134 +2197,257 @@ def _decode_cloud_backup_payload(payload):
     if isinstance(raw, str):
         gz = base64.b64decode(raw.encode("ascii"))
         data = gzip.decompress(gz)
-        return json.loads(data.decode("utf-8"))
-    raise ValueError("Invalid backup payload")
+def get_device_identifier():
+    import platform
+    import socket
+    try:
+        host = socket.gethostname() or platform.node() or "Device"
+    except Exception:
+        host = "Device"
+    user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+    return f"{user}@{host}"
+
+
+def get_local_backups_dir():
+    d = os.path.join(get_default_app_dir(), "Local_Backups")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def create_local_backup(slot_key=None, slot=None, backup_date=None):
+    """Saves an encrypted snapshot backup on this machine's local disk."""
+    try:
+        b_dir = get_local_backups_dir()
+        if not slot_key:
+            backup_date, slot, slot_key = current_cloud_backup_slot()
+        
+        # 1. Copy encrypted database if available
+        enc_file = os.path.join(get_default_app_dir(), "payroll_data.enc")
+        if os.path.isfile(enc_file):
+            import shutil
+            dest_enc = os.path.join(b_dir, f"backup_{slot_key}.enc")
+            try:
+                shutil.copy2(enc_file, dest_enc)
+            except Exception:
+                pass
+
+        # 2. Save encrypted JSON snapshot
+        try:
+            payload, size = _build_cloud_backup_payload()
+            json_file = os.path.join(b_dir, f"snapshot_{slot_key}.json.gz")
+            with open(json_file, "w", encoding="utf-8") as f:
+                f.write(payload)
+        except Exception:
+            pass
+
+        # Rotate: keep newest 40 local backups
+        try:
+            files = sorted(
+                [os.path.join(b_dir, f) for f in os.listdir(b_dir) if f.startswith("backup_") or f.startswith("snapshot_")],
+                key=os.path.getmtime,
+            )
+            if len(files) > 40:
+                for old_f in files[:-40]:
+                    try:
+                        os.remove(old_f)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return True, slot_key
+    except Exception as e:
+        return False, str(e)
 
 
 def create_cloud_backup(slot_key=None, slot=None, backup_date=None, kind="auto"):
-    """Save a snapshot of local data into the Supabase cloud_backups table."""
-    if get_db_mode() != "supabase" or is_supabase_offline():
-        return False, "Cloud is offline"
+    """Save a snapshot locally on this PC AND upload it to Supabase cloud_backups."""
     if not slot_key:
         backup_date, slot, slot_key = current_cloud_backup_slot()
         if kind == "manual":
             slot_key = f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             slot = "manual"
             backup_date = datetime.now().strftime("%Y-%m-%d")
-    payload, size_bytes = _build_cloud_backup_payload()
-    pg = get_shared_supabase_conn()
-    cur = pg.cursor()
-    _ensure_audit_backup_schema(cur)
-    cur.execute("SELECT slot_key FROM cloud_backups WHERE slot_key = ?", (slot_key,))
-    exists = cur.fetchone()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    who = _session_user_name()
-    if exists:
-        cur.execute(
-            """
-            UPDATE cloud_backups
-            SET created_at=?, created_by=?, payload=?, size_bytes=?, backup_date=?, slot=?
-            WHERE slot_key=?
-            """,
-            (now, who, payload, int(size_bytes), backup_date, slot, slot_key),
-        )
-    else:
-        cur.execute(
-            """
-            INSERT INTO cloud_backups
-                (slot_key, backup_date, slot, created_at, created_by, payload, size_bytes)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (slot_key, backup_date, slot, now, who, payload, int(size_bytes)),
-        )
-    cutoff = (datetime.now() - timedelta(days=CLOUD_BACKUP_KEEP_DAYS)).strftime("%Y-%m-%d")
+
+    # Step 1: ALWAYS create local backup on this PC
+    ok_local, msg_local = create_local_backup(slot_key=slot_key, slot=slot, backup_date=backup_date)
+
+    # Step 2: Upload to Supabase if connected
+    if get_db_mode() != "supabase" or is_supabase_offline():
+        return ok_local, f"Saved locally on this device ({msg_local})"
+
     try:
-        cur.execute(
-            "DELETE FROM cloud_backups WHERE backup_date < ? AND slot IN ('am', 'pm')",
-            (cutoff,),
-        )
-    except Exception:
-        pass
-    pg.commit()
-    label = "morning" if slot == "am" else "afternoon" if slot == "pm" else "manual"
-    try:
-        log_user_action(
-            "backup",
-            extra_summary=f"Saved {label} cloud backup",
-            row={"summary": f"Saved {label} cloud backup", "slot_key": slot_key},
-        )
-    except Exception:
-        pass
-    return True, slot_key
+        payload, size_bytes = _build_cloud_backup_payload()
+        pg = get_shared_supabase_conn()
+        cur = pg.cursor()
+        _ensure_audit_backup_schema(cur)
+        cur.execute("SELECT slot_key FROM cloud_backups WHERE slot_key = %s", (slot_key,))
+        exists = cur.fetchone()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        who = f"{_session_user_name()} ({get_device_identifier()})"
+        if exists:
+            cur.execute(
+                """
+                UPDATE cloud_backups
+                SET created_at=%s, created_by=%s, payload=%s, size_bytes=%s, backup_date=%s, slot=%s
+                WHERE slot_key=%s
+                """,
+                (now, who, payload, int(size_bytes), backup_date, slot, slot_key),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO cloud_backups
+                    (slot_key, backup_date, slot, created_at, created_by, payload, size_bytes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (slot_key, backup_date, slot, now, who, payload, int(size_bytes)),
+            )
+        cutoff = (datetime.now() - timedelta(days=CLOUD_BACKUP_KEEP_DAYS)).strftime("%Y-%m-%d")
+        try:
+            cur.execute(
+                "DELETE FROM cloud_backups WHERE backup_date < %s AND slot IN ('am', 'pm')",
+                (cutoff,),
+            )
+        except Exception:
+            pass
+        pg.commit()
+        label = "morning" if slot == "am" else "afternoon" if slot == "pm" else "manual"
+        try:
+            log_user_action(
+                "backup",
+                extra_summary=f"Saved {label} backup locally and uploaded to cloud",
+                row={"summary": f"Saved {label} backup locally and uploaded to cloud", "slot_key": slot_key},
+            )
+        except Exception:
+            pass
+        return True, slot_key
+    except Exception as e:
+        return ok_local, f"Saved locally on this device. Cloud sync: {e}"
 
 
 def maybe_run_scheduled_cloud_backup():
-    """Create today's morning or afternoon backup if it is not already in Supabase."""
+    """Daily morning/afternoon backup for each device linked to DB: saves local + cloud."""
     global _LAST_BACKUP_SLOT
-    if get_db_mode() != "supabase" or is_supabase_offline():
-        return False, "skip"
     backup_date, slot, slot_key = current_cloud_backup_slot()
-    if _LAST_BACKUP_SLOT == slot_key:
+    device_key = f"{slot_key}_{get_device_identifier()}"
+    if _LAST_BACKUP_SLOT == device_key:
         return True, "cached"
-    pg = get_shared_supabase_conn()
-    cur = pg.cursor()
-    _ensure_audit_backup_schema(cur)
-    try:
-        pg.commit()
-    except Exception:
-        pass
-    cur.execute("SELECT slot_key FROM cloud_backups WHERE slot_key = ?", (slot_key,))
-    if cur.fetchone():
-        _LAST_BACKUP_SLOT = slot_key
-        return True, "exists"
     ok, msg = create_cloud_backup(
         slot_key=slot_key, slot=slot, backup_date=backup_date, kind="auto"
     )
     if ok:
-        _LAST_BACKUP_SLOT = slot_key
+        _LAST_BACKUP_SLOT = device_key
     return ok, msg
 
 
+def list_local_backups(limit=30):
+    """List backups saved locally on this machine."""
+    b_dir = get_local_backups_dir()
+    if not os.path.exists(b_dir):
+        return []
+    items = []
+    seen = set()
+    for f in os.listdir(b_dir):
+        if (f.startswith("backup_") or f.startswith("snapshot_")) and (f.endswith(".enc") or f.endswith(".json.gz")):
+            base_key = f.replace("backup_", "").replace("snapshot_", "").replace(".enc", "").replace(".json.gz", "")
+            if base_key in seen:
+                continue
+            seen.add(base_key)
+            full_p = os.path.join(b_dir, f)
+            mtime = os.path.getmtime(full_p)
+            dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            sz = os.path.getsize(full_p)
+            slot = "AM" if "_am" in base_key.lower() else ("PM" if "_pm" in base_key.lower() else "Manual")
+            items.append({
+                "slot_key": f"local::{base_key}",
+                "backup_date": dt_str.split()[0],
+                "slot": f"💻 Local ({slot})",
+                "created_at": dt_str,
+                "created_by": f"This PC ({get_device_identifier()})",
+                "size_bytes": sz,
+                "is_local": True
+            })
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    return items[:limit]
+
+
 def list_cloud_backups(limit=40):
+    """List cloud backups from Supabase."""
     if get_db_mode() != "supabase" or is_supabase_offline():
         return []
-    pg = get_shared_supabase_conn()
-    cur = pg.cursor()
-    _ensure_audit_backup_schema(cur)
-    cur.execute(
-        """
-        SELECT slot_key, backup_date, slot, created_at, created_by, size_bytes
-        FROM cloud_backups
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-        (int(limit),),
-    )
-    rows = []
-    for r in cur.fetchall() or []:
-        rows.append(
-            {
-                "slot_key": r[0],
-                "backup_date": r[1],
-                "slot": r[2],
-                "created_at": r[3],
-                "created_by": plain_label(r[4]),
-                "size_bytes": r[5],
-            }
+    try:
+        pg = get_shared_supabase_conn()
+        cur = pg.cursor()
+        _ensure_audit_backup_schema(cur)
+        cur.execute(
+            """
+            SELECT slot_key, backup_date, slot, created_at, created_by, size_bytes
+            FROM cloud_backups
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (int(limit),),
         )
-    return rows
+        rows = []
+        for r in cur.fetchall() or []:
+            slot_name = r[2] or ""
+            slot_label = "AM" if slot_name == "am" else ("PM" if slot_name == "pm" else "Manual")
+            rows.append(
+                {
+                    "slot_key": r[0],
+                    "backup_date": r[1],
+                    "slot": f"☁️ Cloud ({slot_label})",
+                    "created_at": r[3],
+                    "created_by": plain_label(r[4]),
+                    "size_bytes": r[5],
+                    "is_local": False
+                }
+            )
+        return rows
+    except Exception:
+        return []
+
+
+def list_all_backups(limit=50):
+    """Combines cloud backups and local device backups into a single chronological list."""
+    cloud_list = list_cloud_backups(limit=limit)
+    local_list = list_local_backups(limit=limit)
+    combined = cloud_list + local_list
+    combined.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return combined[:limit]
 
 
 def restore_cloud_backup(slot_key):
-    if get_db_mode() != "supabase" or is_supabase_offline():
-        return False, "Cloud is offline"
-    pg = get_shared_supabase_conn()
-    cur = pg.cursor()
-    cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = ?", (slot_key,))
-    row = cur.fetchone()
-    if not row or not row[0]:
-        return False, "Backup not found"
-    snapshot = _decode_cloud_backup_payload(row[0])
+    """Restores data from either a local device snapshot or a Supabase cloud backup."""
+    if str(slot_key).startswith("local::"):
+        raw_key = str(slot_key)[7:]
+        b_dir = get_local_backups_dir()
+        json_file = os.path.join(b_dir, f"snapshot_{raw_key}.json.gz")
+        payload = None
+        if os.path.isfile(json_file):
+            with open(json_file, "r", encoding="utf-8") as f:
+                payload = f.read()
+        if not payload:
+            enc_file = os.path.join(b_dir, f"backup_{raw_key}.enc")
+            if os.path.isfile(enc_file):
+                active_enc = os.path.join(get_default_app_dir(), "payroll_data.enc")
+                import shutil
+                shutil.copy2(enc_file, active_enc)
+                load_database()
+                return True, "Restored from local encrypted file."
+            return False, "Local backup file not found."
+    else:
+        if get_db_mode() != "supabase" or is_supabase_offline():
+            return False, "Cloud is offline"
+        pg = get_shared_supabase_conn()
+        cur = pg.cursor()
+        cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (slot_key,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return False, "Backup not found in cloud."
+        payload = row[0]
+
+    snapshot = _decode_cloud_backup_payload(payload)
     tables = (snapshot or {}).get("tables") or {}
     path = ensure_offline_cache_open()
     lite = _original_sqlite3_connect(path, timeout=30)
@@ -2365,13 +2488,14 @@ def restore_cloud_backup(slot_key):
         _persist_offline_cache()
     except Exception:
         pass
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            backfill_local_rows_missing_from_cloud()
+            flush_offline_queue_to_cloud()
+        except Exception:
+            pass
     try:
-        backfill_local_rows_missing_from_cloud()
-        flush_offline_queue_to_cloud()
-    except Exception:
-        pass
-    try:
-        log_user_action("backup", extra_summary=f"Restored cloud backup {slot_key}")
+        log_user_action("backup", extra_summary=f"Restored backup {slot_key}")
     except Exception:
         pass
     return True, "ok"
@@ -5413,6 +5537,53 @@ def sync_all_local_files_to_cloud(progress_cb=None):
         return True, f"Successfully synced {total} files to cloud"
     except Exception as e:
         return False, str(e)
+
+
+def get_supabase_storage_usage():
+    """
+    Calculate current storage used in Supabase (Database size + Cloud file storage bytes).
+    Returns (used_bytes, total_bytes_1gb, percent_used, formatted_string)
+    """
+    total_bytes = 1024 * 1024 * 1024  # 1 GB in bytes
+    if get_db_mode() != "supabase" or is_supabase_offline():
+        return 0, total_bytes, 0.0, "Offline / Local Mode"
+        
+    try:
+        db_conn = _open_supabase_pg_conn(timeout=10)
+        try:
+            cur = db_conn.cursor()
+            
+            # 1. Database table & index size
+            try:
+                cur.execute("SELECT pg_database_size(current_database());")
+                r = cur.fetchone()
+                db_size = r[0] if r and r[0] else 0
+            except Exception:
+                db_size = 0
+                
+            # 2. Uploaded documents & receipts size
+            try:
+                cur.execute("SELECT COALESCE(SUM(file_size), 0) FROM cloud_file_storage;")
+                r = cur.fetchone()
+                files_size = r[0] if r and r[0] else 0
+            except Exception:
+                files_size = 0
+                
+            total_used = int(db_size) + int(files_size)
+            pct = min(100.0, (total_used / float(total_bytes)) * 100.0)
+            
+            used_mb = total_used / (1024.0 * 1024.0)
+            total_mb = 1024.0
+            
+            status_text = f"{used_mb:.1f} MB / {total_mb:,.0f} MB ({pct:.1f}% of 1 GB Free Tier)"
+            return total_used, total_bytes, pct, status_text
+        finally:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        return 0, total_bytes, 0.0, f"Error: {e}"
 
 
 def upload_local_database_to_supabase(progress_cb=None):
@@ -9367,10 +9538,8 @@ if HAS_DEPS:
             
             tb.Label(header_frame, text=self._tr("👥 Employee Management"), font=("Segoe UI", 22, "bold"), bootstyle="primary").pack(side=LEFT)
             
-            tb.Button(header_frame, text=self._tr("🔑 Change App Password"), bootstyle="danger outline", cursor="hand2", command=self.change_login_password).pack(side=RIGHT, padx=6)
-            tb.Button(header_frame, text=self._tr("Change Username"), bootstyle="info outline", cursor="hand2", command=self.change_login_username).pack(side=RIGHT, padx=6)
-            tb.Button(header_frame, text=self._tr("☁️ Cloud Upload / Sync"), bootstyle="success outline", cursor="hand2", command=lambda: self.change_db_location(default_tab="supabase")).pack(side=RIGHT, padx=6)
-            tb.Button(header_frame, text=self._tr("📂 Database Settings"), bootstyle="secondary outline", cursor="hand2", command=self.change_db_location).pack(side=RIGHT, padx=6)
+            tb.Button(header_frame, text=self._tr("⚙️ Database & App Settings"), bootstyle="secondary outline", cursor="hand2", command=self.open_settings_password_prompt).pack(side=RIGHT, padx=6)
+            tb.Button(header_frame, text=self._tr("🗄️ Database & Cloud Sync"), bootstyle="info outline", cursor="hand2", command=lambda: self.open_settings_dialog(default_tab="database")).pack(side=RIGHT, padx=6)
             
             btn_frame = tb.Frame(self.tab_names)
             btn_frame.pack(fill=X, padx=25, pady=(0, 15))
@@ -9592,392 +9761,7 @@ if HAS_DEPS:
             tb.Button(dialog, text="Update Password", bootstyle="success", command=save_password).pack(pady=20)
 
         def change_db_location(self, default_tab=None):
-            dialog = tb.Toplevel(self)
-            dialog.title(self._tr("Database Connection Settings"))
-            dialog.geometry("640x650")
-            dialog.transient(self)
-            dialog.grab_set()
-            dialog.focus_set()
-            
-            settings_notebook = tb.Notebook(dialog, bootstyle="info")
-            settings_notebook.pack(fill=BOTH, expand=True, padx=10, pady=10)
-
-            def _create_scrollable_tab(parent_nb, title):
-                tab = tb.Frame(parent_nb)
-                parent_nb.add(tab, text=title)
-                canvas = tk.Canvas(tab, highlightthickness=0)
-                scrollbar = tb.Scrollbar(tab, orient="vertical", command=canvas.yview)
-                scroll_content = tb.Frame(canvas, padding=15)
-                scroll_content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-                win_id = canvas.create_window((0, 0), window=scroll_content, anchor="nw")
-                def _on_cfg(e):
-                    canvas.itemconfigure(win_id, width=e.width)
-                canvas.bind("<Configure>", _on_cfg)
-                canvas.configure(yscrollcommand=scrollbar.set)
-                
-                def _wheel(e):
-                    try:
-                        delta = int(-1 * (e.delta / 120)) if getattr(e, "delta", 0) else (1 if getattr(e, "num", 0) == 5 else -1)
-                        canvas.yview_scroll(delta, "units")
-                    except Exception:
-                        pass
-                def _bind_w(w):
-                    try:
-                        w.bind("<MouseWheel>", _wheel, add="+")
-                        w.bind("<Button-4>", _wheel, add="+")
-                        w.bind("<Button-5>", _wheel, add="+")
-                    except Exception:
-                        pass
-                    for ch in w.winfo_children():
-                        _bind_w(ch)
-                dialog.after(120, lambda: _bind_w(scroll_content))
-                dialog.after(120, lambda: _bind_w(canvas))
-                
-                canvas.pack(side=LEFT, fill=BOTH, expand=True)
-                scrollbar.pack(side=RIGHT, fill=Y)
-                return tab, scroll_content
-            
-            # --- TAB 1: LOCAL DIR ---
-            tab_local_wrapper, tab_local = _create_scrollable_tab(settings_notebook, self._tr("Local (Offline / Shared Sync)"))
-            
-            tb.Label(tab_local, text=self._tr("Current storage directory:"), font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
-            
-            current_dir = get_default_app_dir()
-            config_data = get_db_config()
-            saved_dir = config_data.get("custom_db_directory") or current_dir
-            
-            lbl_current = tb.Label(tab_local, text=saved_dir, font=("Segoe UI", 9), wraplength=500, bootstyle="secondary")
-            lbl_current.pack(pady=5, padx=20)
-            
-            selected_path = tk.StringVar(value=saved_dir)
-            
-            def browse_folder():
-                folder = filedialog.askdirectory(parent=dialog, initialdir=saved_dir, title="Select Local/Sync Directory")
-                if folder:
-                    selected_path.set(folder)
-                    lbl_new.config(text=folder)
-            
-            tb.Button(tab_local, text=self._tr("📁 Select New Directory"), bootstyle="info outline", command=browse_folder).pack(pady=10)
-            
-            tb.Label(tab_local, text=self._tr("New target directory:"), font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
-            lbl_new = tb.Label(tab_local, text=saved_dir, font=("Segoe UI", 9, "italic"), wraplength=500, bootstyle="success")
-            lbl_new.pack(pady=5, padx=20)
-            
-            copy_files_var = tk.BooleanVar(value=True)
-            chk_copy = tb.Checkbutton(tab_local, text=self._tr("Copy database & employee folders if not present"), variable=copy_files_var, bootstyle="success-round-toggle")
-            chk_copy.pack(pady=10)
-            
-            def save_local_config():
-                new_dir = selected_path.get()
-                if not new_dir or not os.path.exists(new_dir):
-                    messagebox.showerror("Error", "Selected directory does not exist.", parent=dialog)
-                    return
-                
-                default_dir = get_default_app_dir()
-                real_new = os.path.abspath(new_dir)
-                
-                if copy_files_var.get() and real_new != os.path.abspath(saved_dir):
-                    old_db = os.path.join(saved_dir, "payroll_data.enc")
-                    new_db = os.path.join(real_new, "payroll_data.enc")
-                    old_emp_folders = os.path.join(saved_dir, "Employee_Folders")
-                    new_emp_folders = os.path.join(real_new, "Employee_Folders")
-                    old_exp_docs = os.path.join(saved_dir, "Expense_Documents")
-                    new_exp_docs = os.path.join(real_new, "Expense_Documents")
-                    
-                    if os.path.exists(old_db) and not os.path.exists(new_db):
-                        try:
-                            import shutil
-                            shutil.copy2(old_db, new_db)
-                        except Exception as e:
-                            messagebox.showwarning("Warning", f"Could not copy database: {e}", parent=dialog)
-                    if os.path.exists(old_emp_folders):
-                        try:
-                            import shutil
-                            os.makedirs(new_emp_folders, exist_ok=True)
-                            for item in os.listdir(old_emp_folders):
-                                s_item = os.path.join(old_emp_folders, item)
-                                d_item = os.path.join(new_emp_folders, item)
-                                if os.path.isdir(s_item):
-                                    if not os.path.exists(d_item):
-                                        shutil.copytree(s_item, d_item)
-                                else:
-                                    if not os.path.exists(d_item):
-                                        shutil.copy2(s_item, d_item)
-                        except Exception as e:
-                            messagebox.showwarning("Warning", f"Could not copy folders: {e}", parent=dialog)
-                    if os.path.exists(old_exp_docs):
-                        try:
-                            import shutil
-                            os.makedirs(new_exp_docs, exist_ok=True)
-                            for item in os.listdir(old_exp_docs):
-                                s_item = os.path.join(old_exp_docs, item)
-                                d_item = os.path.join(new_exp_docs, item)
-                                if os.path.isfile(s_item) and not os.path.exists(d_item):
-                                    shutil.copy2(s_item, d_item)
-                        except Exception as e:
-                            messagebox.showwarning("Warning", f"Could not copy expense documents: {e}", parent=dialog)
-                    old_shop_files = os.path.join(saved_dir, "Shop_Files")
-                    new_shop_files = os.path.join(real_new, "Shop_Files")
-                    if os.path.exists(old_shop_files):
-                        try:
-                            import shutil
-                            os.makedirs(new_shop_files, exist_ok=True)
-                            for item in os.listdir(old_shop_files):
-                                s_item = os.path.join(old_shop_files, item)
-                                d_item = os.path.join(new_shop_files, item)
-                                if os.path.isdir(s_item):
-                                    if not os.path.exists(d_item):
-                                        shutil.copytree(s_item, d_item)
-                                elif os.path.isfile(s_item) and not os.path.exists(d_item):
-                                    shutil.copy2(s_item, d_item)
-                        except Exception as e:
-                            messagebox.showwarning("Warning", f"Could not copy shop files: {e}", parent=dialog)
-                
-                config_file = os.path.join(default_dir, "location_config.json")
-                try:
-                    import json
-                    new_config = {
-                        "mode": "local",
-                        "custom_db_directory": real_new if real_new != os.path.abspath(default_dir) else None
-                    }
-                    with open(config_file, "w", encoding="utf-8") as f:
-                        json.dump(new_config, f, indent=4)
-                    messagebox.showinfo("Restart Required", "Storage directory successfully updated!\n\nPlease restart the app to apply the changes.", parent=dialog)
-                    dialog.destroy()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to save: {e}", parent=dialog)
-            
-            def reset_local_default():
-                selected_path.set(get_default_app_dir())
-                lbl_new.config(text=get_default_app_dir())
-                
-            local_btn_frame = tb.Frame(tab_local)
-            local_btn_frame.pack(pady=15)
-            tb.Button(local_btn_frame, text=self._tr("Reset to Default"), bootstyle="secondary", command=reset_local_default).pack(side=LEFT, padx=10)
-            tb.Button(local_btn_frame, text=self._tr("Save Configuration"), bootstyle="success", command=save_local_config).pack(side=LEFT, padx=10)
-            
-            # --- TAB 2: SUPABASE CLOUD ---
-            tab_remote_wrapper, tab_remote = _create_scrollable_tab(settings_notebook, self._tr("Supabase Cloud Database"))
-            
-            tb.Label(tab_remote, text=self._tr("Supabase DB Host / Project Endpoint:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
-            db_host_var = tk.StringVar(value=config_data.get("supabase_host") or "db.xxxx.supabase.co")
-            db_host_entry = tb.Entry(tab_remote, textvariable=db_host_var, width=45)
-            db_host_entry.pack(pady=5, fill=X)
-            
-            tb.Label(tab_remote, text=self._tr("Database Password:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
-            db_password_var = tk.StringVar(value=config_data.get("supabase_password") or "")
-            db_password_entry = tb.Entry(tab_remote, show="*", textvariable=db_password_var, width=45)
-            db_password_entry.pack(pady=5, fill=X)
-            
-            extra_frame = tb.Frame(tab_remote)
-            extra_frame.pack(fill=X, pady=10)
-            
-            tb.Label(extra_frame, text=self._tr("DB Name:"), font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky=W, padx=(0, 10))
-            db_name_var = tk.StringVar(value=config_data.get("supabase_database") or "postgres")
-            db_name_entry = tb.Entry(extra_frame, textvariable=db_name_var, width=15)
-            db_name_entry.grid(row=0, column=1, sticky=W)
-            
-            tb.Label(extra_frame, text=self._tr("Port:"), font=("Segoe UI", 10, "bold")).grid(row=0, column=2, sticky=W, padx=(20, 10))
-            db_port_var = tk.StringVar(value=config_data.get("supabase_port") or "5432")
-            db_port_entry = tb.Entry(extra_frame, textvariable=db_port_var, width=10)
-            db_port_entry.grid(row=0, column=3, sticky=W)
-
-            tb.Label(tab_remote, text=self._tr("DB Username:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
-            db_user_var = tk.StringVar(value=config_data.get("supabase_user") or "postgres")
-            db_user_entry = tb.Entry(tab_remote, textvariable=db_user_var, width=45)
-            db_user_entry.pack(pady=5, fill=X)
-            
-            tb.Label(
-                tab_remote,
-                text=(
-                    "How sync works:\n"
-                    "1) On the MAIN PC (has your current data): Verify & Save, then Upload Local → Cloud.\n"
-                    "2) On the 2nd Mac/PC: enter the SAME Supabase settings → Verify & Save → Restart.\n"
-                    "3) The 2nd PC only loads what is already in the cloud (no re-seed / no duplicates).\n"
-                    "4) After that, both PCs use the same live database — each change is shared."
-                ),
-                font=("Segoe UI", 9),
-                bootstyle="secondary",
-                justify=LEFT,
-                wraplength=560,
-            ).pack(anchor=W, pady=(0, 12))
-
-            def test_and_save_supabase():
-                raw_cfg = {
-                    "supabase_host": db_host_var.get().strip(),
-                    "supabase_password": db_password_var.get().strip(),
-                    "supabase_port": db_port_var.get().strip(),
-                    "supabase_database": db_name_var.get().strip(),
-                    "supabase_user": db_user_var.get().strip(),
-                }
-                clean_cfg = _clean_supabase_config(raw_cfg)
-                host = clean_cfg["supabase_host"]
-                password = clean_cfg["supabase_password"]
-                port = clean_cfg["supabase_port"]
-                database = clean_cfg["supabase_database"]
-                username = clean_cfg["supabase_user"]
-
-                # Update UI entries with cleaned values
-                db_host_var.set(host)
-                db_port_var.set(str(port))
-                db_user_var.set(username)
-                db_name_var.set(database)
-                
-                if not host or not password:
-                    messagebox.showerror("Validation Error", "Host and Password are required.", parent=dialog)
-                    return
-                try:
-                    import pg8000.dbapi
-                except ImportError:
-                    messagebox.showerror("Error", "pg8000 missing. Run pip install pg8000", parent=dialog)
-                    return
-                try:
-                    conn = pg8000.dbapi.connect(
-                        host=host,
-                        port=int(port),
-                        user=username,
-                        password=password,
-                        database=database,
-                        timeout=10
-                    )
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT 1")
-                    conn.close()
-                except Exception as e:
-                    messagebox.showerror("Connection Failed", f"Could not connect: {e}", parent=dialog)
-                    return
-                    
-                default_dir = get_default_app_dir()
-                config_file = os.path.join(default_dir, "location_config.json")
-                try:
-                    import json
-                    new_config = config_data.copy()
-                    new_config["mode"] = "supabase"
-                    new_config["supabase_host"] = host
-                    new_config["supabase_password"] = password
-                    new_config["supabase_port"] = str(port)
-                    new_config["supabase_database"] = database
-                    new_config["supabase_user"] = username
-                    with open(config_file, "w", encoding="utf-8") as f:
-                        json.dump(new_config, f, indent=4)
-                    messagebox.showinfo(
-                        "Success",
-                        "Supabase cloud configuration saved!\n\n"
-                        "• MAIN PC: use “Upload Local → Cloud” once to publish your data.\n"
-                        "• 2nd PC: just restart — it will fetch the shared cloud data.\n\n"
-                        "Please restart the app.",
-                        parent=dialog,
-                    )
-                    dialog.destroy()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to save: {e}", parent=dialog)
-
-            def do_upload_local_to_cloud():
-                if not messagebox.askyesno(
-                    "Upload Local → Cloud",
-                    "This will REPLACE all cloud payroll data with this PC's local database.\n\n"
-                    "Use this once on the MAIN PC that has the correct data.\n\nContinue?",
-                    parent=dialog,
-                ):
-                    return
-                # Persist credentials first if fields are filled
-                raw_cfg = {
-                    "supabase_host": db_host_var.get().strip(),
-                    "supabase_password": db_password_var.get().strip(),
-                    "supabase_port": db_port_var.get().strip(),
-                    "supabase_database": db_name_var.get().strip(),
-                    "supabase_user": db_user_var.get().strip(),
-                }
-                clean_cfg = _clean_supabase_config(raw_cfg)
-                host = clean_cfg["supabase_host"]
-                password = clean_cfg["supabase_password"]
-                if host and password:
-                    try:
-                        import json
-                        default_dir = get_default_app_dir()
-                        config_file = os.path.join(default_dir, "location_config.json")
-                        new_config = get_db_config().copy()
-                        new_config["mode"] = "supabase"
-                        new_config["supabase_host"] = host
-                        new_config["supabase_password"] = password
-                        new_config["supabase_port"] = str(clean_cfg["supabase_port"])
-                        new_config["supabase_database"] = clean_cfg["supabase_database"]
-                        new_config["supabase_user"] = clean_cfg["supabase_user"]
-                        with open(config_file, "w", encoding="utf-8") as f:
-                            json.dump(new_config, f, indent=4)
-                    except Exception as e:
-                        messagebox.showerror("Error", f"Could not save config: {e}", parent=dialog)
-                        return
-                status = {"text": "Starting..."}
-                self.show_busy("Uploading local database to cloud…")
-                try:
-                    def _progress(t):
-                        status.update(text=t)
-                        try:
-                            self._busy_msg_var.set(t)
-                            self.update_idletasks()
-                        except Exception:
-                            pass
-                    upload_local_database_to_supabase(progress_cb=_progress)
-                    self.hide_busy()
-                    messagebox.showinfo(
-                        "Upload Complete",
-                        f"Local database uploaded to Supabase.\n\nLast step: {status.get('text')}\n\n"
-                        "Restart this app, then on the 2nd PC enter the same Supabase settings and restart.",
-                        parent=dialog,
-                    )
-                except Exception as e:
-                    self.hide_busy()
-                    self.show_app_error("Upload Failed", e, parent=dialog)
-
-            def do_cleanup_cloud():
-                if not messagebox.askyesno(
-                    "Clean Up Cloud",
-                    "Remove duplicate Shop/config rows and clear sync history noise on Supabase?",
-                    parent=dialog,
-                ):
-                    return
-                self.show_busy("Cleaning cloud duplicates…")
-                try:
-                    if self.is_busy_cancelled():
-                        return
-                    cleanup_supabase_duplicates()
-                    self.hide_busy()
-                    messagebox.showinfo("Cleanup Complete", "Cloud duplicates cleaned.", parent=dialog)
-                except Exception as e:
-                    self.hide_busy()
-                    self.show_app_error("Cleanup Failed", e, parent=dialog)
-            
-            def do_sync_files():
-                self.show_busy("Syncing documents to cloud…")
-                try:
-                    ok, msg = sync_all_local_files_to_cloud()
-                    self.hide_busy()
-                    if ok:
-                        messagebox.showinfo("Files Synced", str(msg), parent=dialog)
-                    else:
-                        messagebox.showerror("Sync Failed", str(msg), parent=dialog)
-                except Exception as e:
-                    self.hide_busy()
-                    messagebox.showerror("Sync Error", str(e), parent=dialog)
-
-            btn_row = tb.Frame(tab_remote)
-            btn_row.pack(pady=10, fill=X)
-            tb.Button(btn_row, text=self._tr("Verify & Save Configuration"), bootstyle="success", command=test_and_save_supabase).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text="Upload Local → Cloud", bootstyle="warning", command=do_upload_local_to_cloud).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text="📁 Sync Local Files → Cloud", bootstyle="info", command=do_sync_files).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text="Clean Up Cloud Duplicates", bootstyle="secondary", command=do_cleanup_cloud).pack(side=LEFT)
-            
-            # --- TAB 3: ACTIVITY LOG & BACKUPS ---
-            tab_history = tb.Frame(settings_notebook, padding=15)
-            settings_notebook.add(tab_history, text=self._tr("History & Backups"))
-            self._build_activity_and_backup_panel(tab_history)
-            
-            
-            if default_tab == "supabase" or config_data.get("mode") == "supabase":
-                settings_notebook.select(tab_remote_wrapper)
-            else:
-                settings_notebook.select(tab_local_wrapper)
+            return self.open_settings_dialog(default_tab="database" if default_tab != "supabase" else "supabase")
 
         def load_employees(self, quiet=False):
             if quiet:
@@ -14504,6 +14288,117 @@ if HAS_DEPS:
                 top = parent.winfo_toplevel()
             except Exception:
                 top = parent
+            # --- CSV Log Downloader from Date to Date ---
+            exp_lf = tb.Labelframe(parent, text=self._tr("📥 Download Activity Logs (CSV)"), padding=10, bootstyle="primary")
+            exp_lf.pack(fill=X, pady=(0, 12))
+            
+            exp_row = tb.Frame(exp_lf)
+            exp_row.pack(fill=X, pady=4)
+            
+            tb.Label(exp_row, text=self._tr("From Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
+            start_dt_ent = tb.DateEntry(exp_row, bootstyle="primary", dateformat='%Y-%m-%d')
+            start_dt_ent.entry.delete(0, tk.END)
+            start_dt_ent.entry.insert(0, (datetime.today() - timedelta(days=30)).strftime('%Y-%m-%d'))
+            start_dt_ent.pack(side=LEFT, padx=(0, 12))
+            
+            tb.Label(exp_row, text=self._tr("To Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
+            end_dt_ent = tb.DateEntry(exp_row, bootstyle="primary", dateformat='%Y-%m-%d')
+            end_dt_ent.entry.delete(0, tk.END)
+            end_dt_ent.entry.insert(0, datetime.today().strftime('%Y-%m-%d'))
+            end_dt_ent.pack(side=LEFT, padx=(0, 12))
+            
+            tb.Label(exp_row, text=self._tr("Type:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
+            cbo_log_type = tb.Combobox(exp_row, width=20, state="readonly", values=[self._tr("All Activity Logs"), self._tr("User Actions Only"), self._tr("Database Changes Only")])
+            cbo_log_type.set(self._tr("All Activity Logs"))
+            cbo_log_type.pack(side=LEFT, padx=(0, 12))
+            
+            def do_export_csv():
+                s_date = start_dt_ent.entry.get().strip()
+                e_date = end_dt_ent.entry.get().strip()
+                if not s_date or not e_date:
+                    messagebox.showerror("Error", self._tr("Please select valid Start and End dates."), parent=top)
+                    return
+                l_type = cbo_log_type.get()
+                
+                save_path = filedialog.asksaveasfilename(
+                    parent=top,
+                    title=self._tr("Save Activity Logs CSV"),
+                    defaultextension=".csv",
+                    filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+                    initialfile=f"activity_logs_{s_date}_to_{e_date}.csv"
+                )
+                if not save_path:
+                    return
+                    
+                try:
+                    import csv
+                    rows_out = []
+                    conn = sqlite3.connect(TEMP_DB_PATH)
+                    cur = conn.cursor()
+                    
+                    # 1. user_action_log
+                    if "User Actions" in l_type or "All" in l_type or l_type == self._tr("All Activity Logs"):
+                        try:
+                            cur.execute(
+                                """
+                                SELECT created_at, user_name, action, table_name, record_id, summary, details
+                                FROM user_action_log
+                                WHERE created_at >= ? AND created_at <= ?
+                                ORDER BY created_at ASC
+                                """,
+                                (f"{s_date} 00:00:00", f"{e_date} 23:59:59")
+                            )
+                            for r in cur.fetchall() or []:
+                                rows_out.append([
+                                    r[0] or "",
+                                    plain_label(r[1]) or "unknown",
+                                    r[2] or "USER_ACTION",
+                                    f"{r[3] or ''} #{r[4] or ''}".strip(),
+                                    plain_label(r[5]) or "",
+                                    plain_label(r[6]) or ""
+                                ])
+                        except Exception:
+                            pass
+                            
+                    # 2. database_history_log
+                    if "Database" in l_type or "All" in l_type or l_type == self._tr("All Activity Logs"):
+                        try:
+                            cur.execute(
+                                """
+                                SELECT timestamp, user_name, action, table_name, row_id, old_data, new_data
+                                FROM database_history_log
+                                WHERE timestamp >= ? AND timestamp <= ?
+                                ORDER BY timestamp ASC
+                                """,
+                                (f"{s_date} 00:00:00", f"{e_date} 23:59:59")
+                            )
+                            for r in cur.fetchall() or []:
+                                rows_out.append([
+                                    r[0] or "",
+                                    plain_label(r[1]) or "system",
+                                    r[2] or "DB_MUTATION",
+                                    f"{r[3] or ''} #{r[4] or ''}".strip(),
+                                    f"Old: {plain_label(r[5]) or ''}",
+                                    f"New: {plain_label(r[6]) or ''}"
+                                ])
+                        except Exception:
+                            pass
+                            
+                    conn.close()
+                    rows_out.sort(key=lambda x: str(x[0]))
+                    
+                    with open(save_path, "w", newline="", encoding="utf-8-sig") as csv_f:
+                        writer = csv.writer(csv_f)
+                        writer.writerow(["Timestamp", "User", "Action", "Target", "Summary / Old Data", "Details / New Data"])
+                        for ro in rows_out:
+                            writer.writerow(ro)
+                            
+                    messagebox.showinfo("Export Successful", f"Successfully exported {len(rows_out)} log entries to:\n{save_path}", parent=top)
+                except Exception as e:
+                    messagebox.showerror("Export Failed", str(e), parent=top)
+
+            tb.Button(exp_row, text=self._tr("📥 Download CSV"), bootstyle="success", command=do_export_csv).pack(side=LEFT)
+
             log_lf = tb.Labelframe(parent, text=self._tr("Activity log"), padding=10)
             log_lf.pack(fill=BOTH, expand=True, pady=(0, 12))
             filter_row = tb.Frame(log_lf)
@@ -14525,11 +14420,11 @@ if HAS_DEPS:
             log_tree.column("Action", width=420, anchor=W)
             self._attach_tree_scrollbars(log_holder, log_tree)
 
-            bak_lf = tb.Labelframe(parent, text=self._tr("Cloud backups"), padding=10)
+            bak_lf = tb.Labelframe(parent, text=self._tr("📁 Daily Backups (Local & Supabase Cloud)"), padding=10, bootstyle="info")
             bak_lf.pack(fill=BOTH, expand=True)
             tb.Label(
                 bak_lf,
-                text=self._tr("Two backups are saved in Supabase every day (morning and afternoon)."),
+                text=self._tr("Daily morning (AM) and afternoon (PM) backups are saved locally on each linked device and synced to Supabase Cloud."),
                 font=("Segoe UI", 10),
                 bootstyle="secondary",
                 wraplength=720,
@@ -14539,13 +14434,13 @@ if HAS_DEPS:
             bak_holder = tb.Frame(bak_lf)
             bak_holder.pack(fill=BOTH, expand=True)
             bak_tree = tb.Treeview(bak_holder, columns=bak_cols, show="headings", height=6, bootstyle="secondary")
-            bak_tree.heading("When", text=self._tr("Date"))
-            bak_tree.heading("Slot", text="Slot")
-            bak_tree.heading("User", text=self._tr("User"))
-            bak_tree.heading("Size", text="Size")
-            bak_tree.column("When", width=160, anchor=CENTER)
-            bak_tree.column("Slot", width=160, anchor=CENTER)
-            bak_tree.column("User", width=120, anchor=CENTER)
+            bak_tree.heading("When", text=self._tr("Date & Time"))
+            bak_tree.heading("Slot", text=self._tr("Type / Slot"))
+            bak_tree.heading("User", text=self._tr("Device / User"))
+            bak_tree.heading("Size", text=self._tr("Size"))
+            bak_tree.column("When", width=150, anchor=CENTER)
+            bak_tree.column("Slot", width=160, anchor=W)
+            bak_tree.column("User", width=220, anchor=W)
             bak_tree.column("Size", width=90, anchor=CENTER)
             self._attach_tree_scrollbars(bak_holder, bak_tree)
 
@@ -14610,7 +14505,7 @@ if HAS_DEPS:
 
                 def run():
                     try:
-                        recs = list_cloud_backups(40)
+                        recs = list_all_backups(60)
                     except Exception:
                         recs = []
 
@@ -14619,13 +14514,8 @@ if HAS_DEPS:
                             if loading_id and bak_tree.exists(loading_id):
                                 bak_tree.delete(loading_id)
                             for rec in recs:
-                                slot = rec.get("slot") or ""
+                                slot_label = rec.get("slot") or "Backup"
                                 key = rec.get("slot_key") or ""
-                                label = {
-                                    "am": "Morning",
-                                    "pm": "Afternoon",
-                                    "manual": "Manual",
-                                }.get(str(slot).lower(), slot)
                                 size = rec.get("size_bytes") or 0
                                 try:
                                     size_txt = f"{int(size) / 1024:.0f} KB"
@@ -14635,7 +14525,7 @@ if HAS_DEPS:
                                     "",
                                     tk.END,
                                     iid=key,
-                                    values=(rec.get("created_at") or "", f"{label}  {key}", rec.get("created_by") or "", size_txt),
+                                    values=(rec.get("created_at") or "", slot_label, rec.get("created_by") or "", size_txt),
                                 )
                         except Exception:
                             pass
@@ -14648,11 +14538,11 @@ if HAS_DEPS:
                 import threading
                 threading.Thread(target=run, daemon=True).start()
 
-            def do_cloud_backup():
+            def do_backup_now():
                 try:
                     ok, msg = create_cloud_backup(kind="manual")
                     if ok:
-                        messagebox.showinfo("Backup Success", "Cloud backup saved to Supabase.", parent=top)
+                        messagebox.showinfo("Backup Success", "Backup saved locally on this device and synced to Supabase Cloud.", parent=top)
                         load_backups()
                         load_logs()
                     else:
@@ -14666,16 +14556,18 @@ if HAS_DEPS:
                     messagebox.showwarning("Select", "Please select a backup to restore.", parent=top)
                     return
                 key = sel[0]
+                is_loc = str(key).startswith("local::")
+                source_txt = "Local disk backup on this PC" if is_loc else "Supabase Cloud backup"
                 if not messagebox.askyesno(
                     "Restore backup",
-                    "This replaces current data with the selected cloud backup.\n\nContinue?",
+                    f"This will replace current application data with the selected {source_txt}.\n\nContinue?",
                     parent=top,
                 ):
                     return
                 try:
                     ok, msg = restore_cloud_backup(key)
                     if ok:
-                        messagebox.showinfo("Restore", "Backup restored. Refresh the screens to see it.", parent=top)
+                        messagebox.showinfo("Restore", "Backup restored successfully. Refreshing views...", parent=top)
                         try:
                             self._schedule_soft_ui_refresh(full=True)
                         except Exception:
@@ -14693,23 +14585,346 @@ if HAS_DEPS:
             user_filter.bind("<<ComboboxSelected>>", lambda e: load_logs())
             btn_row = tb.Frame(bak_lf)
             btn_row.pack(fill=X, pady=(8, 0))
-            tb.Button(btn_row, text=self._tr("🔄 Refresh Logs"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text=self._tr("📥 Backup now to cloud"), bootstyle="success", command=do_cloud_backup).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text=self._tr("Restore selected backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT)
+            tb.Button(btn_row, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_row, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_row, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT)
             refresh_all()
 
-        def open_settings_dialog(self):
+        def _build_database_and_cloud_panel(self, parent, dialog):
+            """Embeds Supabase Cloud settings with live 1GB storage meter, and local directory changer."""
+            db_notebook = tb.Notebook(parent, bootstyle="info")
+            db_notebook.pack(fill=BOTH, expand=True, padx=10, pady=10)
+
+            def _create_scrollable_subtab(parent_nb, title):
+                tab = tb.Frame(parent_nb)
+                parent_nb.add(tab, text=title)
+                canvas = tk.Canvas(tab, highlightthickness=0)
+                scrollbar = tb.Scrollbar(tab, orient="vertical", command=canvas.yview)
+                scroll_content = tb.Frame(canvas, padding=15)
+                scroll_content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+                win_id = canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+                def _on_cfg(e):
+                    canvas.itemconfigure(win_id, width=e.width)
+                canvas.bind("<Configure>", _on_cfg)
+                canvas.configure(yscrollcommand=scrollbar.set)
+                
+                def _wheel(e):
+                    try:
+                        delta = int(-1 * (e.delta / 120)) if getattr(e, "delta", 0) else (1 if getattr(e, "num", 0) == 5 else -1)
+                        canvas.yview_scroll(delta, "units")
+                    except Exception:
+                        pass
+                def _bind_w(w):
+                    try:
+                        w.bind("<MouseWheel>", _wheel, add="+")
+                        w.bind("<Button-4>", _wheel, add="+")
+                        w.bind("<Button-5>", _wheel, add="+")
+                    except Exception:
+                        pass
+                    for ch in w.winfo_children():
+                        _bind_w(ch)
+                dialog.after(120, lambda: _bind_w(scroll_content))
+                dialog.after(120, lambda: _bind_w(canvas))
+                
+                canvas.pack(side=LEFT, fill=BOTH, expand=True)
+                scrollbar.pack(side=RIGHT, fill=Y)
+                return tab, scroll_content
+
+            config_data = get_db_config()
+
+            # --- SUB-TAB 1: SUPABASE CLOUD ---
+            tab_remote_wrapper, tab_remote = _create_scrollable_subtab(db_notebook, self._tr("☁️ Supabase Cloud Database"))
+            
+            # --- Live 1 GB Free Tier Storage Meter ---
+            storage_card = tb.Labelframe(tab_remote, text=self._tr("📊 Supabase Cloud Storage (1 GB Free Tier)"), padding=12, bootstyle="info")
+            storage_card.pack(fill=X, pady=(5, 12))
+            
+            lbl_storage_txt = tb.Label(storage_card, text=self._tr("Storage Used: Checking..."), font=("Segoe UI", 11, "bold"), bootstyle="primary")
+            lbl_storage_txt.pack(anchor=W, pady=(0, 4))
+            
+            storage_pbar = tb.Progressbar(storage_card, bootstyle="success-striped", maximum=100, value=0)
+            storage_pbar.pack(fill=X, pady=(0, 6))
+            
+            sub_row = tb.Frame(storage_card)
+            sub_row.pack(fill=X)
+            lbl_storage_sub = tb.Label(sub_row, text=self._tr("Database Tables, Row History & Uploaded Documents"), font=("Segoe UI", 9), bootstyle="secondary")
+            lbl_storage_sub.pack(side=LEFT)
+            
+            def refresh_storage_meter():
+                lbl_storage_txt.config(text=self._tr("Storage Used: Calculating..."))
+                def _fetch():
+                    used_b, tot_b, pct, txt = get_supabase_storage_usage()
+                    def _update():
+                        if not dialog.winfo_exists():
+                            return
+                        lbl_storage_txt.config(text=f"{self._tr('Storage Used:')} {txt}")
+                        storage_pbar["value"] = pct
+                        if pct < 70.0:
+                            storage_pbar.configure(bootstyle="success-striped")
+                        elif pct < 90.0:
+                            storage_pbar.configure(bootstyle="warning-striped")
+                        else:
+                            storage_pbar.configure(bootstyle="danger-striped")
+                    try:
+                        dialog.after(0, _update)
+                    except Exception:
+                        pass
+                import threading
+                threading.Thread(target=_fetch, daemon=True).start()
+                
+            tb.Button(sub_row, text=self._tr("🔄 Check Live Storage"), bootstyle="info outline", cursor="hand2", command=refresh_storage_meter).pack(side=RIGHT)
+            try:
+                dialog.after(300, refresh_storage_meter)
+            except Exception:
+                pass
+
+            tb.Label(tab_remote, text=self._tr("Supabase DB Host / Project Endpoint:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
+            db_host_var = tk.StringVar(value=config_data.get("supabase_host") or "db.xxxx.supabase.co")
+            db_host_entry = tb.Entry(tab_remote, textvariable=db_host_var, width=45)
+            db_host_entry.pack(pady=5, fill=X)
+            
+            tb.Label(tab_remote, text=self._tr("Database Password:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
+            db_password_var = tk.StringVar(value=config_data.get("supabase_password") or "")
+            db_password_entry = tb.Entry(tab_remote, show="*", textvariable=db_password_var, width=45)
+            db_password_entry.pack(pady=5, fill=X)
+            
+            extra_frame = tb.Frame(tab_remote)
+            extra_frame.pack(fill=X, pady=10)
+            
+            tb.Label(extra_frame, text=self._tr("DB Name:"), font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky=W, padx=(0, 10))
+            db_name_var = tk.StringVar(value=config_data.get("supabase_database") or "postgres")
+            db_name_entry = tb.Entry(extra_frame, textvariable=db_name_var, width=15)
+            db_name_entry.grid(row=0, column=1, sticky=W)
+            
+            tb.Label(extra_frame, text=self._tr("Port:"), font=("Segoe UI", 10, "bold")).grid(row=0, column=2, sticky=W, padx=(20, 10))
+            db_port_var = tk.StringVar(value=config_data.get("supabase_port") or "5432")
+            db_port_entry = tb.Entry(extra_frame, textvariable=db_port_var, width=10)
+            db_port_entry.grid(row=0, column=3, sticky=W)
+
+            tb.Label(tab_remote, text=self._tr("DB Username:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
+            db_user_var = tk.StringVar(value=config_data.get("supabase_user") or "postgres")
+            db_user_entry = tb.Entry(tab_remote, textvariable=db_user_var, width=45)
+            db_user_entry.pack(pady=5, fill=X)
+
+            def test_and_save_supabase():
+                raw_cfg = {
+                    "supabase_host": db_host_var.get().strip(),
+                    "supabase_password": db_password_var.get().strip(),
+                    "supabase_port": db_port_var.get().strip(),
+                    "supabase_database": db_name_var.get().strip(),
+                    "supabase_user": db_user_var.get().strip(),
+                }
+                clean_cfg = _clean_supabase_config(raw_cfg)
+                host = clean_cfg["supabase_host"]
+                password = clean_cfg["supabase_password"]
+                port = clean_cfg["supabase_port"]
+                database = clean_cfg["supabase_database"]
+                username = clean_cfg["supabase_user"]
+
+                db_host_var.set(host)
+                db_port_var.set(str(port))
+                db_user_var.set(username)
+                db_name_var.set(database)
+                
+                if not host or not password:
+                    messagebox.showerror("Validation Error", "Host and Password are required.", parent=dialog)
+                    return
+                try:
+                    import pg8000.dbapi
+                except ImportError:
+                    messagebox.showerror("Error", "pg8000 missing. Run pip install pg8000", parent=dialog)
+                    return
+                try:
+                    conn = pg8000.dbapi.connect(
+                        host=host,
+                        port=int(port),
+                        user=username,
+                        password=password,
+                        database=database,
+                        timeout=10
+                    )
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1")
+                    conn.close()
+                except Exception as e:
+                    messagebox.showerror("Connection Failed", f"Could not connect: {e}", parent=dialog)
+                    return
+                    
+                default_dir = get_default_app_dir()
+                config_file = os.path.join(default_dir, "location_config.json")
+                try:
+                    import json
+                    new_config = get_db_config().copy()
+                    new_config["mode"] = "supabase"
+                    new_config["supabase_host"] = host
+                    new_config["supabase_password"] = password
+                    new_config["supabase_port"] = str(port)
+                    new_config["supabase_database"] = database
+                    new_config["supabase_user"] = username
+                    with open(config_file, "w", encoding="utf-8") as f:
+                        json.dump(new_config, f, indent=4)
+                    refresh_storage_meter()
+                    messagebox.showinfo("Success", "Supabase configuration verified and saved!\n\nPlease restart the app to activate Supabase mode.", parent=dialog)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to save configuration: {e}", parent=dialog)
+
+            def do_upload_local_to_cloud():
+                raw_cfg = {
+                    "supabase_host": db_host_var.get().strip(),
+                    "supabase_password": db_password_var.get().strip(),
+                    "supabase_port": db_port_var.get().strip(),
+                    "supabase_database": db_name_var.get().strip(),
+                    "supabase_user": db_user_var.get().strip(),
+                }
+                clean_cfg = _clean_supabase_config(raw_cfg)
+                host = clean_cfg["supabase_host"]
+                password = clean_cfg["supabase_password"]
+                if host and password:
+                    try:
+                        import json
+                        default_dir = get_default_app_dir()
+                        config_file = os.path.join(default_dir, "location_config.json")
+                        new_config = get_db_config().copy()
+                        new_config["mode"] = "supabase"
+                        new_config["supabase_host"] = host
+                        new_config["supabase_password"] = password
+                        new_config["supabase_port"] = str(clean_cfg["supabase_port"])
+                        new_config["supabase_database"] = clean_cfg["supabase_database"]
+                        new_config["supabase_user"] = clean_cfg["supabase_user"]
+                        with open(config_file, "w", encoding="utf-8") as f:
+                            json.dump(new_config, f, indent=4)
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Could not save config: {e}", parent=dialog)
+                        return
+                status = {"text": "Starting..."}
+                self.show_busy("Uploading local database to cloud…")
+                try:
+                    def _progress(t):
+                        status.update(text=t)
+                        try:
+                            self._busy_msg_var.set(t)
+                            self.update_idletasks()
+                        except Exception:
+                            pass
+                    upload_local_database_to_supabase(progress_cb=_progress)
+                    self.hide_busy()
+                    refresh_storage_meter()
+                    messagebox.showinfo(
+                        "Upload Complete",
+                        f"Local database uploaded to Supabase.\n\nLast step: {status.get('text')}\n\n"
+                        "Restart this app, then on the 2nd PC enter the same Supabase settings and restart.",
+                        parent=dialog,
+                    )
+                except Exception as e:
+                    self.hide_busy()
+                    self.show_app_error("Upload Failed", e, parent=dialog)
+
+            def do_cleanup_cloud():
+                if not messagebox.askyesno(
+                    "Clean Up Cloud",
+                    "Remove duplicate Shop/config rows and clear sync history noise on Supabase?",
+                    parent=dialog,
+                ):
+                    return
+                self.show_busy("Cleaning cloud duplicates…")
+                try:
+                    if self.is_busy_cancelled():
+                        return
+                    cleanup_supabase_duplicates()
+                    self.hide_busy()
+                    refresh_storage_meter()
+                    messagebox.showinfo("Cleanup Complete", "Cloud duplicates cleaned.", parent=dialog)
+                except Exception as e:
+                    self.hide_busy()
+                    self.show_app_error("Cleanup Failed", e, parent=dialog)
+            
+            def do_sync_files():
+                self.show_busy("Syncing documents to cloud…")
+                try:
+                    ok, msg = sync_all_local_files_to_cloud()
+                    self.hide_busy()
+                    refresh_storage_meter()
+                    if ok:
+                        messagebox.showinfo("Files Synced", str(msg), parent=dialog)
+                    else:
+                        messagebox.showerror("Sync Failed", str(msg), parent=dialog)
+                except Exception as e:
+                    self.hide_busy()
+                    messagebox.showerror("Sync Error", str(e), parent=dialog)
+
+            btn_row = tb.Frame(tab_remote)
+            btn_row.pack(pady=10, fill=X)
+            tb.Button(btn_row, text=self._tr("Verify & Save Configuration"), bootstyle="success", command=test_and_save_supabase).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_row, text="Upload Local → Cloud", bootstyle="warning", command=do_upload_local_to_cloud).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_row, text="📁 Sync Local Files → Cloud", bootstyle="info", command=do_sync_files).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_row, text="Clean Up Cloud Duplicates", bootstyle="secondary", command=do_cleanup_cloud).pack(side=LEFT)
+
+            # --- SUB-TAB 2: LOCAL DIR ---
+            tab_local_wrapper, tab_local = _create_scrollable_subtab(db_notebook, self._tr("📁 Local Storage Directory"))
+            tb.Label(tab_local, text=self._tr("Current storage directory:"), font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
+            current_dir = get_default_app_dir()
+            saved_dir = config_data.get("custom_db_directory") or current_dir
+            lbl_current = tb.Label(tab_local, text=saved_dir, font=("Segoe UI", 9), wraplength=500, bootstyle="secondary")
+            lbl_current.pack(pady=5, padx=20)
+            selected_path = tk.StringVar(value=saved_dir)
+            
+            def browse_folder():
+                folder = filedialog.askdirectory(parent=dialog, initialdir=saved_dir, title="Select Local/Sync Directory")
+                if folder:
+                    selected_path.set(folder)
+                    lbl_new.config(text=folder)
+            
+            tb.Button(tab_local, text=self._tr("📁 Select New Directory"), bootstyle="info outline", command=browse_folder).pack(pady=10)
+            tb.Label(tab_local, text=self._tr("New target directory:"), font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
+            lbl_new = tb.Label(tab_local, text=saved_dir, font=("Segoe UI", 9, "italic"), wraplength=500, bootstyle="success")
+            lbl_new.pack(pady=5, padx=20)
+            
+            copy_files_var = tk.BooleanVar(value=True)
+            chk_copy = tb.Checkbutton(tab_local, text=self._tr("Copy database & employee folders if not present"), variable=copy_files_var, bootstyle="success-round-toggle")
+            chk_copy.pack(pady=10)
+            
+            def save_local_config():
+                new_dir = selected_path.get()
+                if not new_dir or not os.path.exists(new_dir):
+                    messagebox.showerror("Error", "Selected directory does not exist.", parent=dialog)
+                    return
+                default_dir = get_default_app_dir()
+                real_new = os.path.abspath(new_dir)
+                config_file = os.path.join(default_dir, "location_config.json")
+                try:
+                    import json
+                    new_config = {
+                        "mode": "local",
+                        "custom_db_directory": real_new if real_new != os.path.abspath(default_dir) else None
+                    }
+                    with open(config_file, "w", encoding="utf-8") as f:
+                        json.dump(new_config, f, indent=4)
+                    messagebox.showinfo("Restart Required", "Storage directory successfully updated!\n\nPlease restart the app to apply the changes.", parent=dialog)
+                    dialog.destroy()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to save: {e}", parent=dialog)
+            
+            def reset_local_default():
+                selected_path.set(get_default_app_dir())
+                lbl_new.config(text=get_default_app_dir())
+                
+            local_btn_frame = tb.Frame(tab_local)
+            local_btn_frame.pack(pady=15)
+            tb.Button(local_btn_frame, text=self._tr("Reset to Default"), bootstyle="secondary", command=reset_local_default).pack(side=LEFT, padx=10)
+            tb.Button(local_btn_frame, text=self._tr("Save Configuration"), bootstyle="success", command=save_local_config).pack(side=LEFT, padx=10)
+
+        def open_settings_dialog(self, default_tab=None):
             dialog = tb.Toplevel(self)
-            dialog.title(self._tr("⚙️ Config Settings Panel"))
+            dialog.title(self._tr("⚙️ Config & Database Settings Panel"))
             try:
                 self.update_idletasks()
-                w = self.winfo_width()
-                h = self.winfo_height()
+                w = max(780, self.winfo_width())
+                h = max(680, self.winfo_height())
                 x = self.winfo_x()
                 y = self.winfo_y()
                 dialog.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
-                dialog.geometry("700x600")
+                dialog.geometry("780x680")
             dialog.transient(self)
             dialog.grab_set()
             dialog.focus_set()
@@ -14726,6 +14941,11 @@ if HAS_DEPS:
             ).pack(side=RIGHT)
             notebook.pack(fill=BOTH, expand=True, padx=20, pady=(16, 4))
             
+            # --- TAB 1: DATABASE & CLOUD SYNC ---
+            tab_db = tb.Frame(notebook)
+            notebook.add(tab_db, text=self._tr("🗄️ Database & Cloud"))
+            self._build_database_and_cloud_panel(tab_db, dialog)
+
             # Helper tab builder (Dynamic list managers)
             def create_tab_editor(tab_parent, db_table, label_text):
                 frame = tb.Frame(tab_parent, padding=20)
@@ -15385,6 +15605,25 @@ if HAS_DEPS:
             tb.Button(cols_btn_f, text=self._tr("Save & Apply"), bootstyle="success", cursor="hand2", command=_settings_save_cols).pack(side=LEFT, padx=5)
             tb.Button(cols_btn_f, text=self._tr("Select All"), bootstyle="secondary-outline", cursor="hand2", command=lambda: _settings_select_all_cols(True)).pack(side=LEFT, padx=5)
             tb.Button(cols_btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=lambda: (_settings_select_all_cols(True), settings_check_vars.get("Written Up", tk.BooleanVar()).set(False))).pack(side=LEFT, padx=5)
+
+            if default_tab in ("database", "supabase", "db"):
+                notebook.select(tab_db)
+            elif default_tab in ("activity", "logs", "backups"):
+                notebook.select(tab_act)
+            elif default_tab == "locations":
+                notebook.select(tab_loc)
+            elif default_tab == "categories":
+                notebook.select(tab_cat)
+            elif default_tab == "payments":
+                notebook.select(tab_pay)
+            elif default_tab == "account":
+                notebook.select(tab_acc)
+            elif default_tab == "users":
+                notebook.select(tab_users)
+            elif default_tab in ("commissions", "tiers"):
+                notebook.select(tab_tools)
+            elif default_tab == "columns":
+                notebook.select(tab_cols)
 
             self._present_window(dialog)
 
