@@ -620,7 +620,12 @@ TRANSLATIONS = {
     "Export Revenue to CSV / Excel": "تصدير الإيرادات إلى CSV / Excel",
     "+Add Rate": "+إضافة النسبة/الأجر",
     "+Add Rate for": "+إضافة النسبة لـ",
-    "Missing Rate": "النسبة غير محددة"
+    "Missing Rate": "النسبة غير محددة",
+    " 🚨 CRITICAL UPDATE REQUIRED ": " 🚨 تحديث إجباري مطلوب ",
+    " 🚨 RESTART REQUIRED TO ACTIVATE UPDATE ": " 🚨 يجب إعادة التشغيل لتفعيل التحديث ",
+    "🛡️ Central Device Version Enforcement (Supabase)": "🛡️ فرض إصدار موحد لجميع الأجهزة (Supabase)",
+    "Enforce Minimum Version:": "فرض الحد الأدنى للإصدار:",
+    "🔒 Enforce on All Devices": "🔒 فرض التحديث على جميع الأجهزة"
 }
 
 # --- APP CONFIGURATION ---
@@ -633,10 +638,15 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.14"
+APP_VERSION = "2.5.15"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
+
+# Minimum required application version across all devices sharing the same database.
+# If a running app is older than MIN_REQUIRED_VERSION (or central Supabase config),
+# a mandatory update is enforced to prevent communication or schema errors.
+MIN_REQUIRED_VERSION = "2.5.15"
 
 def get_default_app_dir():
     import platform
@@ -3099,6 +3109,101 @@ def _parse_version_tuple(v_str):
     return tuple(nums)
 
 
+def get_supabase_system_config(key, default=None):
+    """
+    Retrieves a global configuration parameter from Supabase app_system_config table,
+    with local SQLite caching for instant offline response.
+    """
+    local_val = None
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
+        cur.execute("SELECT value FROM app_system_config WHERE key=?", (key,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            local_val = str(row[0]).strip()
+        conn.close()
+    except Exception:
+        pass
+
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            import pg8000
+            pg = get_shared_supabase_conn(timeout=5)
+            with pg.cursor() as cur:
+                cur.execute("SELECT value FROM app_system_config WHERE key = %s", (key,))
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    cloud_val = str(row[0]).strip()
+                    try:
+                        c2 = sqlite3.connect(TEMP_DB_PATH)
+                        cur2 = c2.cursor()
+                        cur2.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
+                        cur2.execute("INSERT OR REPLACE INTO app_system_config (key, value) VALUES (?, ?)", (key, cloud_val))
+                        c2.commit()
+                        c2.close()
+                    except Exception:
+                        pass
+                    return cloud_val
+        except Exception:
+            pass
+
+    return local_val if local_val is not None else default
+
+
+def set_supabase_system_config(key, value, user_name="admin"):
+    """
+    Saves a global configuration parameter to Supabase app_system_config and local cache.
+    Returns (ok: bool, msg: str)
+    """
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
+        cur.execute(
+            "INSERT OR REPLACE INTO app_system_config (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)",
+            (key, str(value), now_str, user_name)
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            import pg8000
+            pg = get_shared_supabase_conn(timeout=10)
+            with pg.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO app_system_config (key, value, updated_at, updated_by)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (key) DO UPDATE
+                    SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
+                """, (key, str(value), now_str, user_name))
+                pg.commit()
+            return True, "Configuration saved to central database successfully."
+        except Exception as e:
+            return False, f"Failed to save to central database: {e}"
+    return True, "Configuration saved locally."
+
+
+def get_central_min_required_version():
+    """
+    Returns the minimum version required to communicate with the shared database.
+    Checks Supabase app_system_config first, falling back to MIN_REQUIRED_VERSION constant.
+    """
+    sb_min = get_supabase_system_config("min_required_version", default=None)
+    if sb_min:
+        try:
+            if _parse_version_tuple(sb_min) > _parse_version_tuple(MIN_REQUIRED_VERSION):
+                return sb_min
+        except Exception:
+            pass
+    return MIN_REQUIRED_VERSION
+
+
 def _resolve_realtime_update_url(url, auth_token=None):
     """
     If the update URL points to a GitHub repository raw file, resolves the latest
@@ -3280,9 +3385,24 @@ def check_for_cloud_update():
     m_date = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', remote_code)
     remote_build_date = m_date.group(1) if m_date else ""
 
+    m_min = re.search(r'MIN_REQUIRED_VERSION\s*=\s*["\']([^"\']+)["\']', remote_code)
+    remote_min_version = m_min.group(1) if m_min else "0.0.0"
+
+    # Also check Supabase central minimum required version
+    try:
+        central_min = get_central_min_required_version()
+        if _parse_version_tuple(central_min) > _parse_version_tuple(remote_min_version):
+            remote_min_version = central_min
+    except Exception:
+        pass
+
     remote_tuple = _parse_version_tuple(remote_version)
     running_tuple = _parse_version_tuple(running_version)
     disk_tuple = _parse_version_tuple(disk_version)
+    min_required_tuple = _parse_version_tuple(remote_min_version)
+
+    # Determine if an update is mandatory / forced to communicate with database
+    is_forced = (remote_tuple > running_tuple) and (running_tuple < min_required_tuple)
 
     # Check if disk file already has this exact code
     disk_matches_remote = bool(disk_norm_hash and disk_norm_hash == remote_norm_hash)
@@ -3292,6 +3412,8 @@ def check_for_cloud_update():
         "remote_hash": remote_hash,
         "remote_version": remote_version,
         "remote_build_date": remote_build_date,
+        "min_required_version": remote_min_version,
+        "is_forced": is_forced,
         "size_bytes": len(raw_bytes),
         "local_info": local_info,
         "commit_sha": resolved_sha,
@@ -6517,6 +6639,14 @@ def ensure_all_supabase_tables(db_conn):
             file_size INTEGER,
             uploaded_at TEXT
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS app_system_config (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT,
+            updated_by TEXT
+        )
         """
     ]
     cur = db_conn.cursor()
@@ -7516,7 +7646,7 @@ def _init_db_schema(cursor, seed=True):
             "users", "employees", "config_locations", "config_categories",
             "config_payments", "payroll_records", "expenses", "shop_documents",
             "payout_tiers", "cash_month_locks", "vagaro_pull_logs", "cloud_backups",
-            "offline_sync_queue", "database_history_log"
+            "offline_sync_queue", "database_history_log", "app_system_config"
         ]
         for tbl in all_pg_tables:
             try:
@@ -8317,23 +8447,35 @@ if HAS_DEPS:
             sys.exit(0)
 
         def _check_login_updates_bg(self):
-            """Checks for cloud software updates in the background on startup and displays an install badge."""
+            """Checks for cloud software updates in the background on startup and displays an install badge or mandatory update blocker."""
             def _bg():
                 try:
                     status, data = check_for_cloud_update()
                     r_ver = data.get("remote_version", "Latest")
+                    is_forced = bool(data.get("is_forced", False))
+                    min_req = data.get("min_required_version", "")
+                    local_info = get_active_code_info()
+                    running_ver = local_info.get("running_version") or APP_VERSION
+
                     if status == "update_available":
                         def _show():
                             try:
                                 if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                     for child in self._login_upd_badge_frame.winfo_children():
                                         child.destroy()
-                                    
+
                                     def _do_quick_install():
-                                        btn.config(text=f"⏳ Installing v{r_ver}...", state="disabled")
+                                        if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                                            for c in self._login_upd_badge_frame.winfo_children():
+                                                try:
+                                                    c.configure(state="disabled")
+                                                except Exception:
+                                                    pass
+                                        self.show_busy(self._tr(f"Installing update v{r_ver}…"))
                                         def _worker():
                                             ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
                                             def _done():
+                                                self.hide_busy()
                                                 if ok:
                                                     if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                                         self._login_upd_badge_frame.grid_remove()
@@ -8350,20 +8492,54 @@ if HAS_DEPS:
                                                     else:
                                                         self.shutdown_app()
                                                 else:
-                                                    btn.config(text=f"❌ Retry Installing v{r_ver}", state="normal")
                                                     messagebox.showerror("Update Failed", msg, parent=self)
                                             self.after(0, _done)
                                         threading.Thread(target=_worker, daemon=True).start()
 
-                                    btn = tb.Button(
-                                        self._login_upd_badge_frame,
-                                        text=f"✨ Update Available: v{r_ver} — Click to Install Now",
-                                        bootstyle="warning",
-                                        cursor="hand2",
-                                        command=_do_quick_install,
-                                    )
-                                    btn.pack(fill=X, pady=(6, 0))
-                                    self._login_upd_badge_frame.grid()
+                                    if is_forced:
+                                        self._mandatory_update_active = True
+                                        self._mandatory_update_version = r_ver
+                                        self._mandatory_update_data = data
+                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                                            self.btn_login.config(state="disabled")
+                                        if hasattr(self, "_login_status") and self._login_status.winfo_exists():
+                                            self._login_status.config(
+                                                text=f"⚠️ Login disabled: Mandatory update v{r_ver} required.",
+                                                bootstyle="danger"
+                                            )
+                                        card = tb.Labelframe(self._login_upd_badge_frame, text=self._tr(" 🚨 CRITICAL UPDATE REQUIRED "), bootstyle="danger", padding=12)
+                                        card.pack(fill=X)
+                                        tb.Label(
+                                            card,
+                                            text=f"A mandatory software update (v{r_ver}) is required to communicate with the shared database.\n\n"
+                                                 f"Your current version (v{running_ver}) is outdated and cannot safely connect.\n"
+                                                 f"Please update now to continue.",
+                                            font=("Segoe UI", 9, "bold"),
+                                            bootstyle="danger",
+                                            justify=CENTER,
+                                            wraplength=340,
+                                        ).pack(pady=(2, 8))
+                                        tb.Button(
+                                            card,
+                                            text=f"🚀 Download & Install Update v{r_ver} Now",
+                                            bootstyle="danger",
+                                            cursor="hand2",
+                                            command=_do_quick_install,
+                                        ).pack(fill=X, pady=2)
+                                        self._login_upd_badge_frame.grid()
+                                    else:
+                                        self._mandatory_update_active = False
+                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                                            self.btn_login.config(state="normal")
+                                        btn = tb.Button(
+                                            self._login_upd_badge_frame,
+                                            text=f"✨ Update Available: v{r_ver} — Click to Install Now",
+                                            bootstyle="warning",
+                                            cursor="hand2",
+                                            command=_do_quick_install,
+                                        )
+                                        btn.pack(fill=X, pady=(6, 0))
+                                        self._login_upd_badge_frame.grid()
                             except Exception:
                                 pass
                         self.after(0, _show)
@@ -8373,21 +8549,58 @@ if HAS_DEPS:
                                 if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                     for child in self._login_upd_badge_frame.winfo_children():
                                         child.destroy()
-                                    btn = tb.Button(
-                                        self._login_upd_badge_frame,
-                                        text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
-                                        bootstyle="success",
-                                        cursor="hand2",
-                                        command=restart_app,
-                                    )
-                                    btn.pack(fill=X, pady=(6, 0))
-                                    self._login_upd_badge_frame.grid()
+                                    if is_forced:
+                                        self._mandatory_update_active = True
+                                        self._mandatory_restart_required = True
+                                        self._mandatory_update_version = r_ver
+                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                                            self.btn_login.config(state="disabled")
+                                        if hasattr(self, "_login_status") and self._login_status.winfo_exists():
+                                            self._login_status.config(
+                                                text=f"⚠️ Restart required: Update v{r_ver} is ready.",
+                                                bootstyle="danger"
+                                            )
+                                        card = tb.Labelframe(self._login_upd_badge_frame, text=self._tr(" 🚨 RESTART REQUIRED TO ACTIVATE UPDATE "), bootstyle="danger", padding=12)
+                                        card.pack(fill=X)
+                                        tb.Label(
+                                            card,
+                                            text=f"Mandatory update v{r_ver} has been downloaded.\n\n"
+                                                 f"You must restart the application to activate it before logging in.",
+                                            font=("Segoe UI", 9, "bold"),
+                                            bootstyle="danger",
+                                            justify=CENTER,
+                                            wraplength=340,
+                                        ).pack(pady=(2, 8))
+                                        tb.Button(
+                                            card,
+                                            text=f"🔄 Restart Application Now to Activate v{r_ver}",
+                                            bootstyle="danger",
+                                            cursor="hand2",
+                                            command=restart_app,
+                                        ).pack(fill=X, pady=2)
+                                        self._login_upd_badge_frame.grid()
+                                    else:
+                                        self._mandatory_update_active = False
+                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                                            self.btn_login.config(state="normal")
+                                        btn = tb.Button(
+                                            self._login_upd_badge_frame,
+                                            text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
+                                            bootstyle="success",
+                                            cursor="hand2",
+                                            command=restart_app,
+                                        )
+                                        btn.pack(fill=X, pady=(6, 0))
+                                        self._login_upd_badge_frame.grid()
                             except Exception:
                                 pass
                         self.after(0, _show_restart)
                     else:
                         def _hide():
                             try:
+                                self._mandatory_update_active = False
+                                if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                                    self.btn_login.config(state="normal")
                                 if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                     self._login_upd_badge_frame.grid_remove()
                             except Exception:
@@ -8398,11 +8611,12 @@ if HAS_DEPS:
             threading.Thread(target=_bg, daemon=True).start()
 
         def _check_main_window_updates_bg(self):
-            """Checks for software updates while inside the main dashboard and displays a yellow banner if available."""
+            """Checks for software updates while inside the main dashboard and displays update banners or prompts."""
             def _bg():
                 try:
                     status, data = check_for_cloud_update()
                     r_ver = data.get("remote_version", "Latest")
+                    is_forced = bool(data.get("is_forced", False))
                     if status == "update_available":
                         def _show():
                             try:
@@ -8436,15 +8650,36 @@ if HAS_DEPS:
                                             self.after(0, _done)
                                         threading.Thread(target=_worker, daemon=True).start()
 
-                                    btn = tb.Button(
-                                        self._main_upd_banner,
-                                        text=f"✨ Software Update Available: v{r_ver} — Click to Install & Restart Now",
-                                        bootstyle="warning",
-                                        cursor="hand2",
-                                        command=_do_quick_install,
-                                    )
-                                    btn.pack(fill=X, pady=4)
-                                    self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
+                                    if is_forced:
+                                        btn = tb.Button(
+                                            self._main_upd_banner,
+                                            text=f"🚨 CRITICAL DATABASE UPDATE REQUIRED: v{r_ver} — Click to Install & Restart Now",
+                                            bootstyle="danger",
+                                            cursor="hand2",
+                                            command=_do_quick_install,
+                                        )
+                                        btn.pack(fill=X, pady=4)
+                                        self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
+                                        if not getattr(self, "_mandatory_modal_shown", False):
+                                            self._mandatory_modal_shown = True
+                                            if messagebox.askyesno(
+                                                "Critical Update Required 🚨",
+                                                f"A mandatory software update (v{r_ver}) has been released for the shared Supabase database.\n\n"
+                                                f"To prevent data corruption or communication errors, you must update now.\n\n"
+                                                f"Would you like to install update v{r_ver} and restart immediately?",
+                                                parent=self
+                                            ):
+                                                _do_quick_install()
+                                    else:
+                                        btn = tb.Button(
+                                            self._main_upd_banner,
+                                            text=f"✨ Software Update Available: v{r_ver} — Click to Install & Restart Now",
+                                            bootstyle="warning",
+                                            cursor="hand2",
+                                            command=_do_quick_install,
+                                        )
+                                        btn.pack(fill=X, pady=4)
+                                        self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
                             except Exception:
                                 pass
                         self.after(0, _show)
@@ -8454,10 +8689,12 @@ if HAS_DEPS:
                                 if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
                                     for child in self._main_upd_banner.winfo_children():
                                         child.destroy()
+                                    btn_style = "danger" if is_forced else "success"
+                                    btn_txt = f"🚨 Update v{r_ver} Ready — Must Restart Now" if is_forced else f"✅ Update v{r_ver} Ready — Click to Restart Now"
                                     btn = tb.Button(
                                         self._main_upd_banner,
-                                        text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
-                                        bootstyle="success",
+                                        text=btn_txt,
+                                        bootstyle=btn_style,
                                         cursor="hand2",
                                         command=restart_app,
                                     )
@@ -8476,6 +8713,12 @@ if HAS_DEPS:
                         self.after(0, _hide)
                 except Exception:
                     pass
+                finally:
+                    # Recurring check every 10 minutes (600,000 ms)
+                    try:
+                        self.after(600000, self._check_main_window_updates_bg)
+                    except Exception:
+                        pass
             threading.Thread(target=_bg, daemon=True).start()
 
         def show_login_page(self):
@@ -8556,7 +8799,8 @@ if HAS_DEPS:
             eye_btn = tb.Button(pw_frame, text="Show", bootstyle="secondary outline", cursor="hand2", width=5, command=toggle_password_visibility)
             eye_btn.pack(side=LEFT, padx=(6, 0))
             
-            tb.Button(frame, text="Login", bootstyle="primary", width=25, cursor="hand2", command=self.login).grid(row=3, column=0, columnspan=2, pady=(24, 10), ipadx=10, ipady=5)
+            self.btn_login = tb.Button(frame, text="Login", bootstyle="primary", width=25, cursor="hand2", command=self.login)
+            self.btn_login.grid(row=3, column=0, columnspan=2, pady=(24, 10), ipadx=10, ipady=5)
 
             self._login_status = tb.Label(frame, text="", font=("Segoe UI", 10), bootstyle="secondary")
             self._login_status.grid(row=4, column=0, columnspan=2, pady=(0, 6))
@@ -8611,6 +8855,23 @@ if HAS_DEPS:
                         ok, msg = sync_local_cache_with_cloud(backfill=False, init_schema=False)
                         self._prelogin_sync_result["ok"] = ok
                         self._prelogin_sync_result["msg"] = msg
+                        # Verify central version requirement from Supabase
+                        try:
+                            sb_min = get_central_min_required_version()
+                            if _parse_version_tuple(sb_min) > _parse_version_tuple(APP_VERSION):
+                                def _enforce_login_block():
+                                    self._mandatory_update_active = True
+                                    self._mandatory_update_version = sb_min
+                                    if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                                        self.btn_login.config(state="disabled")
+                                    if hasattr(self, "_login_status") and self._login_status.winfo_exists():
+                                        self._login_status.config(
+                                            text=f"⚠️ Login disabled: Mandatory update v{sb_min} required.",
+                                            bootstyle="danger"
+                                        )
+                                self.after(0, _enforce_login_block)
+                        except Exception:
+                            pass
                         try:
                             # Re-warm caches with latest synced data
                             self._cache_locations = None
@@ -8635,6 +8896,43 @@ if HAS_DEPS:
         def login(self):
             if getattr(self, "_login_syncing", False):
                 return
+            if getattr(self, "_mandatory_update_active", False):
+                ver = getattr(self, "_mandatory_update_version", "Latest")
+                if getattr(self, "_mandatory_restart_required", False):
+                    ans = messagebox.askyesno(
+                        "Restart Required 🚨",
+                        f"Mandatory update v{ver} has already been downloaded and saved!\n\n"
+                        f"The application must restart to activate the update before you can log in.\n\n"
+                        f"Would you like to restart the application now?",
+                        parent=self
+                    )
+                    if ans:
+                        restart_app()
+                    return
+                ans = messagebox.askyesno(
+                    "Critical Update Required 🚨",
+                    f"A mandatory software update (v{ver}) is required to communicate with the shared database.\n\n"
+                    f"Older versions are blocked to prevent data corruption or communication errors.\n\n"
+                    f"Would you like to install update v{ver} and restart now?",
+                    parent=self
+                )
+                if ans:
+                    d = getattr(self, "_mandatory_update_data", None)
+                    if d and d.get("remote_code"):
+                        self.show_busy(self._tr(f"Installing mandatory update v{ver}…"))
+                        def _do_bg():
+                            ok, msg = install_cloud_update(d.get("remote_code"), d.get("remote_hash"))
+                            def _fin():
+                                self.hide_busy()
+                                if ok:
+                                    messagebox.showinfo("Update Installed", f"Update v{ver} installed successfully!\n\nRestarting application now...", parent=self)
+                                    restart_app()
+                                else:
+                                    messagebox.showerror("Update Failed", msg, parent=self)
+                            self.after(0, _fin)
+                        threading.Thread(target=_do_bg, daemon=True).start()
+                return
+
             username = (self.username_entry.get() or "").strip()
             password = (self.password_entry.get() or "").strip()
             if not username:
@@ -17299,20 +17597,40 @@ if HAS_DEPS:
                         elif status == "update_available":
                             cached_update["data"] = data
                             size_kb = int(data.get("size_bytes", 0)) / 1024
-                            lbl_check_status.configure(
-                                text=f"✨ Update Available! New Version: v{data.get('remote_version')} ({size_kb:.0f} KB). Ready to install.",
-                                bootstyle="warning"
-                            )
-                            if messagebox.askyesno(
-                                "Update Available ✨",
-                                f"A new version is available!\n\n"
-                                f"• New Version: v{data.get('remote_version')}\n"
-                                f"• Current Version: v{info.get('version')}\n"
-                                f"• Download Size: {size_kb:.0f} KB\n\n"
-                                f"Would you like to download and install this update now?",
-                                parent=top
-                            ):
-                                _do_install_update(data)
+                            is_f = bool(data.get("is_forced", False))
+                            req_v = data.get("min_required_version", "")
+                            if is_f:
+                                lbl_check_status.configure(
+                                    text=f"🚨 MANDATORY UPDATE REQUIRED! Version v{data.get('remote_version')} (Required: v{req_v}).",
+                                    bootstyle="danger"
+                                )
+                                if messagebox.askyesno(
+                                    "Critical Update Required 🚨",
+                                    f"A mandatory software update (v{data.get('remote_version')}) is required to communicate with the shared database!\n\n"
+                                    f"• New Version: v{data.get('remote_version')}\n"
+                                    f"• Current Version: v{info.get('version')}\n"
+                                    f"• Required Minimum: v{req_v}\n"
+                                    f"• Download Size: {size_kb:.0f} KB\n\n"
+                                    f"Older versions cannot safely synchronize with the database.\n\n"
+                                    f"Would you like to download and install this mandatory update now?",
+                                    parent=top
+                                ):
+                                    _do_install_update(data)
+                            else:
+                                lbl_check_status.configure(
+                                    text=f"✨ Update Available! New Version: v{data.get('remote_version')} ({size_kb:.0f} KB). Ready to install.",
+                                    bootstyle="warning"
+                                )
+                                if messagebox.askyesno(
+                                    "Update Available ✨",
+                                    f"A new version is available!\n\n"
+                                    f"• New Version: v{data.get('remote_version')}\n"
+                                    f"• Current Version: v{info.get('version')}\n"
+                                    f"• Download Size: {size_kb:.0f} KB\n\n"
+                                    f"Would you like to download and install this update now?",
+                                    parent=top
+                                ):
+                                    _do_install_update(data)
                     try:
                         top.after(0, update_ui)
                     except Exception:
@@ -17415,7 +17733,86 @@ if HAS_DEPS:
             tb.Button(btn_act_row, text=self._tr("⏮️ Roll Back to Previous Backup"), bootstyle="warning outline", command=_do_rollback_bak).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_act_row, text=self._tr("🏭 Revert to Factory Built-in"), bootstyle="danger outline", command=_do_revert_factory).pack(side=LEFT)
 
-            # --- 3. UPDATE AUDIT & CLOUD LOGS ---
+            # --- 3. CENTRAL DEVICE VERSION ENFORCEMENT (SUPABASE MULTI-DEVICE) ---
+            policy_lf = tb.Labelframe(inner, text=self._tr("🛡️ Central Device Version Enforcement (Supabase)"), padding=14, bootstyle="secondary")
+            policy_lf.pack(fill=X, pady=(0, 14))
+
+            tb.Label(
+                policy_lf,
+                text=self._tr("When multiple devices connect to the same Supabase database, set a minimum required version below to prevent older versions from accessing the database with incompatible changes:"),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+                wraplength=680,
+                justify=LEFT,
+            ).pack(anchor=W, pady=(0, 8))
+
+            cur_central_min = get_central_min_required_version()
+            lbl_central_status = tb.Label(
+                policy_lf,
+                text=f"Currently Enforced Minimum: v{cur_central_min}   |   Current Running App: v{APP_VERSION}",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="info",
+            )
+            lbl_central_status.pack(anchor=W, pady=(0, 10))
+
+            pol_row = tb.Frame(policy_lf)
+            pol_row.pack(fill=X)
+
+            tb.Label(pol_row, text=self._tr("Enforce Minimum Version:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 8))
+            ent_min_ver = tb.Entry(pol_row, width=12, font=("Segoe UI", 10))
+            ent_min_ver.insert(0, cur_central_min)
+            ent_min_ver.pack(side=LEFT, padx=(0, 10))
+
+            def _save_enforced_version():
+                val = ent_min_ver.get().strip()
+                if not val:
+                    messagebox.showerror("Invalid Version", "Please enter a valid version number (e.g., 2.5.15).", parent=top)
+                    return
+                tup = _parse_version_tuple(val)
+                if tup == (0, 0, 0):
+                    messagebox.showerror("Invalid Version", f"'{val}' is not a recognized version number.", parent=top)
+                    return
+                if not messagebox.askyesno(
+                    "Confirm Version Enforcement 🛡️",
+                    f"Are you sure you want to enforce version {val} across all devices?\n\n"
+                    f"Any computer running an app version older than v{val} will be blocked from logging in until they update.",
+                    parent=top,
+                ):
+                    return
+                who = getattr(self, "current_user", "admin")
+                ok, msg = set_supabase_system_config("min_required_version", val, user_name=who)
+                if ok:
+                    try:
+                        log_user_action(
+                            "set_min_app_version",
+                            extra_summary=f"Enforced minimum client version {val}",
+                            row={"enforced_version": val, "set_by": who}
+                        )
+                    except Exception:
+                        pass
+                    lbl_central_status.configure(
+                        text=f"Currently Enforced Minimum: v{val}   |   Current Running App: v{APP_VERSION}",
+                        bootstyle="success",
+                    )
+                    load_update_logs()
+                    messagebox.showinfo(
+                        "Enforcement Active 🔒",
+                        f"Version {val} is now enforced!\n\nAll connected devices running an older version will be forced to update upon launch.",
+                        parent=top,
+                    )
+                else:
+                    messagebox.showerror("Error", msg, parent=top)
+
+            btn_save_pol = tb.Button(pol_row, text=self._tr("🔒 Enforce on All Devices"), bootstyle="danger", command=_save_enforced_version)
+            btn_save_pol.pack(side=LEFT, padx=(0, 8))
+
+            def _use_current_app_ver():
+                ent_min_ver.delete(0, tk.END)
+                ent_min_ver.insert(0, APP_VERSION)
+
+            tb.Button(pol_row, text=self._tr(f"Use Current App Version (v{APP_VERSION})"), bootstyle="secondary outline", command=_use_current_app_ver).pack(side=LEFT)
+
+            # --- 4. UPDATE AUDIT & CLOUD LOGS ---
             hist_lf = tb.Labelframe(inner, text=self._tr("📋 Supabase Update & Recovery Audit History"), padding=12, bootstyle="secondary")
             hist_lf.pack(fill=BOTH, expand=True, pady=(0, 8))
 
@@ -17445,7 +17842,7 @@ if HAS_DEPS:
                         """
                         SELECT created_at, user_name, action, summary
                         FROM user_action_log
-                        WHERE action LIKE 'app_%' OR action LIKE 'update_%'
+                        WHERE action LIKE 'app_%' OR action LIKE 'update_%' OR action = 'set_min_app_version'
                         ORDER BY id DESC LIMIT 50
                         """
                     )
@@ -17463,7 +17860,7 @@ if HAS_DEPS:
                             """
                             SELECT created_at, user_name, action, summary
                             FROM user_action_log
-                            WHERE action LIKE 'app_%' OR action LIKE 'update_%'
+                            WHERE action LIKE 'app_%' OR action LIKE 'update_%' OR action = 'set_min_app_version'
                             ORDER BY created_at DESC LIMIT 50
                             """
                         )
@@ -17489,6 +17886,7 @@ if HAS_DEPS:
                         "update_crash": "⚠️ Crash / Safe Mode",
                         "app_update_check": "🔍 Update Checked",
                         "update_syntax_error": "❌ Syntax Rejected",
+                        "set_min_app_version": "🛡️ Enforced Min Version",
                     }.get(act, act)
                     hist_tree.insert("", tk.END, values=(r[0], r[1], act_label, r[3]))
 
