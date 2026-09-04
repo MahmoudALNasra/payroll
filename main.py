@@ -644,7 +644,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.12"
+APP_VERSION = "2.5.13"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -3317,24 +3317,17 @@ def check_for_cloud_update():
     except Exception:
         pass
 
-    if disk_matches_remote:
-        # Code is already on disk! Check if running process needs restart to activate
-        if running_tuple < remote_tuple or running_norm_hash != remote_norm_hash:
-            return "installed_pending_restart", data
-        else:
-            return "up_to_date", data
+    # 1. If remote version is less than or equal to running version, app is up to date!
+    if remote_tuple <= running_tuple:
+        return "up_to_date", data
 
-    # Disk does not match remote code
-    if remote_tuple > running_tuple or remote_tuple > disk_tuple:
-        return "update_available", data
-    elif remote_tuple < running_tuple and remote_tuple < disk_tuple:
-        return "up_to_date", data
-    else:
-        # Same semantic version tuple (e.g. revisions/fixes within same version tag)
-        if remote_norm_hash != running_norm_hash and remote_norm_hash != disk_norm_hash:
-            data["remote_version"] = f"{remote_version} (Rev {remote_hash[:8]})"
-            return "update_available", data
-        return "up_to_date", data
+    # 2. Remote version is strictly newer than running version:
+    # Check if this newer version has already been downloaded to disk
+    if disk_matches_remote or (disk_tuple >= remote_tuple and disk_tuple > running_tuple):
+        return "installed_pending_restart", data
+
+    # 3. Newer version available to download
+    return "update_available", data
 
 check_for_github_update = check_for_cloud_update
 
@@ -18686,19 +18679,16 @@ if HAS_DEPS:
                 day_notes = notes_by_day.get(day, [])
                 num_notes = len(day_notes)
 
-                # Format day header and note mark with star:
-                # One note -> ⭐ 1 Note; Two notes -> ⭐⭐ 2 Notes
+                # Format day header and note mark:
+                # Day header displays clean day number; stars are kept only next to the word notes
+                day_hdr_text = str(day)
                 if num_notes == 1:
-                    day_hdr_text = f"{day} ⭐"
                     note_tag_text = "⭐ 1 Note"
                 elif num_notes == 2:
-                    day_hdr_text = f"{day} ⭐⭐"
                     note_tag_text = "⭐⭐ 2 Notes"
                 elif num_notes > 2:
-                    day_hdr_text = f"{day} ⭐⭐⭐"
                     note_tag_text = f"⭐⭐⭐ {num_notes} Notes"
                 else:
-                    day_hdr_text = str(day)
                     note_tag_text = ""
                 
                 cell_hdr = tb.Frame(cell_frame)
