@@ -3,9 +3,107 @@
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 import sys
+import os
+
+# PyInstaller --windowed safe stream fallbacks to prevent NoneType attribute crashes
+class _SafeStream:
+    def write(self, *args, **kwargs): pass
+    def flush(self, *args, **kwargs): pass
+if sys.stdout is None:
+    sys.stdout = _SafeStream()
+if sys.stderr is None:
+    sys.stderr = _SafeStream()
+
 import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+
+class SafeTkProxy:
+    """Safeguards Tkinter against Tcl crashes from non-BMP Unicode characters (> 0xFFFF).
+    On Windows, Tcl 8.6 is built with 16-bit characters and raises TclError when any character
+    with codepoint > 0xFFFF is passed. This proxy intercepts Tk calls and safely sanitizes
+    strings, mapping common emojis to safe representations and stripping unsupported codepoints.
+    """
+    _EMOJI_MAP = {
+        0x1F680: "[Update]",
+        0x1F441: "Show",
+        0x1F648: "Hide",
+        0x1F48E: "❖",
+        0x1F504: "⟳",
+        0x1F4E5: "↓",
+        0x1F4E4: "↑",
+        0x1F5D1: "X",
+        0x1F4CA: "■",
+        0x1F4C1: "[Folder]",
+        0x1F4C2: "[Folder]",
+        0x1F4C4: "[File]",
+        0x1F4BE: "[Save]",
+        0x1F511: "*",
+        0x1F512: "[Lock]",
+        0x1F513: "[Unlock]",
+        0x1F4C5: "[Date]",
+        0x1F465: "[Users]",
+        0x1F4B8: "[$]",
+        0x1F3ED: "[Factory]",
+        0x1F389: "!",
+        0x1F9F9: "[Clear]",
+        0x1F7E2: "●",
+        0x1F534: "●",
+        0x1F7E1: "●",
+        0x1F4E6: "■",
+        0x1F4CB: "❖",
+        0x1F3AF: "*",
+        0x1F488: "[Shop]",
+        0x1F487: "[Stylist]",
+        0x1F4BB: "[PC]",
+        0x1F4D6: "[Guide]",
+        0x1F4CD: "*",
+        0x1F3F7: "*",
+        0x1F4B3: "[$]",
+        0x1F5C4: "[DB]",
+        0x1F50D: "[Search]",
+        0x1F4F4: "[Offline]",
+    }
+
+    def __init__(self, real_tk):
+        self._real_tk = real_tk
+
+    @classmethod
+    def _sanitize(cls, arg):
+        if isinstance(arg, str):
+            if not any(ord(c) > 0xFFFF or (0xFE00 <= ord(c) <= 0xFE0F) for c in arg):
+                return arg
+            res = []
+            for c in arg:
+                cp = ord(c)
+                if cp > 0xFFFF:
+                    res.append(cls._EMOJI_MAP.get(cp, ""))
+                elif 0xFE00 <= cp <= 0xFE0F:
+                    continue
+                else:
+                    res.append(c)
+            return "".join(res)
+        elif isinstance(arg, (tuple, list)):
+            return type(arg)(cls._sanitize(x) for x in arg)
+        elif isinstance(arg, dict):
+            return {k: cls._sanitize(v) for k, v in arg.items()}
+        return arg
+
+    def call(self, *args):
+        return self._real_tk.call(*[self._sanitize(a) for a in args])
+
+    def eval(self, *args):
+        return self._real_tk.eval(*[self._sanitize(a) for a in args])
+
+    def setvar(self, name, value):
+        return self._real_tk.setvar(name, self._sanitize(value))
+
+    def globalsetvar(self, name, value):
+        return self._real_tk.globalsetvar(name, self._sanitize(value))
+
+    def __getattr__(self, name):
+        return getattr(self._real_tk, name)
+
 import csv
 import hashlib
 import tempfile
@@ -433,11 +531,11 @@ TRANSLATIONS = {
 }
 
 # --- APP CONFIGURATION ---
-APP_TITLE = "Highend Payroll App - Custom Made ✂️"
-APP_LOGO_TITLE = "💈 HIGHEND PAYROLL 💈"
+APP_TITLE = "Highend Payroll App - Custom Made ✂"
+APP_LOGO_TITLE = "★ HIGHEND PAYROLL ★"
 APP_GEOMETRY = "1250x900"
 APP_THEME = "darkly"
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.2"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -528,7 +626,9 @@ def get_db_config():
         try:
             import json
             with open(config_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                res = json.load(f)
+                if isinstance(res, dict):
+                    return res
         except Exception:
             pass
     return {}
@@ -1351,7 +1451,9 @@ class PostgresCursorProxy:
                         row_list[idx] = decrypt_val(val)
                 decrypted_rows.append(tuple(row_list))
             return decrypted_rows
-_original_sqlite3_connect = sqlite3.connect
+if not hasattr(sqlite3, "_real_connect"):
+    sqlite3._real_connect = sqlite3.connect
+_original_sqlite3_connect = sqlite3._real_connect
 _SUPABASE_PG_CONN = None
 SUPABASE_HISTORY_ENABLED = True
 
@@ -2638,18 +2740,43 @@ def restore_cloud_backup(slot_key):
 def restart_app():
     """Cleanly restart the current application process."""
     try:
-        if getattr(sys, "frozen", False):
-            if platform.system() == "Darwin":
-                exe = sys.executable
+        clean_env = os.environ.copy()
+        clean_env.pop("_DYNAMIC_UPDATE_RUNNING", None)
+        clean_env.pop("_DYNAMIC_UPDATE_ACTIVE", None)
+        clean_env.pop("_RUNNING_SAFE_MODE_FALLBACK", None)
+        clean_env.pop("_MEIPASS2", None)
+        clean_env.pop("_MEIPASS", None)
+        if platform.system() == "Windows":
+            quoted_exe = f'"{sys.executable}"'
+            if getattr(sys, "frozen", False):
+                args_str = " ".join(f'"{a}"' for a in sys.argv[1:])
+                full_target = f"{quoted_exe} {args_str}".strip() if args_str else quoted_exe
+            else:
+                script_path = os.path.abspath(sys.argv[0]) if sys.argv else "payroll_app.py"
+                extra_args = " ".join(f'"{a}"' for a in sys.argv[1:])
+                full_target = f'{quoted_exe} "{script_path}" {extra_args}'.strip() if extra_args else f'{quoted_exe} "{script_path}"'
+
+            # Delay execution by ~1.5s via localhost ping. This allows the exiting parent
+            # process to terminate fully and unhook all PyInstaller _MEI temp files before
+            # the new process begins extracting.
+            cmd = f'ping 127.0.0.1 -n 2 > nul & start "" {full_target}'
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+            subprocess.Popen(cmd, shell=True, env=clean_env, close_fds=True, creationflags=flags)
+        elif platform.system() == "Darwin":
+            exe = sys.executable
+            if getattr(sys, "frozen", False):
                 if ".app/Contents/MacOS" in exe:
                     app_bundle = exe[:exe.rfind(".app/Contents/MacOS") + 4]
-                    subprocess.Popen(["open", "-n", app_bundle])
+                    subprocess.Popen(["open", "-n", app_bundle], env=clean_env)
                 else:
-                    subprocess.Popen([exe] + sys.argv[1:])
+                    subprocess.Popen([exe] + sys.argv[1:], env=clean_env)
             else:
-                subprocess.Popen([sys.executable] + sys.argv[1:])
+                subprocess.Popen([sys.executable] + sys.argv, env=clean_env)
         else:
-            subprocess.Popen([sys.executable] + sys.argv)
+            if getattr(sys, "frozen", False):
+                subprocess.Popen([sys.executable] + sys.argv[1:], env=clean_env)
+            else:
+                subprocess.Popen([sys.executable] + sys.argv, env=clean_env)
     except Exception as e:
         messagebox.showinfo("Restart Needed", f"Please close and reopen the app manually to complete the update.\n\n({e})")
         return
@@ -7162,6 +7289,10 @@ if HAS_DEPS:
     class PayrollApp(tk.Tk):
         def __init__(self):
             super().__init__()
+            try:
+                self.tk = SafeTkProxy(self.tk)
+            except Exception:
+                pass
             self.style = tb.Style(theme=APP_THEME)
             self.title(APP_TITLE)
             
@@ -7225,8 +7356,19 @@ if HAS_DEPS:
                     msg = str(exc_val).lower()
                     if "can't delete tcl command" in msg or "application has been destroyed" in msg:
                         return  # Benign Python 3.14 / Windows Tkinter teardown race
-                import traceback
-                traceback.print_exception(exc_type, exc_val, exc_tb)
+                try:
+                    import traceback
+                    tb_str = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+                    with open(get_last_crash_log_path(), "a", encoding="utf-8") as f:
+                        f.write(f"\n--- Tk Callback Error ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---\n{tb_str}\n")
+                except Exception:
+                    pass
+                if sys.stderr is not None:
+                    try:
+                        import traceback
+                        traceback.print_exception(exc_type, exc_val, exc_tb)
+                    except Exception:
+                        pass
 
             self.report_callback_exception = _handle_tk_callback_error
 
@@ -7238,7 +7380,7 @@ if HAS_DEPS:
             container = tb.Frame(self, padding=40)
             container.place(relx=0.5, rely=0.5, anchor=CENTER)
             
-            lbl_b = tb.Label(container, text="💈 Highend Payroll App 💈", font=("Segoe UI", 22, "bold"), bootstyle="success")
+            lbl_b = tb.Label(container, text="★ Highend Payroll App ★", font=("Segoe UI", 22, "bold"), bootstyle="success")
             lbl_b.pack(pady=(0, 5))
             lbl_c = tb.Label(container, text="Custom Made ✂️", font=("Segoe UI", 12, "italic"), bootstyle="secondary")
             lbl_c.pack(pady=(0, 25))
@@ -7827,6 +7969,76 @@ if HAS_DEPS:
             tb.Button(btn_row, text="Save error log…", bootstyle="warning", command=_save_log).pack(side=LEFT)
             tb.Button(btn_row, text="Close", bootstyle="secondary", command=win.destroy).pack(side=RIGHT)
 
+        def open_app_updates_dialog(self):
+            """Open the Cloud Software Updates and Fail-Safe Recovery panel in a standalone modal window."""
+            dlg = tb.Toplevel(self)
+            dlg.title(self._tr("In-App Updates & Fail-Safe Recovery"))
+            dlg.geometry("820x650")
+            dlg.minsize(700, 520)
+            try:
+                dlg.transient(self)
+                dlg.grab_set()
+            except Exception:
+                pass
+
+            bottom_bar = tb.Frame(dlg, padding=(14, 10))
+            bottom_bar.pack(side=BOTTOM, fill=X)
+            tb.Button(bottom_bar, text=self._tr("Close"), bootstyle="secondary", width=12, command=dlg.destroy).pack(side=RIGHT)
+
+            content_frame = tb.Frame(dlg)
+            content_frame.pack(side=TOP, fill=BOTH, expand=True)
+
+            self._build_app_updates_panel(content_frame, dlg)
+
+        def _do_quick_rollback_from_login(self):
+            """Quick rollback or revert handler invoked directly from the login screen."""
+            bak_path = os.path.join(get_updates_dir(), "payroll_app.py.bak")
+            has_bak = os.path.isfile(bak_path)
+            dyn_path = get_updates_script_path()
+            has_dyn = os.path.isfile(dyn_path)
+
+            if not has_dyn and not has_bak:
+                messagebox.showinfo(
+                    "Factory Version",
+                    "The application is already running its original built-in factory version.\nThere are no cloud updates installed to roll back.",
+                    parent=self,
+                )
+                return
+
+            msg = "Select a recovery option:\n\n"
+            if has_bak:
+                msg += "• Click [Yes] to restore the previous update backup (.bak)\n"
+                msg += "• Click [No] to revert completely to the original factory built-in version\n"
+                msg += "• Click [Cancel] to keep current engine"
+                ans = messagebox.askyesnocancel("Revert / Rollback Engine", msg, parent=self)
+                if ans is True:
+                    ok, res = rollback_cloud_update(target="bak")
+                    if ok:
+                        if messagebox.askyesno("Restart Required", f"{res}\n\nRestart now to apply?", parent=self):
+                            restart_app()
+                    else:
+                        messagebox.showerror("Rollback Failed", res, parent=self)
+                elif ans is False:
+                    ok, res = rollback_cloud_update(target="factory")
+                    if ok:
+                        if messagebox.askyesno("Restart Required", f"{res}\n\nRestart now to apply?", parent=self):
+                            restart_app()
+                    else:
+                        messagebox.showerror("Revert Failed", res, parent=self)
+            else:
+                if messagebox.askyesno(
+                    "Revert to Factory Version",
+                    "No previous backup was found, but a cloud update is installed.\n\n"
+                    "Would you like to revert completely to the original factory built-in version?",
+                    parent=self,
+                ):
+                    ok, res = rollback_cloud_update(target="factory")
+                    if ok:
+                        if messagebox.askyesno("Restart Required", f"{res}\n\nRestart now to apply?", parent=self):
+                            restart_app()
+                    else:
+                        messagebox.showerror("Revert Failed", res, parent=self)
+
         def show_login_page(self):
             self.clear_window()
             self.grid_rowconfigure(0, weight=1)
@@ -7839,8 +8051,8 @@ if HAS_DEPS:
             # Add a fancy logo/title area
             title_frame = tb.Frame(frame)
             title_frame.grid(row=0, column=0, columnspan=2, pady=(0, 30))
-            tb.Label(title_frame, text="💎", font=("Segoe UI", 42)).pack(side=TOP, pady=(0, 10))
-            tb.Label(title_frame, text=APP_LOGO_TITLE, font=("Segoe UI", 28, "bold"), bootstyle="primary").pack(side=TOP)
+            tb.Label(title_frame, text="❖", font=("Segoe UI", 36), bootstyle="primary").pack(side=TOP, pady=(0, 5))
+            tb.Label(title_frame, text=APP_LOGO_TITLE, font=("Segoe UI", 26, "bold"), bootstyle="primary").pack(side=TOP)
             tb.Label(title_frame, text="Secure Data Vault", font=("Segoe UI", 12, "italic"), bootstyle="secondary").pack(side=TOP, pady=(5, 0))
             
             login_users = ["admin", "moe", "ziad"]
@@ -7868,7 +8080,13 @@ if HAS_DEPS:
             user_frame = tb.Frame(frame)
             user_frame.grid(row=1, column=1, pady=10, sticky=EW)
             self.username_entry = tb.Combobox(user_frame, width=28, font=("Segoe UI", 11), values=login_users, state="readonly")
-            cached_user = get_db_config().get("last_selected_username", "admin")
+            cached_user = "admin"
+            try:
+                cfg = get_db_config()
+                if isinstance(cfg, dict) and cfg.get("last_selected_username"):
+                    cached_user = cfg.get("last_selected_username")
+            except Exception:
+                pass
             if cached_user in login_users:
                 self.username_entry.set(cached_user)
             elif "admin" in login_users:
@@ -7886,23 +8104,55 @@ if HAS_DEPS:
             self.password_entry.bind("<Return>", lambda e: self.login_on_enter())
             
             def toggle_password_visibility():
-                if self.password_entry.cget("show") == "*":
-                    self.password_entry.config(show="")
-                    eye_btn.config(text="🙈")
-                else:
-                    self.password_entry.config(show="*")
-                    eye_btn.config(text="👁️")
+                try:
+                    if self.password_entry.cget("show") == "*":
+                        self.password_entry.config(show="")
+                        eye_btn.config(text="Hide")
+                    else:
+                        self.password_entry.config(show="*")
+                        eye_btn.config(text="Show")
+                except Exception:
+                    pass
                     
-            eye_btn = tb.Button(pw_frame, text="👁️", bootstyle="secondary-outline", cursor="hand2", width=3, command=toggle_password_visibility)
+            eye_btn = tb.Button(pw_frame, text="Show", bootstyle="secondary outline", cursor="hand2", width=5, command=toggle_password_visibility)
             eye_btn.pack(side=LEFT, padx=(6, 0))
             
-            tb.Button(frame, text="Login", bootstyle="primary", width=25, cursor="hand2", command=self.login).grid(row=3, column=0, columnspan=2, pady=40, ipadx=10, ipady=5)
+            tb.Button(frame, text="Login", bootstyle="primary", width=25, cursor="hand2", command=self.login).grid(row=3, column=0, columnspan=2, pady=(24, 10), ipadx=10, ipady=5)
 
             self._login_status = tb.Label(frame, text="", font=("Segoe UI", 10), bootstyle="secondary")
             self._login_status.grid(row=4, column=0, columnspan=2, pady=(0, 6))
             self._login_progress = tb.Progressbar(frame, mode="determinate", length=280, bootstyle="success-striped")
             self._login_progress.grid(row=5, column=0, columnspan=2, pady=(0, 10))
             self._login_progress.grid_remove()
+
+            # Recovery & Cloud Updates Actions on Login Screen
+            recov_frame = tb.Frame(frame)
+            recov_frame.grid(row=6, column=0, columnspan=2, pady=(8, 0))
+
+            tb.Button(
+                recov_frame,
+                text="Check / Retrieve Updates",
+                bootstyle="info-outline",
+                cursor="hand2",
+                command=self.open_app_updates_dialog,
+            ).pack(side=LEFT, padx=6)
+
+            tb.Button(
+                recov_frame,
+                text="Revert / Rollback Engine",
+                bootstyle="danger-outline",
+                cursor="hand2",
+                command=self._do_quick_rollback_from_login,
+            ).pack(side=LEFT, padx=6)
+
+            # Engine version & status indicator
+            try:
+                ver_info = get_active_code_info()
+                ver_mode = " [Safe Mode Fallback]" if ver_info.get("is_safe_mode") else (" [Cloud Dynamic Engine]" if ver_info.get("is_dynamic") else " [Built-in Engine]")
+                ver_text = f"v{ver_info.get('version', APP_VERSION)}{ver_mode}"
+                tb.Label(frame, text=ver_text, font=("Segoe UI", 8), bootstyle="secondary").grid(row=7, column=0, columnspan=2, pady=(12, 0))
+            except Exception:
+                pass
 
             # Focus password entry immediately for instant typing
             try:
@@ -15421,14 +15671,17 @@ if HAS_DEPS:
             pw_entry.focus()
             
             def toggle_settings_pw_visibility():
-                if pw_entry.cget("show") == "*":
-                    pw_entry.config(show="")
-                    eye_btn.config(text="🙈")
-                else:
-                    pw_entry.config(show="*")
-                    eye_btn.config(text="👁️")
+                try:
+                    if pw_entry.cget("show") == "*":
+                        pw_entry.config(show="")
+                        eye_btn.config(text="Hide")
+                    else:
+                        pw_entry.config(show="*")
+                        eye_btn.config(text="Show")
+                except Exception:
+                    pass
                     
-            eye_btn = tb.Button(pw_frame, text="👁️", bootstyle="secondary-outline", cursor="hand2", width=3, command=toggle_settings_pw_visibility)
+            eye_btn = tb.Button(pw_frame, text="Show", bootstyle="secondary outline", cursor="hand2", width=5, command=toggle_settings_pw_visibility)
             eye_btn.pack(side=LEFT, padx=(5, 0))
             
             def check_password(event=None):
@@ -17696,14 +17949,17 @@ if HAS_DEPS:
             pw_entry.focus()
 
             def toggle_pw():
-                if pw_entry.cget("show") == "*":
-                    pw_entry.config(show="")
-                    eye_btn.config(text="🙈")
-                else:
-                    pw_entry.config(show="*")
-                    eye_btn.config(text="👁️")
+                try:
+                    if pw_entry.cget("show") == "*":
+                        pw_entry.config(show="")
+                        eye_btn.config(text="Hide")
+                    else:
+                        pw_entry.config(show="*")
+                        eye_btn.config(text="Show")
+                except Exception:
+                    pass
 
-            eye_btn = tb.Button(pw_frame, text="👁️", bootstyle="secondary-outline", cursor="hand2", width=3, command=toggle_pw)
+            eye_btn = tb.Button(pw_frame, text="Show", bootstyle="secondary outline", cursor="hand2", width=5, command=toggle_pw)
             eye_btn.pack(side=LEFT, padx=(5, 0))
 
             def do_confirm(event=None):
