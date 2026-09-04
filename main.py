@@ -120,13 +120,93 @@ import threading
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-try:
-    import ttkbootstrap as tb
-    from ttkbootstrap.constants import *
-    from cryptography.fernet import Fernet
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    import base64
+def auto_install_package(package_spec, import_name=None):
+    """
+    Ensures a Python package is installed and importable.
+    If missing, automatically installs it via pip without user intervention.
+    Supports macOS, Linux, and Windows.
+    """
+    mod_name = import_name or package_spec.split("==")[0].split(">=")[0].replace("-", "_")
+    try:
+        __import__(mod_name)
+        return True
+    except ImportError:
+        pass
+
+    # Ensure user site-packages directory is in sys.path
+    try:
+        import site
+        if hasattr(site, "getusersitepackages"):
+            usp = site.getusersitepackages()
+            if usp and usp not in sys.path:
+                sys.path.insert(0, usp)
+    except Exception:
+        pass
+
+    # Candidate commands for invoking pip across various environments
+    pip_cmds = []
+    if not getattr(sys, "frozen", False):
+        pip_cmds.append([sys.executable, "-m", "pip", "install", package_spec])
+        pip_cmds.append([sys.executable, "-m", "pip", "install", "--break-system-packages", package_spec])
+        pip_cmds.append([sys.executable, "-m", "pip", "install", "--user", package_spec])
+        pip_cmds.append([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", package_spec])
+
+    pip_cmds.extend([
+        ["pip3", "install", package_spec],
+        ["pip3", "install", "--break-system-packages", package_spec],
+        ["pip3", "install", "--user", package_spec],
+        ["pip3", "install", "--user", "--break-system-packages", package_spec],
+        ["python3", "-m", "pip", "install", package_spec],
+        ["python3", "-m", "pip", "install", "--break-system-packages", package_spec],
+        ["python3", "-m", "pip", "install", "--user", package_spec],
+        ["pip", "install", package_spec],
+    ])
+
+    for cmd in pip_cmds:
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=120,
+                stdin=subprocess.DEVNULL,
+            )
+            try:
+                import site
+                if hasattr(site, "getusersitepackages"):
+                    usp = site.getusersitepackages()
+                    if usp and usp not in sys.path:
+                        sys.path.insert(0, usp)
+            except Exception:
+                pass
+            import importlib
+            importlib.invalidate_caches()
+            __import__(mod_name)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def ensure_all_dependencies():
+    """Silently ensure all required third-party packages are installed (pg8000, scramp, openpyxl, numbers-parser, etc.)."""
+    packages_to_check = [
+        ("ttkbootstrap", "ttkbootstrap"),
+        ("cryptography", "cryptography"),
+        ("pg8000", "pg8000"),
+        ("scramp", "scramp"),
+        ("openpyxl", "openpyxl"),
+        ("numbers-parser", "numbers_parser"),
+    ]
+    for pkg, mod in packages_to_check:
+        try:
+            __import__(mod)
+        except ImportError:
+            auto_install_package(pkg, mod)
+
+
+def _init_tooltips():
+    global ToolTip
     try:
         from ttkbootstrap.widgets import ToolTip
     except ImportError:
@@ -157,9 +237,33 @@ try:
                     self.tip_window = None
                     if tw:
                         tw.destroy()
+
+
+HAS_DEPS = False
+try:
+    import ttkbootstrap as tb
+    from ttkbootstrap.constants import *
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64
+    _init_tooltips()
     HAS_DEPS = True
 except ImportError:
-    HAS_DEPS = False
+    # Attempt automatic install on missing packages
+    auto_install_package("ttkbootstrap", "ttkbootstrap")
+    auto_install_package("cryptography", "cryptography")
+    try:
+        import ttkbootstrap as tb
+        from ttkbootstrap.constants import *
+        from cryptography.fernet import Fernet
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+        import base64
+        _init_tooltips()
+        HAS_DEPS = True
+    except ImportError:
+        HAS_DEPS = False
 
 def resource_path(relative_path):
     """Get absolute path to resource, works for dev and for PyInstaller."""
@@ -540,7 +644,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.10"
+APP_VERSION = "2.5.12"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1563,7 +1667,15 @@ def _clean_supabase_config(config):
     return cfg
 
 def _open_supabase_pg_conn(timeout=15):
-    import pg8000.dbapi
+    try:
+        import pg8000.dbapi
+    except ImportError:
+        auto_install_package("pg8000", "pg8000")
+        auto_install_package("scramp", "scramp")
+        try:
+            import pg8000.dbapi
+        except ImportError:
+            raise RuntimeError("The pg8000 database driver could not be loaded or auto-installed.")
     raw_config = get_db_config()
     config = _clean_supabase_config(raw_config)
     host = config.get("supabase_host")
@@ -2853,15 +2965,30 @@ def restart_app():
                     messagebox.showinfo("Restart Needed", f"Please close and reopen the application manually.\n\n({ex})")
                     return
         elif platform.system() == "Darwin":
-            exe = sys.executable
-            if getattr(sys, "frozen", False):
+            is_frozen = getattr(sys, "frozen", False)
+            app_dir = os.path.dirname(sys.executable) if is_frozen else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
+            if is_frozen:
+                exe = sys.executable
                 if ".app/Contents/MacOS" in exe:
                     app_bundle = exe[:exe.rfind(".app/Contents/MacOS") + 4]
-                    subprocess.Popen(["open", "-n", app_bundle], env=clean_env)
+                    cmd = f'sleep 1.5 && open -n "{app_bundle}"'
                 else:
-                    subprocess.Popen([exe] + sys.argv[1:], env=clean_env)
+                    cmd = f'sleep 1.5 && "{exe}"'
             else:
-                subprocess.Popen([sys.executable] + sys.argv, env=clean_env)
+                py_exe = sys.executable
+                script = os.path.abspath(sys.argv[0] if sys.argv else "payroll_app.py")
+                args = " ".join(f'"{a}"' for a in sys.argv[1:]) if len(sys.argv) > 1 else ""
+                cmd = f'sleep 1.5 && "{py_exe}" "{script}" {args}'.strip()
+
+            subprocess.Popen(
+                ["/bin/sh", "-c", cmd],
+                cwd=app_dir,
+                env=clean_env,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         else:
             if getattr(sys, "frozen", False):
                 subprocess.Popen([sys.executable] + sys.argv[1:], env=clean_env)
@@ -14733,13 +14860,17 @@ if HAS_DEPS:
                 try:
                     from numbers_parser import Document
                 except ImportError:
-                    messagebox.showerror(
-                        "Library Missing",
-                        "To import Apple Numbers (.numbers) files, you must install the numbers-parser library.\n\n"
-                        "Please open your terminal and run:\npip install numbers-parser",
-                        parent=parent_win
-                    )
-                    return
+                    auto_install_package("numbers-parser", "numbers_parser")
+                    try:
+                        from numbers_parser import Document
+                    except ImportError:
+                        messagebox.showerror(
+                            "Library Missing",
+                            "To import Apple Numbers (.numbers) files, you must install the numbers-parser library.\n\n"
+                            "Please open your terminal and run:\npip install numbers-parser",
+                            parent=parent_win
+                        )
+                        return
                 try:
                     doc = Document(filepath)
                     sheet = doc.sheets[0]
@@ -14784,13 +14915,17 @@ if HAS_DEPS:
                 try:
                     import openpyxl
                 except ImportError:
-                    messagebox.showerror(
-                        "Library Missing",
-                        "To import Excel files, you must install the openpyxl library.\n\n"
-                        "Please open your terminal and run:\npip install openpyxl",
-                        parent=parent_win
-                    )
-                    return
+                    auto_install_package("openpyxl", "openpyxl")
+                    try:
+                        import openpyxl
+                    except ImportError:
+                        messagebox.showerror(
+                            "Library Missing",
+                            "To import Excel files, you must install the openpyxl library.\n\n"
+                            "Please open your terminal and run:\npip install openpyxl",
+                            parent=parent_win
+                        )
+                        return
                 try:
                     wb = openpyxl.load_workbook(filepath, read_only=False, data_only=True)
                     sheet = wb.active
@@ -16777,8 +16912,13 @@ if HAS_DEPS:
                 try:
                     import pg8000.dbapi
                 except ImportError:
-                    messagebox.showerror("Error", "pg8000 missing. Run pip install pg8000", parent=dialog)
-                    return
+                    auto_install_package("pg8000", "pg8000")
+                    auto_install_package("scramp", "scramp")
+                    try:
+                        import pg8000.dbapi
+                    except ImportError:
+                        messagebox.showerror("Error", "pg8000 missing. Run: pip install pg8000", parent=dialog)
+                        return
                 try:
                     conn = pg8000.dbapi.connect(
                         host=host,
@@ -17138,18 +17278,6 @@ if HAS_DEPS:
                 wraplength=680,
                 justify=LEFT,
             ).pack(anchor=W, pady=(0, 10))
-
-            url_row = tb.Frame(upd_lf)
-            url_row.pack(fill=X, pady=(0, 10))
-            tb.Label(url_row, text="Update Server URL:", font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 10))
-            ent_url = tb.Entry(url_row, font=("Segoe UI", 9))
-            ent_url.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
-            ent_url.insert(0, get_custom_update_server_url())
-
-            def _save_url():
-                set_custom_update_server_url(ent_url.get().strip())
-                messagebox.showinfo("Saved", "Update server URL configuration saved.", parent=top)
-            tb.Button(url_row, text="💾 Save URL", bootstyle="secondary outline", command=_save_url).pack(side=LEFT)
 
             lbl_check_status = tb.Label(upd_lf, text="Ready to check for updates.", font=("Segoe UI", 10, "italic"), bootstyle="secondary")
             lbl_check_status.pack(anchor=W, pady=(0, 10))
@@ -19071,13 +19199,23 @@ def check_machine_license():
 
 if __name__ == "__main__":
     if not HAS_DEPS:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("Dependency Missing", "Please install required package:\n\nOpen your terminal and run:\npip install ttkbootstrap cryptography")
-        sys.exit(1)
+        ensure_all_dependencies()
+        try:
+            import ttkbootstrap as tb
+            from ttkbootstrap.constants import *
+            from cryptography.fernet import Fernet
+            HAS_DEPS = True
+        except ImportError:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Dependency Missing", "Please install required package:\n\nOpen your terminal and run:\npip install ttkbootstrap cryptography")
+            sys.exit(1)
         
     if not check_machine_license():
         sys.exit(1)
+
+    # Launch background dependency verification so pg8000, scramp, openpyxl, etc. are ready
+    threading.Thread(target=ensure_all_dependencies, daemon=True).start()
 
     # Dynamic update bootstrap (runs downloaded update if present, or safely falls back)
     if _check_and_run_dynamic_update():
