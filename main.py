@@ -7303,6 +7303,77 @@ if HAS_DEPS:
                 self.hide_busy()
                 self.show_app_error("Login Failed", e)
 
+        def _register_modal_popup(self, win):
+            """Register a modal window to stay in front and re-surface if background is clicked."""
+            if win is None:
+                return
+            if not hasattr(self, "_active_modal_popups"):
+                self._active_modal_popups = []
+            if win not in self._active_modal_popups:
+                self._active_modal_popups.append(win)
+            try:
+                win.attributes("-topmost", True)
+                win.lift()
+            except Exception:
+                pass
+
+            def _on_win_destroy(e):
+                if getattr(e, "widget", None) is win:
+                    if hasattr(self, "_active_modal_popups") and win in self._active_modal_popups:
+                        self._active_modal_popups.remove(win)
+                    if hasattr(self, "_active_modal_popups") and self._active_modal_popups:
+                        next_top = self._active_modal_popups[-1]
+                        if self._widget_alive(next_top):
+                            try:
+                                next_top.attributes("-topmost", True)
+                                next_top.lift()
+                                next_top.focus_set()
+                            except Exception:
+                                pass
+
+            win.bind("<Destroy>", _on_win_destroy, add="+")
+            self._ensure_popup_click_redirection()
+
+        def _ensure_popup_click_redirection(self):
+            """Ensure clicking anywhere outside the active modal brings it back to the front."""
+            if getattr(self, "_popup_interceptor_bound", False):
+                return
+            self._popup_interceptor_bound = True
+
+            def _is_descendant_of(w, parent):
+                cur = w
+                for _ in range(32):
+                    if cur is None:
+                        return False
+                    if cur is parent:
+                        return True
+                    cur = getattr(cur, "master", None)
+                return False
+
+            def _on_global_click(event):
+                if not hasattr(self, "_active_modal_popups") or not self._active_modal_popups:
+                    return
+                # Filter out destroyed widgets
+                self._active_modal_popups = [p for p in self._active_modal_popups if self._widget_alive(p)]
+                if not self._active_modal_popups:
+                    return
+                top_popup = self._active_modal_popups[-1]
+                w = getattr(event, "widget", None)
+                if w and _is_descendant_of(w, top_popup):
+                    return
+                # User clicked outside the active smaller window: bring it immediately to the front!
+                try:
+                    top_popup.deiconify()
+                    top_popup.lift()
+                    top_popup.attributes("-topmost", True)
+                    top_popup.focus_force()
+                    top_popup.bell()
+                except Exception:
+                    pass
+                return "break"
+
+            self.bind_all("<Button-1>", _on_global_click, add="+")
+
         def _present_window(self, win):
             """Bring a popup to the front and keep it usable."""
             if win is None:
@@ -7313,21 +7384,17 @@ if HAS_DEPS:
                 pass
             try:
                 win.lift()
-                # Aqua Tk deadlocks if focus_force + grab_set + DateEntry/Combobox
-                # run together (cash-calendar envelope flow on Mac).
-                if platform.system() == "Darwin":
-                    win.focus_set()
-                else:
-                    win.focus_force()
-                    win.attributes("-topmost", True)
-                    win.after(350, lambda: self._clear_topmost(win))
+                win.focus_force()
+                win.attributes("-topmost", True)
             except Exception:
                 pass
+            self._register_modal_popup(win)
 
         def _safe_grab_set(self, win):
             """Modal grab without nested grabs. Skip entirely on macOS Aqua Tk."""
             if win is None:
                 return
+            self._register_modal_popup(win)
             try:
                 if platform.system() == "Darwin":
                     return
@@ -7354,6 +7421,8 @@ if HAS_DEPS:
                     win.grab_release()
             except Exception:
                 pass
+            if hasattr(self, "_active_modal_popups") and win in self._active_modal_popups:
+                self._active_modal_popups.remove(win)
 
         def _envelope_ui_open(self):
             if getattr(self, "_envelope_opening", False):
@@ -7363,7 +7432,7 @@ if HAS_DEPS:
             )
 
         def _open_sheet(self, parent, title, geometry):
-            """Child window without grab_set. Nested grabs freeze Windows and Mac."""
+            """Child window with top-priority placement and click-refocus protection."""
             parent = parent if self._widget_alive(parent) else self
             popup = tb.Toplevel(parent)
             popup.title(title)
@@ -7377,9 +7446,11 @@ if HAS_DEPS:
                 pass
             try:
                 popup.lift()
-                popup.focus_set()
+                popup.focus_force()
+                popup.attributes("-topmost", True)
             except Exception:
                 pass
+            self._register_modal_popup(popup)
             return popup
 
         def apply_and_memorize_column_widths(
@@ -7783,11 +7854,11 @@ if HAS_DEPS:
             """Apply current hidden columns to tree_calendar."""
             if not self._widget_alive(getattr(self, "tree_calendar", None)):
                 return
-            hidden = get_calendar_hidden_columns()
+            disp_cols = [c for c in self.columns if c != self._tr("Name")]
             self.apply_and_memorize_column_widths(
                 "calendar_table",
                 self.tree_calendar,
-                self.columns,
+                disp_cols,
                 hidden_cols=list(hidden),
             )
 
@@ -8731,13 +8802,40 @@ if HAS_DEPS:
             self.lbl_summary = tb.Label(summary_frame, text="", font=("Segoe UI", 12, "bold"), bootstyle="inverse-primary")
             self.lbl_summary.pack(side=LEFT, padx=10)
 
-            # Records Table Container
+            # Records Table Container with Frozen Employee Column
             tree_frame = tb.Frame(self.tab_calendar)
             tree_frame.pack(side=TOP, fill=BOTH, expand=True, padx=15, pady=(0, 5))
             
+            # 1. Left Frozen Pane: Employee Name
+            frozen_frame = tb.Frame(tree_frame, width=175)
+            frozen_frame.pack_propagate(False)
+            frozen_frame.pack(side=LEFT, fill=Y)
+
+            self.tree_frozen = tb.Treeview(
+                frozen_frame,
+                columns=(self._tr("Name"),),
+                show="headings",
+                bootstyle="primary",
+                selectmode="extended",
+            )
+            self.tree_frozen.heading(self._tr("Name"), text=self._tr("Name"))
+            self.tree_frozen.column(self._tr("Name"), width=170, stretch=True)
+            self.tree_frozen.pack(side=TOP, fill=BOTH, expand=True)
+
+            frozen_spacer = tb.Frame(frozen_frame, height=18)
+            frozen_spacer.pack(side=BOTTOM, fill=X)
+
+            # 2. Right Vertical Scrollbar (Synchronized for both panes)
             scroll_y = tb.Scrollbar(tree_frame, orient=VERTICAL)
-            scroll_x = tb.Scrollbar(tree_frame, orient=HORIZONTAL)
-            
+            scroll_y.pack(side=RIGHT, fill=Y)
+
+            # 3. Right Scrollable Pane: Remaining Columns
+            main_table_frame = tb.Frame(tree_frame)
+            main_table_frame.pack(side=LEFT, fill=BOTH, expand=True)
+
+            scroll_x = tb.Scrollbar(main_table_frame, orient=HORIZONTAL)
+            scroll_x.pack(side=BOTTOM, fill=X)
+
             self.columns = tuple(self._tr(c) for c in (
                 "Record ID", "Date", "Cycle", "Name", "Location",
                 "Service Sales", "Service Sales Calculations",
@@ -8745,24 +8843,90 @@ if HAS_DEPS:
                 "Hour Rate", "Percentage", "Hours",
                 "Total Calculation", "Notes", "Written Up",
             ))
-            
-            self.tree_calendar = tb.Treeview(tree_frame, columns=self.columns, show="headings", bootstyle="primary", yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set, selectmode="extended")
-            
-            scroll_y.config(command=self.tree_calendar.yview)
-            scroll_y.pack(side=RIGHT, fill=Y)
-            
+
+            disp_cols = [c for c in self.columns if c != self._tr("Name")]
+            self.tree_calendar = tb.Treeview(
+                main_table_frame,
+                columns=self.columns,
+                displaycolumns=disp_cols,
+                show="headings",
+                bootstyle="primary",
+                xscrollcommand=scroll_x.set,
+                selectmode="extended",
+            )
             scroll_x.config(command=self.tree_calendar.xview)
-            scroll_x.pack(side=BOTTOM, fill=X)
-            
+
+            # Synchronize vertical scrolling
+            def _sync_yview(*args):
+                try:
+                    self.tree_frozen.yview(*args)
+                except Exception:
+                    pass
+                try:
+                    self.tree_calendar.yview(*args)
+                except Exception:
+                    pass
+            scroll_y.config(command=_sync_yview)
+
+            def _on_cal_yscroll(*args):
+                scroll_y.set(*args)
+                try:
+                    self.tree_frozen.yview_moveto(args[0])
+                except Exception:
+                    pass
+            self.tree_calendar.configure(yscrollcommand=_on_cal_yscroll)
+
+            def _on_frozen_yscroll(*args):
+                scroll_y.set(*args)
+                try:
+                    self.tree_calendar.yview_moveto(args[0])
+                except Exception:
+                    pass
+            self.tree_frozen.configure(yscrollcommand=_on_frozen_yscroll)
+
+            # Synchronize mousewheel scrolling across both panes
+            def _on_wheel(e):
+                delta = int(-1 * (e.delta / 120)) if getattr(e, "delta", 0) else (1 if getattr(e, "num", 0) == 5 else -1)
+                try:
+                    self.tree_frozen.yview_scroll(delta, "units")
+                    self.tree_calendar.yview_scroll(delta, "units")
+                except Exception:
+                    pass
+                return "break"
+
+            for t in (self.tree_frozen, self.tree_calendar):
+                t.bind("<MouseWheel>", _on_wheel)
+                t.bind("<Button-4>", _on_wheel)
+                t.bind("<Button-5>", _on_wheel)
+
+            # Synchronize row selection between frozen column and table
+            def _sync_sel_from_frozen(e=None):
+                sel = self.tree_frozen.selection()
+                if self.tree_calendar.selection() != sel:
+                    self.tree_calendar.selection_set(sel)
+                    if sel:
+                        self.tree_calendar.focus(sel[0])
+
+            def _sync_sel_from_cal(e=None):
+                sel = self.tree_calendar.selection()
+                if self.tree_frozen.selection() != sel:
+                    self.tree_frozen.selection_set(sel)
+                    if sel:
+                        self.tree_frozen.focus(sel[0])
+
+            self.tree_frozen.bind("<<TreeviewSelect>>", _sync_sel_from_frozen)
+            self.tree_calendar.bind("<<TreeviewSelect>>", _sync_sel_from_cal)
+
+            self.tree_frozen.bind("<Double-1>", lambda e: self.edit_selected_record())
+            self.tree_calendar.bind("<Double-1>", lambda e: self.edit_selected_record())
+
             self.apply_and_memorize_column_widths(
                 "calendar_table",
                 self.tree_calendar,
-                self.columns,
+                disp_cols,
                 hidden_cols=list(get_calendar_hidden_columns()),
             )
-            
-            self.tree_calendar.bind("<Double-1>", lambda e: self.edit_selected_record())
-            self.tree_calendar.pack(side=LEFT, fill=BOTH, expand=True)
+            self.tree_calendar.pack(side=TOP, fill=BOTH, expand=True)
             self.load_calendar_data()
 
         def _rebuild_cycle_cards(self):
@@ -9003,6 +9167,9 @@ if HAS_DEPS:
 
             for item in self.tree_calendar.get_children():
                 self.tree_calendar.delete(item)
+            if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
+                for item in self.tree_frozen.get_children():
+                    self.tree_frozen.delete(item)
                 
             emp_f = getattr(self, 'cal_name_filter', None)
             emp_val = emp_f.get() if emp_f else self._tr("All")
@@ -9113,17 +9280,46 @@ if HAS_DEPS:
             else:
                 table_rows = resolved_rows
 
+            # Pre-compute employee payout details and add-on sales to apply rules:
+            # 1. Below 50%: top add-on earner gets 50%, rest get 40%
+            # 2. At or above 50%: if tiered checked, get their service %; if fixed >= 50%, get 50%
+            emp_service_perc = {}
+            emp_use_tiered = {}
             addon_by_emp = {}
-            for row, _ in table_rows:
-                emp_id = row[17] if len(row) > 17 else None
+            payout_cache = {}
+
+            for row, row_ck in table_rows:
+                emp_name = row[2]
+                emp_id = row[17] if len(row) > 17 else name_to_id.get(emp_name, None)
                 addon_by_emp[emp_id] = addon_by_emp.get(emp_id, 0.0) + to_float(row[5], 0.0)
-            top_addon_emp = None
-            top_addon_amt = -1.0
+                if emp_id not in emp_service_perc:
+                    rec_perc = row[10]
+                    emp_perc = row[11]
+                    use_tiered = (row[16] == 1 or row[16] == '1' or row[16] is True)
+                    emp_use_tiered[emp_id] = use_tiered
+                    if use_tiered:
+                        if emp_id:
+                            if emp_id not in payout_cache:
+                                bounds = cycle_bounds(row_ck) if row_ck else (row[1], row[1])
+                                payout_cache[emp_id] = self.get_employee_payout_details(emp_id, bounds[0], bounds[1])
+                            _, s_perc, _, _ = payout_cache[emp_id]
+                            emp_service_perc[emp_id] = to_float(s_perc, 0.0)
+                        else:
+                            emp_service_perc[emp_id] = 0.0
+                    else:
+                        emp_service_perc[emp_id] = to_float(rec_perc if rec_perc is not None else emp_perc, 0.0)
+
+            top_below_50_emp = None
+            top_below_50_amt = -1.0
             for eid, amt in addon_by_emp.items():
-                if amt > top_addon_amt:
-                    top_addon_amt = amt
-                    top_addon_emp = eid
-            
+                if eid is None:
+                    continue
+                s_perc = emp_service_perc.get(eid, 0.0)
+                if s_perc < 0.50:
+                    if amt > top_below_50_amt:
+                        top_below_50_amt = amt
+                        top_below_50_emp = eid
+
             total_rev = 0.0
             total_addon = 0.0
             total_prod = 0.0
@@ -9131,36 +9327,27 @@ if HAS_DEPS:
             total_hrs = 0.0
             total_svc_calc = 0.0
             total_calc = 0.0
-            payout_cache = {}
-            
-            for row, row_ck in table_rows:
+
+            for r_idx, (row, row_ck) in enumerate(table_rows):
                 emp_name = row[2]
                 emp_id = row[17] if len(row) > 17 else name_to_id.get(emp_name, None)
-                
+
                 rec_hr = row[8]
                 emp_hr = row[9]
-                rec_perc = row[10]
-                emp_perc = row[11]
-                use_tiered = (row[16] == 1 or row[16] == '1' or row[16] is True)
-                
                 hour_rate = to_float(rec_hr if rec_hr is not None else emp_hr, 0.0)
                 product_perc = 0.00
-                
-                if use_tiered:
-                    if emp_id:
-                        if emp_id not in payout_cache:
-                            bounds = cycle_bounds(row_ck) if row_ck else (row[1], row[1])
-                            payout_cache[emp_id] = self.get_employee_payout_details(emp_id, bounds[0], bounds[1])
-                        _, service_perc, product_perc, hour_rate = payout_cache[emp_id]
-                        service_perc = to_float(service_perc, 0.0)
-                        product_perc = to_float(product_perc, 0.0)
-                        hour_rate = to_float(hour_rate, 0.0)
-                    else:
-                        service_perc = 0.0
+
+                service_perc = emp_service_perc.get(emp_id, 0.0)
+                use_tiered = emp_use_tiered.get(emp_id, False)
+
+                if use_tiered and emp_id in payout_cache:
+                    _, _, product_perc, t_hr = payout_cache[emp_id]
+                    product_perc = to_float(product_perc, 0.0)
+                    if not rec_hr:
+                        hour_rate = to_float(t_hr, hour_rate)
                 else:
-                    service_perc = to_float(rec_perc if rec_perc is not None else emp_perc, 0.0)
                     product_perc = product_percent_for_sales(to_float(row[6], 0.0))
-                
+
                 rev_v = to_float(row[4], 0.0)
                 addon_v = to_float(row[5], 0.0)
                 prod_v = to_float(row[6], 0.0)
@@ -9168,13 +9355,37 @@ if HAS_DEPS:
                 loc_v = row[3] if row[3] else ""
                 hrs_v = to_float(row[12], 0.0)
 
+                # Service sales calculation: (Service revenue * service percentage) + (hours * hourly rate)
                 svc_calc = round((rev_v * service_perc) + (hrs_v * hour_rate), 2)
-                addon_rate = 0.50 if (emp_id is not None and emp_id == top_addon_emp) else 0.40
+
+                # Service add-on percentage rules:
+                # 1. If barber is below 50% percentage:
+                #    - The highest one below 50% gets 50% on add-ons instead of 40%
+                #    - The rest below 50% get 40% on add-ons
+                # 2. If barber is >= 50% percentage:
+                #    - For people who have percentage checked (use_tiered) and achieve >= 50%:
+                #      they get the same percentage on add-on as sales service
+                #    - For people with fixed percentage >= 50%: add-on is also 50%
+                if service_perc < 0.50:
+                    if emp_id is not None and emp_id == top_below_50_emp:
+                        addon_rate = 0.50
+                    else:
+                        addon_rate = 0.40
+                else:
+                    if use_tiered:
+                        addon_rate = service_perc
+                    else:
+                        addon_rate = 0.50
+
                 addon_calc = round(addon_v * addon_rate, 2)
                 prod_calc = round(prod_v * product_perc, 2)
                 tip_calc = round(tip_v * 1.0, 2)
-                calc_v = round(svc_calc + addon_calc + prod_calc + tip_calc, 2)
-                
+
+                # TOTAL CALCULATION FOR EACH EMPLOYEE:
+                # Service Sales + Service Add-on + Tip (100%)
+                # Product sales are EXCLUDED from total calculations!
+                calc_v = round(svc_calc + addon_calc + tip_calc, 2)
+
                 total_rev += rev_v
                 total_addon += addon_v
                 total_prod += prod_v
@@ -9182,7 +9393,7 @@ if HAS_DEPS:
                 total_hrs += hrs_v
                 total_svc_calc += svc_calc
                 total_calc += calc_v
-                
+
                 cyc_display = cycle_label(row_ck) if row_ck else ""
                 tree_row = [
                     row[0],
@@ -9202,11 +9413,16 @@ if HAS_DEPS:
                     row[14] if row[14] else "",
                     row[15] if row[15] else "",
                 ]
-                self.tree_calendar.insert('', tk.END, values=tree_row)
-            
-            self.tree_calendar.insert('', tk.END, values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
-            
-            self.tree_calendar.insert('', tk.END, values=(
+                iid = f"row_{row[0]}_{r_idx}"
+                self.tree_calendar.insert('', tk.END, iid=iid, values=tree_row)
+                if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
+                    self.tree_frozen.insert('', tk.END, iid=iid, values=(row[2],))
+
+            self.tree_calendar.insert('', tk.END, iid='spacer_row', values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
+            if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
+                self.tree_frozen.insert('', tk.END, iid='spacer_row', values=("",))
+
+            self.tree_calendar.insert('', tk.END, iid='totals_row', values=(
                 "", "", "", "=== TOTALS ===", "",
                 f"${total_rev:,.2f}", f"${total_svc_calc:,.2f}",
                 f"${total_addon:,.2f}", f"${total_prod:,.2f}", f"${total_tip:,.2f}",
@@ -9215,6 +9431,9 @@ if HAS_DEPS:
                 "", "",
             ), tags=('totals',))
             self.tree_calendar.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
+            if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
+                self.tree_frozen.insert('', tk.END, iid='totals_row', values=("=== TOTALS ===",), tags=('totals',))
+                self.tree_frozen.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
 
             # Format summary banner text
             num_sel = len(self.selected_rev_cycles)
@@ -9328,7 +9547,7 @@ if HAS_DEPS:
             dialog = tb.Toplevel(parent_win)
             dialog.title(f"Edit Record: {rec[6]}")
             dialog.transient(parent_win)
-            dialog.grab_set()
+            self._register_modal_popup(dialog)
             dialog.focus_set()
             try:
                 dialog.update_idletasks()
@@ -15980,6 +16199,7 @@ if HAS_DEPS:
                 pass
             
             envelopes_by_day = {}
+            notes_by_day = {}
             total_amt = 0.0
             total_approved = 0.0
             total_pending = 0.0
@@ -16001,6 +16221,10 @@ if HAS_DEPS:
                     day = dt.day
                     amt_f = to_float(amt, 0.0)
                     status_s = str(decrypt_val(status) if status is not None else "").strip()
+                    desc_s = str(decrypt_val(desc) if desc is not None else "").strip()
+                    if desc_s:
+                        notes_by_day.setdefault(day, []).append(desc_s)
+
                     if day not in envelopes_by_day:
                         envelopes_by_day[day] = []
                     envelopes_by_day[day].append({
@@ -16008,7 +16232,7 @@ if HAS_DEPS:
                         "amount": amt_f,
                         "status": status_s,
                         "assignee": assignee if assignee else "Unassigned",
-                        "description": desc if desc else "",
+                        "description": desc_s,
                         "location": loc if loc else ""
                     })
                     total_amt += amt_f
@@ -16018,6 +16242,28 @@ if HAS_DEPS:
                         total_pending += amt_f
                 except Exception:
                     continue
+
+            # Also check payroll_records for any notes on days of this month
+            try:
+                conn_notes = sqlite3.connect(TEMP_DB_PATH)
+                cur_n = conn_notes.cursor()
+                cur_n.execute("SELECT record_date, notes FROM payroll_records WHERE notes IS NOT NULL AND TRIM(notes) != ''")
+                for r_date, r_notes in cur_n.fetchall() or []:
+                    p_note = str(decrypt_val(r_notes) if r_notes is not None else "").strip()
+                    if p_note:
+                        iso = normalize_iso_date(decrypt_val(r_date) if r_date is not None else "")
+                        if not iso:
+                            iso = normalize_iso_date(r_date)
+                        if iso and iso.startswith(f"{year}-{month:02d}-"):
+                            try:
+                                d_num = int(iso.split("-")[2])
+                                if p_note not in notes_by_day.setdefault(d_num, []):
+                                    notes_by_day[d_num].append(p_note)
+                            except Exception:
+                                pass
+                conn_notes.close()
+            except Exception:
+                pass
             
             self.lbl_cash_cal_summary.config(
                 text=f"Total: ${total_amt:,.2f}  |  Approved: ${total_approved:,.2f}  |  Pending/Not Approved: ${total_pending:,.2f}"
@@ -16074,8 +16320,25 @@ if HAS_DEPS:
                 cell_frame.grid(row=current_row, column=current_col, sticky="nsew", padx=2, pady=2)
                 
                 day_envelopes = envelopes_by_day.get(day, [])
+                day_notes = notes_by_day.get(day, [])
+                num_notes = len(day_notes)
+
+                # Format day header and note mark with star:
+                # One note -> ⭐ 1 Note; Two notes -> ⭐⭐ 2 Notes
+                if num_notes == 1:
+                    day_hdr_text = f"{day} ⭐"
+                    note_tag_text = "⭐ 1 Note"
+                elif num_notes == 2:
+                    day_hdr_text = f"{day} ⭐⭐"
+                    note_tag_text = "⭐⭐ 2 Notes"
+                elif num_notes > 2:
+                    day_hdr_text = f"{day} ⭐⭐⭐"
+                    note_tag_text = f"⭐⭐⭐ {num_notes} Notes"
+                else:
+                    day_hdr_text = str(day)
+                    note_tag_text = ""
                 
-                lbl_day = tb.Label(cell_frame, text=str(day), font=("Segoe UI", 11, "bold"), anchor="nw")
+                lbl_day = tb.Label(cell_frame, text=day_hdr_text, font=("Segoe UI", 11, "bold"), anchor="nw")
                 lbl_day.pack(anchor=NW, padx=5, pady=2)
                 
                 if day_envelopes:
@@ -16099,7 +16362,7 @@ if HAS_DEPS:
                         lbl_day.config(bootstyle="inverse-success")
                         loc_count = f"{len(present_locs)}/{len(required_locations)}" if required_locations else str(len(day_envelopes))
                         lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 11, "bold"), bootstyle="inverse-success")
-                        lbl_amount.pack(pady=5)
+                        lbl_amount.pack(pady=3)
                         lbl_count = tb.Label(
                             cell_frame,
                             text=f"{loc_count} {self._tr('Approved')}",
@@ -16107,6 +16370,14 @@ if HAS_DEPS:
                             bootstyle="inverse-success",
                         )
                         lbl_count.pack()
+                        if note_tag_text:
+                            lbl_note_tag = tb.Label(
+                                cell_frame,
+                                text=note_tag_text,
+                                font=("Segoe UI", 8, "bold"),
+                                bootstyle="inverse-success",
+                            )
+                            lbl_note_tag.pack(pady=(2, 0))
                     else:
                         cell_frame.config(bootstyle="danger")
                         lbl_day.pack_forget()
@@ -16139,9 +16410,25 @@ if HAS_DEPS:
                             status_txt = f"{len(day_envelopes)} {self._tr('Pending')}"
                         lbl_count = tb.Label(cell_frame, text=status_txt, font=("Segoe UI", 8), bootstyle="inverse-danger")
                         lbl_count.pack()
+                        if note_tag_text:
+                            lbl_note_tag = tb.Label(
+                                cell_frame,
+                                text=note_tag_text,
+                                font=("Segoe UI", 8, "bold"),
+                                bootstyle="inverse-danger",
+                            )
+                            lbl_note_tag.pack(pady=(2, 0))
                 else:
                     cell_frame.config(bootstyle="light")
                     lbl_day.config(bootstyle="secondary")
+                    if note_tag_text:
+                        lbl_note_tag = tb.Label(
+                            cell_frame,
+                            text=note_tag_text,
+                            font=("Segoe UI", 8, "bold"),
+                            bootstyle="warning",
+                        )
+                        lbl_note_tag.pack(pady=4)
                     
                 click_date = f"{year}-{month:02d}-{day:02d}"
                 
