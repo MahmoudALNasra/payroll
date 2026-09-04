@@ -437,7 +437,7 @@ APP_TITLE = "Highend Payroll App - Custom Made ✂️"
 APP_LOGO_TITLE = "💈 HIGHEND PAYROLL 💈"
 APP_GEOMETRY = "1250x900"
 APP_THEME = "darkly"
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2923,8 +2923,8 @@ def check_for_cloud_update():
                     if disk_norm == remote_norm_hash:
                         is_update_available = False
                     else:
-                        if remote_build_date and local_build_date:
-                            is_update_available = (remote_build_date > local_build_date)
+                        if remote_build_date and local_build_date and remote_build_date < local_build_date:
+                            is_update_available = False
                         else:
                             is_update_available = True
                 except Exception:
@@ -15484,29 +15484,84 @@ if HAS_DEPS:
                 top = parent.winfo_toplevel()
             except Exception:
                 top = parent
+
+            canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+            vscroll = tb.Scrollbar(parent, orient=VERTICAL, command=canvas.yview)
+            inner = tb.Frame(canvas, padding=16)
+
+            inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+            canvas.configure(yscrollcommand=vscroll.set)
+
+            def _on_canvas_configure(e):
+                try:
+                    canvas.itemconfigure(win_id, width=e.width)
+                except Exception:
+                    pass
+            canvas.bind("<Configure>", _on_canvas_configure)
+
+            def _act_mousewheel(event):
+                try:
+                    if getattr(event, "delta", 0):
+                        delta = int(-1 * (event.delta / 120))
+                    elif getattr(event, "num", 0) == 5:
+                        delta = 1
+                    elif getattr(event, "num", 0) == 4:
+                        delta = -1
+                    else:
+                        delta = 0
+                    if delta:
+                        canvas.yview_scroll(delta, "units")
+                except Exception:
+                    pass
+
+            def _bind_wheel(_e=None):
+                canvas.bind_all("<MouseWheel>", _act_mousewheel)
+                canvas.bind_all("<Button-4>", _act_mousewheel)
+                canvas.bind_all("<Button-5>", _act_mousewheel)
+
+            def _unbind_wheel(_e=None):
+                try:
+                    canvas.unbind_all("<MouseWheel>")
+                    canvas.unbind_all("<Button-4>")
+                    canvas.unbind_all("<Button-5>")
+                except Exception:
+                    pass
+
+            canvas.bind("<Enter>", _bind_wheel)
+            canvas.bind("<Leave>", _unbind_wheel)
+            inner.bind("<Enter>", _bind_wheel)
+            inner.bind("<Leave>", _unbind_wheel)
+
+            vscroll.pack(side=RIGHT, fill=Y)
+            canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
             # --- CSV Log Downloader from Date to Date ---
-            exp_lf = tb.Labelframe(parent, text=self._tr("📥 Download Activity Logs (CSV)"), padding=10, bootstyle="primary")
+            exp_lf = tb.Labelframe(inner, text=self._tr("📥 Download Activity Logs (CSV)"), padding=12, bootstyle="primary")
             exp_lf.pack(fill=X, pady=(0, 12))
-            
-            exp_row = tb.Frame(exp_lf)
-            exp_row.pack(fill=X, pady=4)
-            
-            tb.Label(exp_row, text=self._tr("From Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
-            start_dt_ent = tb.DateEntry(exp_row, bootstyle="primary", dateformat='%Y-%m-%d')
+
+            row_dates = tb.Frame(exp_lf)
+            row_dates.pack(fill=X, pady=(0, 8))
+
+            tb.Label(row_dates, text=self._tr("From Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
+            start_dt_ent = tb.DateEntry(row_dates, bootstyle="primary", dateformat='%Y-%m-%d', width=10)
             start_dt_ent.entry.delete(0, tk.END)
             start_dt_ent.entry.insert(0, (datetime.today() - timedelta(days=30)).strftime('%Y-%m-%d'))
-            start_dt_ent.pack(side=LEFT, padx=(0, 12))
-            
-            tb.Label(exp_row, text=self._tr("To Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
-            end_dt_ent = tb.DateEntry(exp_row, bootstyle="primary", dateformat='%Y-%m-%d')
+            start_dt_ent.pack(side=LEFT, padx=(0, 16))
+
+            tb.Label(row_dates, text=self._tr("To Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
+            end_dt_ent = tb.DateEntry(row_dates, bootstyle="primary", dateformat='%Y-%m-%d', width=10)
             end_dt_ent.entry.delete(0, tk.END)
             end_dt_ent.entry.insert(0, datetime.today().strftime('%Y-%m-%d'))
-            end_dt_ent.pack(side=LEFT, padx=(0, 12))
-            
-            tb.Label(exp_row, text=self._tr("Type:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
-            cbo_log_type = tb.Combobox(exp_row, width=20, state="readonly", values=[self._tr("All Activity Logs"), self._tr("User Actions Only"), self._tr("Database Changes Only")])
+            end_dt_ent.pack(side=LEFT)
+
+            row_type = tb.Frame(exp_lf)
+            row_type.pack(fill=X, pady=(0, 8))
+
+            tb.Label(row_type, text=self._tr("Type:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
+            cbo_log_type = tb.Combobox(row_type, width=20, state="readonly", values=[self._tr("All Activity Logs"), self._tr("User Actions Only"), self._tr("Database Changes Only")])
             cbo_log_type.set(self._tr("All Activity Logs"))
-            cbo_log_type.pack(side=LEFT, padx=(0, 12))
+            cbo_log_type.pack(side=LEFT, padx=(0, 16))
             
             def do_export_csv():
                 s_date = start_dt_ent.entry.get().strip()
@@ -15593,10 +15648,12 @@ if HAS_DEPS:
                 except Exception as e:
                     messagebox.showerror("Export Failed", str(e), parent=top)
 
-            tb.Button(exp_row, text=self._tr("📥 Download CSV"), bootstyle="success", command=do_export_csv).pack(side=LEFT)
+            row_action = tb.Frame(exp_lf)
+            row_action.pack(fill=X)
+            tb.Button(row_action, text=self._tr("📥 Download Activity Logs (CSV)"), bootstyle="success", command=do_export_csv).pack(side=LEFT)
 
-            log_lf = tb.Labelframe(parent, text=self._tr("Activity log"), padding=10)
-            log_lf.pack(fill=BOTH, expand=True, pady=(0, 12))
+            log_lf = tb.Labelframe(inner, text=self._tr("Activity log"), padding=10)
+            log_lf.pack(fill=X, pady=(0, 12))
             filter_row = tb.Frame(log_lf)
             filter_row.pack(fill=X, pady=(0, 8))
             tb.Label(filter_row, text=self._tr("Filter by user:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT)
@@ -15606,8 +15663,8 @@ if HAS_DEPS:
 
             cols = ("When", "User", "Action")
             log_holder = tb.Frame(log_lf)
-            log_holder.pack(fill=BOTH, expand=True)
-            log_tree = tb.Treeview(log_holder, columns=cols, show="headings", height=9, bootstyle="info")
+            log_holder.pack(fill=X)
+            log_tree = tb.Treeview(log_holder, columns=cols, show="headings", height=8, bootstyle="info")
             log_tree.heading("When", text=self._tr("Date"))
             log_tree.heading("User", text=self._tr("User"))
             log_tree.heading("Action", text=self._tr("Action"))
@@ -15616,8 +15673,8 @@ if HAS_DEPS:
             log_tree.column("Action", width=420, anchor=W)
             self._attach_tree_scrollbars(log_holder, log_tree)
 
-            bak_lf = tb.Labelframe(parent, text=self._tr("📁 Daily Backups (Local & Supabase Cloud)"), padding=10, bootstyle="info")
-            bak_lf.pack(fill=BOTH, expand=True)
+            bak_lf = tb.Labelframe(inner, text=self._tr("📁 Daily Backups (Local & Supabase Cloud)"), padding=10, bootstyle="info")
+            bak_lf.pack(fill=X)
             tb.Label(
                 bak_lf,
                 text=self._tr("Daily morning (AM) and afternoon (PM) backups are saved locally on each linked device and synced to Supabase Cloud."),
@@ -15628,7 +15685,7 @@ if HAS_DEPS:
             ).pack(anchor=W, pady=(0, 8))
             bak_cols = ("When", "Slot", "User", "Size")
             bak_holder = tb.Frame(bak_lf)
-            bak_holder.pack(fill=BOTH, expand=True)
+            bak_holder.pack(fill=X)
             bak_tree = tb.Treeview(bak_holder, columns=bak_cols, show="headings", height=6, bootstyle="secondary")
             bak_tree.heading("When", text=self._tr("Date & Time"))
             bak_tree.heading("Slot", text=self._tr("Type / Slot"))
@@ -15928,13 +15985,44 @@ if HAS_DEPS:
                 load_backups()
 
             user_filter.bind("<<ComboboxSelected>>", lambda e: load_logs())
-            btn_row = tb.Frame(bak_lf)
-            btn_row.pack(fill=X, pady=(8, 0))
-            tb.Button(btn_row, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row, text=self._tr("💾 Download Selected File"), bootstyle="info outline", command=do_download_backup).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row, text=self._tr("📂 Load Backup from Disk..."), bootstyle="primary outline", command=do_load_backup_file).pack(side=LEFT)
+            btn_container = tb.Frame(bak_lf)
+            btn_container.pack(fill=X, pady=(10, 0))
+
+            b_refresh = tb.Button(btn_container, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all)
+            b_backup = tb.Button(btn_container, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now)
+            b_restore = tb.Button(btn_container, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore)
+            b_download = tb.Button(btn_container, text=self._tr("💾 Download Selected File"), bootstyle="info outline", command=do_download_backup)
+            b_load = tb.Button(btn_container, text=self._tr("📂 Load Backup from Disk..."), bootstyle="primary outline", command=do_load_backup_file)
+
+            action_buttons = [b_refresh, b_backup, b_restore, b_download, b_load]
+            button_subrows = []
+
+            def reflow_buttons(event=None):
+                avail_w = btn_container.winfo_width()
+                if avail_w <= 10:
+                    return
+                for b in action_buttons:
+                    b.pack_forget()
+                for f in button_subrows:
+                    f.destroy()
+                button_subrows.clear()
+
+                cur_f = tb.Frame(btn_container)
+                cur_f.pack(fill=X, pady=2)
+                button_subrows.append(cur_f)
+                cur_w = 0
+                pad = 8
+                for b in action_buttons:
+                    req_w = b.winfo_reqwidth()
+                    if cur_w > 0 and (cur_w + req_w + pad) > avail_w:
+                        cur_f = tb.Frame(btn_container)
+                        cur_f.pack(fill=X, pady=2)
+                        button_subrows.append(cur_f)
+                        cur_w = 0
+                    b.pack(in_=cur_f, side=LEFT, padx=(0, pad))
+                    cur_w += req_w + pad
+
+            btn_container.bind("<Configure>", reflow_buttons)
             refresh_all()
 
         def _build_database_and_cloud_panel(self, parent, dialog):
@@ -16692,13 +16780,13 @@ if HAS_DEPS:
             dialog.title(self._tr("⚙️ Config & Database Settings Panel"))
             try:
                 self.update_idletasks()
-                w = max(780, self.winfo_width())
-                h = max(680, self.winfo_height())
+                w = max(860, self.winfo_width())
+                h = max(700, self.winfo_height())
                 x = self.winfo_x()
                 y = self.winfo_y()
                 dialog.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
-                dialog.geometry("780x680")
+                dialog.geometry("860x700")
             dialog.transient(self)
             dialog.grab_set()
             dialog.focus_set()
@@ -16993,7 +17081,7 @@ if HAS_DEPS:
             tb.Button(tab_users, text=self._tr("🗑️ Delete Selected"), bootstyle="danger outline", command=delete_user).pack(anchor=W, pady=6)
             load_users()
 
-            tab_act = tb.Frame(notebook, padding=16)
+            tab_act = tb.Frame(notebook)
             notebook.add(tab_act, text=self._tr("Activity & Backups"))
             self._build_activity_and_backup_panel(tab_act)
 
