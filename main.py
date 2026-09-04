@@ -10480,12 +10480,26 @@ if HAS_DEPS:
             
             if emp:
                 f_name, l_name, phone, email, emp_rate, emp_perc, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered = emp
-                f_name = f_name if f_name else ""
-                l_name = l_name if l_name else ""
-                phone = phone if phone else ""
-                email = email if email else ""
-                emp_rate = str(emp_rate) if emp_rate else ""
-                emp_perc = str(emp_perc * 100) if emp_perc else ""
+                f_name = decrypt_val(f_name) or ""
+                l_name = decrypt_val(l_name) or ""
+                phone = decrypt_val(phone) or ""
+                email = decrypt_val(email) or ""
+                ssn = decrypt_val(ssn) or ""
+                address = decrypt_val(address) or ""
+                start_date = decrypt_val(start_date) or ""
+                end_date = decrypt_val(end_date) or ""
+
+                rate_num = to_float(decrypt_val(emp_rate), 0.0)
+                emp_rate = f"{rate_num:g}" if rate_num > 0 else ""
+
+                perc_num = to_float(decrypt_val(emp_perc), 0.0)
+                if perc_num > 1.0:
+                    emp_perc = f"{perc_num:g}"
+                elif perc_num > 0.0:
+                    emp_perc = f"{perc_num * 100:g}"
+                else:
+                    emp_perc = ""
+
                 use_tiered = use_tiered if use_tiered else 0
                 self.open_employee_dialog(emp_id, f_name, l_name, phone, email, emp_rate, emp_perc, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered)
 
@@ -10594,15 +10608,28 @@ if HAS_DEPS:
             entry_end.entry.insert(0, end_date or "")
             entry_end.grid(row=7, column=1, **ent_pad)
             
+            clean_rate_str = ""
+            if current_rate:
+                c_rate = to_float(current_rate, 0.0)
+                clean_rate_str = f"{c_rate:g}" if c_rate > 0 else ""
+
+            clean_perc_str = ""
+            if current_perc:
+                c_perc = to_float(current_perc, 0.0)
+                if c_perc > 1.0:
+                    clean_perc_str = f"{c_perc:g}"
+                elif c_perc > 0.0:
+                    clean_perc_str = f"{c_perc * 100:g}"
+
             tb.Label(scrollable_frame, text=self._tr("Hour Rate ($):"), font=("Segoe UI", 10, "bold")).grid(row=8, column=0, **pad)
             entry_rate = tb.Entry(scrollable_frame, width=35)
             entry_rate.grid(row=8, column=1, **ent_pad)
-            entry_rate.insert(0, current_rate)
+            entry_rate.insert(0, clean_rate_str)
             
             tb.Label(scrollable_frame, text=self._tr("Percentage (1-100):"), font=("Segoe UI", 10, "bold")).grid(row=9, column=0, **pad)
             entry_perc = tb.Entry(scrollable_frame, width=35)
             entry_perc.grid(row=9, column=1, **ent_pad)
-            entry_perc.insert(0, current_perc)
+            entry_perc.insert(0, clean_perc_str)
 
             use_tiered_var = tk.IntVar(value=use_tiered_payout)
             tb.Label(scrollable_frame, text=self._tr("Use Tiered Payout:"), font=("Segoe UI", 10, "bold")).grid(row=10, column=0, **pad)
@@ -10658,10 +10685,10 @@ if HAS_DEPS:
                     messagebox.showerror("Error", self._tr("First Name is required."))
                     return
                 try:
-                    rate_val = float(rate)
-                    perc_val = float(perc)
-                except ValueError:
-                    messagebox.showerror("Error", "Hour rate and percentage must be numbers.")
+                    rate_val = to_float(rate, -1.0) if rate else 0.0
+                    perc_val = to_float(perc, -1.0) if perc else 0.0
+                except Exception:
+                    messagebox.showerror("Error", "Hour rate and percentage must be numbers.", parent=dialog)
                     return
                     
                 if rate_val < 0 or perc_val < 0:
@@ -10678,7 +10705,12 @@ if HAS_DEPS:
                         messagebox.showerror("Validation Error", "You must configure either an Hour Rate or a Percentage greater than 0.", parent=dialog)
                         return
                 
-                db_perc = perc_val / 100.0 if perc_val > 0 else 0.0
+                if perc_val > 1.0:
+                    db_perc = perc_val / 100.0
+                elif perc_val > 0.0:
+                    db_perc = perc_val
+                else:
+                    db_perc = 0.0
                 db_rate = rate_val if rate_val > 0 else 0.0
                 combined_name = f"{fn} {ln}".strip()
                 
@@ -11170,8 +11202,26 @@ if HAS_DEPS:
                 conn.close()
                 if emp_data:
                     f_name, l_name, ph, em, emp_rate, emp_perc, s_ssn, s_address, s_start, s_end, s_cv, s_id, s_pp, use_tiered = emp_data
-                    emp_rate = str(emp_rate) if emp_rate else ""
-                    emp_perc = str(emp_perc * 100) if emp_perc else ""
+                    f_name = decrypt_val(f_name) or ""
+                    l_name = decrypt_val(l_name) or ""
+                    ph = decrypt_val(ph) or ""
+                    em = decrypt_val(em) or ""
+                    s_ssn = decrypt_val(s_ssn) or ""
+                    s_address = decrypt_val(s_address) or ""
+                    s_start = decrypt_val(s_start) or ""
+                    s_end = decrypt_val(s_end) or ""
+
+                    rate_num = to_float(decrypt_val(emp_rate), 0.0)
+                    emp_rate = f"{rate_num:g}" if rate_num > 0 else ""
+
+                    perc_num = to_float(decrypt_val(emp_perc), 0.0)
+                    if perc_num > 1.0:
+                        emp_perc = f"{perc_num:g}"
+                    elif perc_num > 0.0:
+                        emp_perc = f"{perc_num * 100:g}"
+                    else:
+                        emp_perc = ""
+
                     use_tiered = use_tiered if use_tiered else 0
                     win.destroy()
                     self.open_employee_dialog(emp_id, f_name, l_name, ph, em, emp_rate, emp_perc, s_ssn, s_address, s_start, s_end, s_cv, s_id, s_pp, use_tiered)
