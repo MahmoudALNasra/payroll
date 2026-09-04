@@ -540,7 +540,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2761,14 +2761,14 @@ def restart_app():
         if platform.system() == "Windows":
             app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
             if getattr(sys, "frozen", False):
-                run_target = f'""{sys.executable}""'
+                bat_target = f'"{sys.executable}"'
                 if len(sys.argv) > 1:
-                    run_target += " " + " ".join(f'""{a}""' for a in sys.argv[1:])
+                    bat_target += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
             else:
                 script_path = os.path.abspath(sys.argv[0]) if sys.argv else "payroll_app.py"
-                run_target = f'""{sys.executable}"" ""{script_path}""'
+                bat_target = f'"{sys.executable}" "{script_path}"'
                 if len(sys.argv) > 1:
-                    run_target += " " + " ".join(f'""{a}""' for a in sys.argv[1:])
+                    bat_target += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
 
             # Release current working directory lock from any PyInstaller _MEI folder
             try:
@@ -2776,31 +2776,56 @@ def restart_app():
             except Exception:
                 pass
 
-            # Launch completely silently via native Windows wscript without flashing any console or terminal window
+            pid = os.getpid()
+            bat_path = os.path.join(tempfile.gettempdir(), f"payroll_restart_{pid}.bat")
+            bat_code = (
+                "@echo off\r\n"
+                "timeout /t 2 /nobreak >nul 2>&1\r\n"
+                "set _MEIPASS2=\r\n"
+                "set _MEIPASS=\r\n"
+                "set _PYI_APPLICATION_HOME_DIR=\r\n"
+                "set _PYI_PARENT_PROCESS_LEVEL=\r\n"
+                f'cd /d "{app_dir}"\r\n'
+                f"start \"\" {bat_target}\r\n"
+                'del "%~f0" >nul 2>&1\r\n'
+            )
             try:
-                vbs_path = os.path.join(tempfile.gettempdir(), f"payroll_restart_{os.getpid()}.vbs")
+                with open(bat_path, "w", encoding="utf-8") as bf:
+                    bf.write(bat_code)
+            except Exception as e:
+                messagebox.showinfo("Restart Needed", f"Please close and reopen the application manually.\n\n({e})")
+                return
+
+            launched = False
+            # Method 1: Silent execution via VBScript wrapper (no black console window)
+            try:
+                vbs_path = os.path.join(tempfile.gettempdir(), f"payroll_silent_{pid}.vbs")
                 vbs_code = (
-                    "WScript.Sleep 2500\n"
-                    "Set sh = CreateObject(\"WScript.Shell\")\n"
-                    "Set env = sh.Environment(\"Process\")\n"
-                    "On Error Resume Next\n"
-                    "env.Remove(\"_MEIPASS2\")\n"
-                    "env.Remove(\"_MEIPASS\")\n"
-                    "env.Remove(\"_PYI_APPLICATION_HOME_DIR\")\n"
-                    "env.Remove(\"_PYI_PARENT_PROCESS_LEVEL\")\n"
-                    "On Error GoTo 0\n"
-                    f"sh.CurrentDirectory = \"{app_dir}\"\n"
-                    f"sh.Run \"{run_target}\", 1, False\n"
-                    "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
-                    "On Error Resume Next\n"
-                    "fso.DeleteFile WScript.ScriptFullName\n"
+                    'Set sh = CreateObject("WScript.Shell")\r\n'
+                    f'sh.Run Chr(34) & "{bat_path}" & Chr(34), 0, False\r\n'
+                    'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
+                    'On Error Resume Next\r\n'
+                    'fso.DeleteFile WScript.ScriptFullName\r\n'
                 )
                 with open(vbs_path, "w", encoding="utf-8") as vf:
                     vf.write(vbs_code)
                 subprocess.Popen(["wscript.exe", vbs_path], cwd=app_dir, close_fds=True)
-            except Exception as wscript_err:
-                messagebox.showinfo("Restart Needed", "Please close and reopen the application to complete the update.")
-                return
+                launched = True
+            except Exception:
+                pass
+
+            # Method 2: Direct cmd.exe with CREATE_NO_WINDOW if wscript is unavailable
+            if not launched:
+                try:
+                    cflags = 0
+                    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                        cflags |= subprocess.CREATE_NO_WINDOW
+                    if hasattr(subprocess, "DETACHED_PROCESS"):
+                        cflags |= subprocess.DETACHED_PROCESS
+                    subprocess.Popen(["cmd.exe", "/c", bat_path], cwd=app_dir, creationflags=cflags, close_fds=True)
+                except Exception as ex:
+                    messagebox.showinfo("Restart Needed", f"Please close and reopen the application manually.\n\n({ex})")
+                    return
         elif platform.system() == "Darwin":
             exe = sys.executable
             if getattr(sys, "frozen", False):
@@ -8174,14 +8199,18 @@ if HAS_DEPS:
                                                 if ok:
                                                     if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                                         self._login_upd_badge_frame.grid_remove()
-                                                    messagebox.showinfo(
+                                                    ans = messagebox.askyesno(
                                                         "Update Installed Successfully 🎉",
                                                         f"Update v{r_ver} has been installed successfully!\n\n"
-                                                        "The application will now close.\n"
-                                                        "Simply reopen Payroll App to use the new version.",
+                                                        "To activate the new version, the app needs to restart:\n\n"
+                                                        "• [Yes] = Restart app automatically now\n"
+                                                        "• [No] = Close app cleanly (reopen manually)",
                                                         parent=self,
                                                     )
-                                                    self.shutdown_app()
+                                                    if ans:
+                                                        restart_app()
+                                                    else:
+                                                        self.shutdown_app()
                                                 else:
                                                     btn.config(text=f"❌ Retry Installing v{r_ver}", state="normal")
                                                     messagebox.showerror("Update Failed", msg, parent=self)
@@ -8208,10 +8237,10 @@ if HAS_DEPS:
                                         child.destroy()
                                     btn = tb.Button(
                                         self._login_upd_badge_frame,
-                                        text=f"✅ Update v{r_ver} Ready — Click to Close & Reopen",
+                                        text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
                                         bootstyle="success",
                                         cursor="hand2",
-                                        command=self.shutdown_app,
+                                        command=restart_app,
                                     )
                                     btn.pack(fill=X, pady=(6, 0))
                                     self._login_upd_badge_frame.grid()
@@ -17109,18 +17138,21 @@ if HAS_DEPS:
                 if ok:
                     lbl_check_status.configure(text="✅ Update installed successfully!", bootstyle="success")
                     load_update_logs()
-                    if messagebox.askyesno(
+                    ans = messagebox.askyesnocancel(
                         "Update Installed 🎉",
                         f"{msg}\n\nUpdate installed successfully!\n\n"
-                        "• Click [Yes] to Close Application Cleanly (Recommended — just reopen when ready)\n"
-                        "• Click [No] to Restart Automatically",
+                        "To activate the new version, the app needs to restart:\n\n"
+                        "• [Yes] = Restart app automatically now\n"
+                        "• [No] = Close app cleanly (reopen manually when ready)\n"
+                        "• [Cancel] = Stay open in current session",
                         parent=top,
-                    ):
-                        dialog.destroy()
-                        self.shutdown_app()
-                    else:
+                    )
+                    if ans is True:
                         dialog.destroy()
                         restart_app()
+                    elif ans is False:
+                        dialog.destroy()
+                        self.shutdown_app()
                 else:
                     lbl_check_status.configure(text=f"❌ Installation aborted: {msg}", bootstyle="danger")
                     messagebox.showerror("Installation Failed", msg, parent=top)
