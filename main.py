@@ -2754,15 +2754,16 @@ def restart_app():
             purged = [p for p in raw_paths if "_MEI" not in p]
             clean_env["PATH"] = os.pathsep.join(purged)
         if platform.system() == "Windows":
-            quoted_exe = f'"{sys.executable}"'
             app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
             if getattr(sys, "frozen", False):
-                args_str = " ".join(f'"{a}"' for a in sys.argv[1:])
-                full_target = f"{quoted_exe} {args_str}".strip() if args_str else quoted_exe
+                run_target = f'""{sys.executable}""'
+                if len(sys.argv) > 1:
+                    run_target += " " + " ".join(f'""{a}""' for a in sys.argv[1:])
             else:
                 script_path = os.path.abspath(sys.argv[0]) if sys.argv else "payroll_app.py"
-                extra_args = " ".join(f'"{a}"' for a in sys.argv[1:])
-                full_target = f'{quoted_exe} "{script_path}" {extra_args}'.strip() if extra_args else f'{quoted_exe} "{script_path}"'
+                run_target = f'""{sys.executable}"" ""{script_path}""'
+                if len(sys.argv) > 1:
+                    run_target += " " + " ".join(f'""{a}""' for a in sys.argv[1:])
 
             # Release current working directory lock from any PyInstaller _MEI folder
             try:
@@ -2770,21 +2771,31 @@ def restart_app():
             except Exception:
                 pass
 
-            # Delay execution by ~2.5s via localhost ping. This allows the exiting parent
-            # process to terminate fully, unhook all DLLs, and let PyInstaller remove the _MEI temp directory.
-            cmd = f'ping 127.0.0.1 -n 3 > nul & start "" {full_target}'
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-            subprocess.Popen(
-                cmd,
-                shell=True,
-                env=clean_env,
-                close_fds=True,
-                creationflags=flags,
-                cwd=app_dir,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            # Launch completely silently via native Windows wscript without flashing any console or terminal window
+            try:
+                vbs_path = os.path.join(tempfile.gettempdir(), f"payroll_restart_{os.getpid()}.vbs")
+                vbs_code = (
+                    "WScript.Sleep 2500\n"
+                    "Set sh = CreateObject(\"WScript.Shell\")\n"
+                    "Set env = sh.Environment(\"Process\")\n"
+                    "On Error Resume Next\n"
+                    "env.Remove(\"_MEIPASS2\")\n"
+                    "env.Remove(\"_MEIPASS\")\n"
+                    "env.Remove(\"_PYI_APPLICATION_HOME_DIR\")\n"
+                    "env.Remove(\"_PYI_PARENT_PROCESS_LEVEL\")\n"
+                    "On Error GoTo 0\n"
+                    f"sh.CurrentDirectory = \"{app_dir}\"\n"
+                    f"sh.Run \"{run_target}\", 1, False\n"
+                    "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+                    "On Error Resume Next\n"
+                    "fso.DeleteFile WScript.ScriptFullName\n"
+                )
+                with open(vbs_path, "w", encoding="utf-8") as vf:
+                    vf.write(vbs_code)
+                subprocess.Popen(["wscript.exe", vbs_path], cwd=app_dir, close_fds=True)
+            except Exception as wscript_err:
+                messagebox.showinfo("Restart Needed", "Please close and reopen the application to complete the update.")
+                return
         elif platform.system() == "Darwin":
             exe = sys.executable
             if getattr(sys, "frozen", False):
@@ -16996,17 +17007,18 @@ if HAS_DEPS:
                 if ok:
                     lbl_check_status.configure(text="✅ Update installed successfully!", bootstyle="success")
                     load_update_logs()
-                    ans_r = messagebox.askyesnocancel(
+                    if messagebox.askyesno(
                         "Update Installed 🎉",
-                        f"{msg}\n\nTo apply the update:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
+                        f"{msg}\n\nUpdate installed successfully!\n\n"
+                        "• Click [Yes] to Close Application Cleanly (Recommended — just reopen when ready)\n"
+                        "• Click [No] to Restart Automatically",
                         parent=top,
-                    )
-                    if ans_r is True:
-                        dialog.destroy()
-                        restart_app()
-                    elif ans_r is False:
+                    ):
                         dialog.destroy()
                         self.shutdown_app()
+                    else:
+                        dialog.destroy()
+                        restart_app()
                 else:
                     lbl_check_status.configure(text=f"❌ Installation aborted: {msg}", bootstyle="danger")
                     messagebox.showerror("Installation Failed", msg, parent=top)
