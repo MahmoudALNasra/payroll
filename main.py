@@ -3060,9 +3060,35 @@ def check_for_cloud_update():
         except Exception:
             pass
 
+    # Check if this exact update is already downloaded and saved on disk
+    upd_path = get_updates_script_path()
+    disk_is_current = False
+    if os.path.isfile(upd_path):
+        try:
+            with open(upd_path, "rb") as uf:
+                disk_bytes = uf.read()
+            disk_norm = hashlib.sha256(disk_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
+            if disk_norm == remote_norm_hash:
+                disk_is_current = True
+        except Exception:
+            pass
+
     is_update_available = False
 
-    if remote_tuple > local_tuple:
+    if disk_is_current:
+        if local_info.get("is_dynamic"):
+            is_update_available = False
+        else:
+            data = {
+                "remote_code": remote_code,
+                "remote_hash": remote_hash,
+                "remote_version": remote_version,
+                "remote_build_date": remote_build_date,
+                "size_bytes": len(raw_bytes),
+                "local_info": local_info,
+            }
+            return "installed_pending_restart", data
+    elif remote_tuple > local_tuple:
         is_update_available = True
     elif remote_tuple < local_tuple:
         is_update_available = False
@@ -3289,8 +3315,16 @@ def _check_and_run_dynamic_update():
         
     safe_flag = get_safe_mode_flag_path()
     if os.path.isfile(safe_flag):
-        os.environ["_RUNNING_SAFE_MODE_FALLBACK"] = "1"
-        return False
+        try:
+            # If the downloaded update is newer than the crash flag, clear the stale flag
+            if os.path.getmtime(update_file) > os.path.getmtime(safe_flag):
+                os.remove(safe_flag)
+            else:
+                os.environ["_RUNNING_SAFE_MODE_FALLBACK"] = "1"
+                return False
+        except Exception:
+            os.environ["_RUNNING_SAFE_MODE_FALLBACK"] = "1"
+            return False
 
     try:
         with open(update_file, "r", encoding="utf-8") as f:
@@ -8118,25 +8152,74 @@ if HAS_DEPS:
             def _bg():
                 try:
                     status, data = check_for_cloud_update()
+                    r_ver = data.get("remote_version", "Latest")
                     if status == "update_available":
                         def _show():
                             try:
                                 if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                     for child in self._login_upd_badge_frame.winfo_children():
                                         child.destroy()
-                                    r_ver = data.get("remote_version", "Latest")
+                                    
+                                    def _do_quick_install():
+                                        btn.config(text=f"⏳ Installing v{r_ver}...", state="disabled")
+                                        def _worker():
+                                            ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
+                                            def _done():
+                                                if ok:
+                                                    if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                                                        self._login_upd_badge_frame.grid_remove()
+                                                    messagebox.showinfo(
+                                                        "Update Installed Successfully 🎉",
+                                                        f"Update v{r_ver} has been installed successfully!\n\n"
+                                                        "The application will now close.\n"
+                                                        "Simply reopen Payroll App to use the new version.",
+                                                        parent=self,
+                                                    )
+                                                    self.shutdown_app()
+                                                else:
+                                                    btn.config(text=f"❌ Retry Installing v{r_ver}", state="normal")
+                                                    messagebox.showerror("Update Failed", msg, parent=self)
+                                            self.after(0, _done)
+                                        threading.Thread(target=_worker, daemon=True).start()
+
                                     btn = tb.Button(
                                         self._login_upd_badge_frame,
-                                        text=f"✨ Update Available: v{r_ver} — Click to Retrieve & Install",
+                                        text=f"✨ Update Available: v{r_ver} — Click to Install Now",
                                         bootstyle="warning",
                                         cursor="hand2",
-                                        command=self.open_app_updates_dialog,
+                                        command=_do_quick_install,
                                     )
                                     btn.pack(fill=X, pady=(6, 0))
                                     self._login_upd_badge_frame.grid()
                             except Exception:
                                 pass
                         self.after(0, _show)
+                    elif status == "installed_pending_restart":
+                        def _show_restart():
+                            try:
+                                if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                                    for child in self._login_upd_badge_frame.winfo_children():
+                                        child.destroy()
+                                    btn = tb.Button(
+                                        self._login_upd_badge_frame,
+                                        text=f"✅ Update v{r_ver} Ready — Click to Close & Reopen",
+                                        bootstyle="success",
+                                        cursor="hand2",
+                                        command=self.shutdown_app,
+                                    )
+                                    btn.pack(fill=X, pady=(6, 0))
+                                    self._login_upd_badge_frame.grid()
+                            except Exception:
+                                pass
+                        self.after(0, _show_restart)
+                    else:
+                        def _hide():
+                            try:
+                                if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                                    self._login_upd_badge_frame.grid_remove()
+                            except Exception:
+                                pass
+                        self.after(0, _hide)
                 except Exception:
                     pass
             threading.Thread(target=_bg, daemon=True).start()
