@@ -2746,6 +2746,13 @@ def restart_app():
         clean_env.pop("_RUNNING_SAFE_MODE_FALLBACK", None)
         clean_env.pop("_MEIPASS2", None)
         clean_env.pop("_MEIPASS", None)
+        clean_env.pop("_PYI_APPLICATION_HOME_DIR", None)
+        clean_env.pop("_PYI_PARENT_PROCESS_LEVEL", None)
+        # Purge any temporary PyInstaller _MEI paths from PATH so new instance extracts cleanly
+        if "PATH" in clean_env:
+            raw_paths = clean_env["PATH"].split(os.pathsep)
+            purged = [p for p in raw_paths if "_MEI" not in p]
+            clean_env["PATH"] = os.pathsep.join(purged)
         if platform.system() == "Windows":
             quoted_exe = f'"{sys.executable}"'
             app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
@@ -8037,15 +8044,29 @@ if HAS_DEPS:
                 if ans is True:
                     ok, res = rollback_cloud_update(target="bak")
                     if ok:
-                        if messagebox.askyesno("Restart Required", f"{res}\n\nRestart now to apply?", parent=self):
+                        ans_r = messagebox.askyesnocancel(
+                            "Rollback Applied",
+                            f"{res}\n\nTo apply the rollback:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
+                            parent=self,
+                        )
+                        if ans_r is True:
                             restart_app()
+                        elif ans_r is False:
+                            self.shutdown_app()
                     else:
                         messagebox.showerror("Rollback Failed", res, parent=self)
                 elif ans is False:
                     ok, res = rollback_cloud_update(target="factory")
                     if ok:
-                        if messagebox.askyesno("Restart Required", f"{res}\n\nRestart now to apply?", parent=self):
+                        ans_r = messagebox.askyesnocancel(
+                            "Reverted to Factory",
+                            f"{res}\n\nTo apply the built-in version:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
+                            parent=self,
+                        )
+                        if ans_r is True:
                             restart_app()
+                        elif ans_r is False:
+                            self.shutdown_app()
                     else:
                         messagebox.showerror("Revert Failed", res, parent=self)
             else:
@@ -8057,10 +8078,57 @@ if HAS_DEPS:
                 ):
                     ok, res = rollback_cloud_update(target="factory")
                     if ok:
-                        if messagebox.askyesno("Restart Required", f"{res}\n\nRestart now to apply?", parent=self):
+                        ans_r = messagebox.askyesnocancel(
+                            "Reverted to Factory",
+                            f"{res}\n\nTo apply the built-in version:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
+                            parent=self,
+                        )
+                        if ans_r is True:
                             restart_app()
+                        elif ans_r is False:
+                            self.shutdown_app()
                     else:
                         messagebox.showerror("Revert Failed", res, parent=self)
+
+        def shutdown_app(self):
+            """Cleanly shuts down the application, saving state, releasing locks, and closing."""
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            try:
+                cleanup()
+            except Exception:
+                pass
+            sys.exit(0)
+
+        def _check_login_updates_bg(self):
+            """Checks for cloud software updates in the background on startup and displays an install badge."""
+            def _bg():
+                try:
+                    status, data = check_for_cloud_update()
+                    if status == "update_available":
+                        def _show():
+                            try:
+                                if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                                    for child in self._login_upd_badge_frame.winfo_children():
+                                        child.destroy()
+                                    r_ver = data.get("remote_version", "Latest")
+                                    btn = tb.Button(
+                                        self._login_upd_badge_frame,
+                                        text=f"✨ Update Available: v{r_ver} — Click to Retrieve & Install",
+                                        bootstyle="warning",
+                                        cursor="hand2",
+                                        command=self.open_app_updates_dialog,
+                                    )
+                                    btn.pack(fill=X, pady=(6, 0))
+                                    self._login_upd_badge_frame.grid()
+                            except Exception:
+                                pass
+                        self.after(0, _show)
+                except Exception:
+                    pass
+            threading.Thread(target=_bg, daemon=True).start()
 
         def show_login_page(self):
             self.clear_window()
@@ -8158,7 +8226,7 @@ if HAS_DEPS:
                 bootstyle="info-outline",
                 cursor="hand2",
                 command=self.open_app_updates_dialog,
-            ).pack(side=LEFT, padx=6)
+            ).pack(side=LEFT, padx=5)
 
             tb.Button(
                 recov_frame,
@@ -8166,16 +8234,30 @@ if HAS_DEPS:
                 bootstyle="danger-outline",
                 cursor="hand2",
                 command=self._do_quick_rollback_from_login,
-            ).pack(side=LEFT, padx=6)
+            ).pack(side=LEFT, padx=5)
+
+            tb.Button(
+                recov_frame,
+                text="Shutdown App",
+                bootstyle="secondary-outline",
+                cursor="hand2",
+                command=self.shutdown_app,
+            ).pack(side=LEFT, padx=5)
 
             # Engine version & status indicator
             try:
                 ver_info = get_active_code_info()
                 ver_mode = " [Safe Mode Fallback]" if ver_info.get("is_safe_mode") else (" [Cloud Dynamic Engine]" if ver_info.get("is_dynamic") else " [Built-in Engine]")
                 ver_text = f"v{ver_info.get('version', APP_VERSION)}{ver_mode}"
-                tb.Label(frame, text=ver_text, font=("Segoe UI", 8), bootstyle="secondary").grid(row=7, column=0, columnspan=2, pady=(12, 0))
+                tb.Label(frame, text=ver_text, font=("Segoe UI", 8), bootstyle="secondary").grid(row=7, column=0, columnspan=2, pady=(10, 0))
             except Exception:
                 pass
+
+            # Automatic Update Notification Banner on Login Screen
+            self._login_upd_badge_frame = tb.Frame(frame)
+            self._login_upd_badge_frame.grid(row=8, column=0, columnspan=2, pady=(4, 0))
+            self._login_upd_badge_frame.grid_remove()
+            self._check_login_updates_bg()
 
             # Focus password entry immediately for instant typing
             try:
@@ -16914,13 +16996,17 @@ if HAS_DEPS:
                 if ok:
                     lbl_check_status.configure(text="✅ Update installed successfully!", bootstyle="success")
                     load_update_logs()
-                    if messagebox.askyesno(
+                    ans_r = messagebox.askyesnocancel(
                         "Update Installed 🎉",
-                        f"{msg}\n\nThe application must restart to apply the updated engine.\n\nRestart now?",
+                        f"{msg}\n\nTo apply the update:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
                         parent=top,
-                    ):
+                    )
+                    if ans_r is True:
                         dialog.destroy()
                         restart_app()
+                    elif ans_r is False:
+                        dialog.destroy()
+                        self.shutdown_app()
                 else:
                     lbl_check_status.configure(text=f"❌ Installation aborted: {msg}", bootstyle="danger")
                     messagebox.showerror("Installation Failed", msg, parent=top)
@@ -16939,11 +17025,18 @@ if HAS_DEPS:
                     return
                 ok, msg = rollback_cloud_update(target="bak")
                 if ok:
-                    messagebox.showinfo("Rollback Success", f"{msg}\n\nPlease restart the application to apply the rollback.", parent=top)
                     load_update_logs()
-                    if messagebox.askyesno("Restart Now", "Restart application now?", parent=top):
+                    ans_r = messagebox.askyesnocancel(
+                        "Rollback Success ⏮️",
+                        f"{msg}\n\nTo apply the rollback:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
+                        parent=top,
+                    )
+                    if ans_r is True:
                         dialog.destroy()
                         restart_app()
+                    elif ans_r is False:
+                        dialog.destroy()
+                        self.shutdown_app()
                 else:
                     messagebox.showerror("Rollback Failed", msg, parent=top)
 
@@ -16956,11 +17049,18 @@ if HAS_DEPS:
                     return
                 ok, msg = rollback_cloud_update(target="factory")
                 if ok:
-                    messagebox.showinfo("Reverted", f"{msg}\n\nPlease restart the application to run the built-in version.", parent=top)
                     load_update_logs()
-                    if messagebox.askyesno("Restart Now", "Restart application now?", parent=top):
+                    ans_r = messagebox.askyesnocancel(
+                        "Reverted to Factory 🏭",
+                        f"{msg}\n\nTo apply the built-in version:\n• [Yes] = Restart app automatically\n• [No] = Shutdown app cleanly now (reopen manually)\n• [Cancel] = Continue current session",
+                        parent=top,
+                    )
+                    if ans_r is True:
                         dialog.destroy()
                         restart_app()
+                    elif ans_r is False:
+                        dialog.destroy()
+                        self.shutdown_app()
                 else:
                     messagebox.showerror("Revert Failed", msg, parent=top)
 
