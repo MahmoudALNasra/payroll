@@ -2840,12 +2840,18 @@ def check_for_cloud_update():
     status: 'update_available' | 'up_to_date' | 'error'
     """
     url = get_custom_update_server_url()
-    import urllib.request
-    headers = {"User-Agent": "PayrollApp-Updater/2.5"}
+    import time, urllib.request
+    sep = "&" if "?" in url else "?"
+    req_url = f"{url}{sep}_cb={int(time.time())}"
+    headers = {
+        "User-Agent": "PayrollApp-Updater/2.5",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     token = get_update_auth_token()
     if token:
         headers["Authorization"] = f"token {token}"
-    req = urllib.request.Request(url, headers=headers)
+    req = urllib.request.Request(req_url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             raw_bytes = resp.read()
@@ -2925,10 +2931,11 @@ def check_for_cloud_update():
                     is_update_available = False
             else:
                 # Factory binary (no dynamic update file on disk yet)
-                if remote_build_date and local_build_date:
-                    is_update_available = (remote_build_date > local_build_date)
-                else:
+                if remote_build_date and local_build_date and remote_build_date < local_build_date:
                     is_update_available = False
+                else:
+                    # Remote code differs from local factory code, update is available
+                    is_update_available = True
     
     try:
         log_user_action(
@@ -2939,10 +2946,14 @@ def check_for_cloud_update():
     except Exception:
         pass
 
+    disp_version = remote_version
+    if remote_version == local_version and is_update_available:
+        disp_version = f"{remote_version} (Rev {remote_hash[:8]})"
+
     data = {
         "remote_code": remote_code,
         "remote_hash": remote_hash,
-        "remote_version": remote_version,
+        "remote_version": disp_version,
         "remote_build_date": remote_build_date,
         "size_bytes": len(raw_bytes),
         "local_info": local_info,
@@ -2979,6 +2990,10 @@ def install_cloud_update(code_str, remote_hash=""):
         return False, f"Downloaded update cannot be installed because it contains syntax errors:\n\n{err_msg}"
 
     updates_dir = get_updates_dir()
+    try:
+        os.makedirs(updates_dir, exist_ok=True)
+    except Exception:
+        pass
     current_update = get_updates_script_path()
     bak_file = os.path.join(updates_dir, "payroll_app.py.bak")
 
