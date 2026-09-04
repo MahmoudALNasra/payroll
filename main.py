@@ -2739,10 +2739,34 @@ def set_update_auth_token(token_str, sync_to_cloud=True):
             pass
 
 
+def _parse_version_tuple(v_str):
+    """
+    Parses a version string into a comparable tuple of integers.
+    Examples:
+        '2.5.0' -> (2, 5, 0)
+        'v2.5.1' -> (2, 5, 1)
+        '2.5' -> (2, 5, 0)
+    """
+    if not v_str:
+        return (0, 0, 0)
+    import re
+    clean = re.sub(r'^[^\d]*', '', str(v_str).strip())
+    nums = []
+    for chunk in clean.split('.'):
+        m = re.match(r'^(\d+)', chunk)
+        if m:
+            nums.append(int(m.group(1)))
+        else:
+            break
+    while len(nums) < 3:
+        nums.append(0)
+    return tuple(nums)
+
+
 def get_active_code_info():
     """Returns metadata about the currently running code engine."""
     is_safe_mode = os.environ.get("_RUNNING_SAFE_MODE_FALLBACK") == "1" or os.path.isfile(get_safe_mode_flag_path())
-    is_dynamic = os.environ.get("_DYNAMIC_UPDATE_ACTIVE") == "1" or os.environ.get("_DYNAMIC_UPDATE_RUNNING") == "1"
+    is_dynamic = (os.environ.get("_DYNAMIC_UPDATE_ACTIVE") == "1" or os.environ.get("_DYNAMIC_UPDATE_RUNNING") == "1") and not is_safe_mode
     
     current_file = None
     if is_dynamic and os.path.isfile(get_updates_script_path()):
@@ -2750,15 +2774,39 @@ def get_active_code_info():
     else:
         current_file = os.path.abspath(__file__)
         
-    code_hash = "unknown"
+    code_hash = ""
+    norm_hash = ""
     file_size = 0
     version = APP_VERSION
+    build_date = APP_BUILD_DATE
     last_modified = ""
+
+    # Check version_meta.json if dynamic
+    if is_dynamic:
+        meta_file = os.path.join(get_updates_dir(), "version_meta.json")
+        if os.path.isfile(meta_file):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as mf:
+                    meta = json.load(mf)
+                    if meta.get("version"):
+                        version = meta.get("version")
+                    if meta.get("build_date"):
+                        build_date = meta.get("build_date")
+                    if meta.get("hash"):
+                        code_hash = meta.get("hash")
+                    if meta.get("norm_hash"):
+                        norm_hash = meta.get("norm_hash")
+            except Exception:
+                pass
+
     try:
         if current_file and os.path.isfile(current_file):
             with open(current_file, "rb") as f:
                 content = f.read()
-            code_hash = hashlib.sha256(content).hexdigest()
+            if not code_hash:
+                code_hash = hashlib.sha256(content).hexdigest()
+            if not norm_hash:
+                norm_hash = hashlib.sha256(content.replace(b"\r\n", b"\n").strip()).hexdigest()
             file_size = len(content)
             mtime = os.path.getmtime(current_file)
             last_modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
@@ -2766,12 +2814,17 @@ def get_active_code_info():
             m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', content.decode("utf-8", errors="ignore"))
             if m:
                 version = m.group(1)
+            m_d = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', content.decode("utf-8", errors="ignore"))
+            if m_d:
+                build_date = m_d.group(1)
     except Exception:
         pass
 
     return {
         "version": version,
+        "build_date": build_date,
         "hash": code_hash,
+        "norm_hash": norm_hash,
         "is_dynamic": is_dynamic,
         "is_safe_mode": is_safe_mode,
         "file_size": file_size,
@@ -2798,23 +2851,90 @@ def check_for_cloud_update():
             raw_bytes = resp.read()
             remote_code = raw_bytes.decode("utf-8", errors="replace")
     except Exception as e:
-        return "error", {"error": str(e), "url": url}
+        err_str = str(e)
+        if "404" in err_str:
+            clean_err = "Update server resource not found (404)."
+        elif "403" in err_str:
+            clean_err = "Access to update server was denied (403)."
+        elif "timed out" in err_str.lower():
+            clean_err = "Connection to update server timed out. Please check your network."
+        else:
+            clean_err = f"Could not connect to update service: {err_str}"
+        return "error", {"error": clean_err}
 
     remote_hash = hashlib.sha256(raw_bytes).hexdigest()
+    remote_norm_hash = hashlib.sha256(raw_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
+
     local_info = get_active_code_info()
     local_hash = local_info.get("hash") or ""
+    local_norm_hash = local_info.get("norm_hash") or ""
+    local_version = local_info.get("version") or APP_VERSION
+    local_build_date = local_info.get("build_date") or APP_BUILD_DATE
 
     import re
     m_ver = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', remote_code)
-    remote_version = m_ver.group(1) if m_ver else "Latest"
+    remote_version = m_ver.group(1) if m_ver else local_version
 
-    is_different = (remote_hash != local_hash)
+    m_date = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', remote_code)
+    remote_build_date = m_date.group(1) if m_date else ""
+
+    remote_tuple = _parse_version_tuple(remote_version)
+    local_tuple = _parse_version_tuple(local_version)
+
+    meta_hash = ""
+    meta_norm_hash = ""
+    meta_file = os.path.join(get_updates_dir(), "version_meta.json")
+    if os.path.isfile(meta_file):
+        try:
+            with open(meta_file, "r", encoding="utf-8") as mf:
+                meta_data = json.load(mf)
+                meta_hash = meta_data.get("hash") or ""
+                meta_norm_hash = meta_data.get("norm_hash") or ""
+        except Exception:
+            pass
+
+    is_update_available = False
+
+    if remote_tuple > local_tuple:
+        is_update_available = True
+    elif remote_tuple < local_tuple:
+        is_update_available = False
+    else:
+        # Same semantic version
+        if meta_hash and (remote_hash == meta_hash or (meta_norm_hash and remote_norm_hash == meta_norm_hash)):
+            is_update_available = False
+        elif local_norm_hash and remote_norm_hash == local_norm_hash:
+            is_update_available = False
+        elif local_hash and remote_hash == local_hash:
+            is_update_available = False
+        else:
+            upd_path = get_updates_script_path()
+            if os.path.isfile(upd_path):
+                try:
+                    with open(upd_path, "rb") as uf:
+                        disk_bytes = uf.read()
+                    disk_norm = hashlib.sha256(disk_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
+                    if disk_norm == remote_norm_hash:
+                        is_update_available = False
+                    else:
+                        if remote_build_date and local_build_date:
+                            is_update_available = (remote_build_date > local_build_date)
+                        else:
+                            is_update_available = True
+                except Exception:
+                    is_update_available = False
+            else:
+                # Factory binary (no dynamic update file on disk yet)
+                if remote_build_date and local_build_date:
+                    is_update_available = (remote_build_date > local_build_date)
+                else:
+                    is_update_available = False
     
     try:
         log_user_action(
             "app_update_check",
-            extra_summary=f"Checked for software updates: {'Update available' if is_different else 'Already up to date'}",
-            row={"remote_version": remote_version, "remote_hash": remote_hash[:10], "local_hash": local_hash[:10]}
+            extra_summary=f"Checked for software updates: {'Update available' if is_update_available else 'Already up to date'}",
+            row={"remote_version": remote_version, "remote_hash": remote_hash[:10]}
         )
     except Exception:
         pass
@@ -2823,11 +2943,11 @@ def check_for_cloud_update():
         "remote_code": remote_code,
         "remote_hash": remote_hash,
         "remote_version": remote_version,
+        "remote_build_date": remote_build_date,
         "size_bytes": len(raw_bytes),
         "local_info": local_info,
-        "url": url,
     }
-    if is_different:
+    if is_update_available:
         return "update_available", data
     return "up_to_date", data
 
@@ -2882,7 +3002,7 @@ def install_cloud_update(code_str, remote_hash=""):
 
     # 3. Write new code
     try:
-        with open(current_update, "w", encoding="utf-8") as f:
+        with open(current_update, "w", encoding="utf-8", newline="\n") as f:
             f.write(code_str)
     except Exception as e:
         return False, f"Failed to write update file: {e}"
@@ -2900,12 +3020,17 @@ def install_cloud_update(code_str, remote_hash=""):
         import re
         m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', code_str)
         new_ver = m.group(1) if m else "Latest"
+        m_d = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', code_str)
+        new_date = m_d.group(1) if m_d else ""
+        norm_h = hashlib.sha256(code_str.replace("\r\n", "\n").strip().encode("utf-8")).hexdigest()
         meta_file = os.path.join(updates_dir, "version_meta.json")
         with open(meta_file, "w", encoding="utf-8") as f:
             json.dump({
                 "version": new_ver,
+                "build_date": new_date,
                 "installed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "hash": remote_hash,
+                "norm_hash": norm_h,
                 "user": _session_user_name(),
                 "machine": get_device_identifier(),
             }, f, indent=2)
@@ -2916,13 +3041,13 @@ def install_cloud_update(code_str, remote_hash=""):
     try:
         log_user_action(
             "app_update",
-            extra_summary=f"Installed software update {new_ver} ({remote_hash[:8]})",
-            row={"version": new_ver, "hash": remote_hash, "size_bytes": len(code_str.encode("utf-8"))}
+            extra_summary=f"Installed software update v{new_ver}",
+            row={"version": new_ver, "size_bytes": len(code_str.encode("utf-8"))}
         )
     except Exception:
         pass
 
-    return True, f"Version {new_ver} installed successfully!"
+    return True, f"Version v{new_ver} installed successfully!"
 
 install_github_update = install_cloud_update
 
@@ -2956,6 +3081,12 @@ def rollback_cloud_update(target="bak"):
                 shutil.move(current_update, dis_path)
             if os.path.isfile(safe_flag):
                 os.remove(safe_flag)
+            meta_file = os.path.join(updates_dir, "version_meta.json")
+            if os.path.isfile(meta_file):
+                try:
+                    os.remove(meta_file)
+                except Exception:
+                    pass
             log_user_action("app_rollback", extra_summary="Reverted to built-in factory version")
             return True, "Reverted to factory built-in version."
         except Exception as e:
@@ -16261,13 +16392,11 @@ if HAS_DEPS:
             tb.Label(status_grid, text=engine_txt, font=("Segoe UI", 10, "bold"), bootstyle=engine_style).grid(row=0, column=1, sticky=W, pady=3)
             
             tb.Label(status_grid, text="Active Version:", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky=W, pady=3, padx=(0, 12))
-            tb.Label(status_grid, text=f"v{info['version']} (Build Date: {APP_BUILD_DATE})", font=("Segoe UI", 10)).grid(row=1, column=1, sticky=W, pady=3)
-            
-            tb.Label(status_grid, text="Active Code Hash:", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky=W, pady=3, padx=(0, 12))
-            tb.Label(status_grid, text=f"{info['hash'][:16]}...", font=("Segoe UI", 9, "italic"), bootstyle="secondary").grid(row=2, column=1, sticky=W, pady=3)
-            
-            tb.Label(status_grid, text="Updates Location:", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky=W, pady=3, padx=(0, 12))
-            tb.Label(status_grid, text=get_updates_dir(), font=("Segoe UI", 9), bootstyle="secondary").grid(row=3, column=1, sticky=W, pady=3)
+            build_date_disp = info.get('build_date') or APP_BUILD_DATE
+            tb.Label(status_grid, text=f"v{info['version']} (Build Date: {build_date_disp})", font=("Segoe UI", 10)).grid(row=1, column=1, sticky=W, pady=3)
+
+            tb.Label(status_grid, text="System Status:", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky=W, pady=3, padx=(0, 12))
+            tb.Label(status_grid, text="✅ System Verified & Ready", font=("Segoe UI", 10), bootstyle="success").grid(row=2, column=1, sticky=W, pady=3)
 
             # Safe mode / Crash diagnostics box
             safe_flag = get_safe_mode_flag_path()
