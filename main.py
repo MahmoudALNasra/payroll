@@ -535,7 +535,12 @@ APP_TITLE = "Highend Payroll App - Custom Made ✂"
 APP_LOGO_TITLE = "★ HIGHEND PAYROLL ★"
 APP_GEOMETRY = "1250x900"
 APP_THEME = "darkly"
-APP_VERSION = "2.5.2"
+
+# Versioning Policy:
+# - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
+# - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
+# - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
+APP_VERSION = "2.5.3"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
