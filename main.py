@@ -120,18 +120,24 @@ import threading
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
+_FAILED_AUTO_INSTALL = set()
+
 def auto_install_package(package_spec, import_name=None):
     """
     Ensures a Python package is installed and importable.
     If missing, automatically installs it via pip without user intervention.
     Supports macOS, Linux, and Windows.
     """
+    global _FAILED_AUTO_INSTALL
     mod_name = import_name or package_spec.split("==")[0].split(">=")[0].replace("-", "_")
     try:
         __import__(mod_name)
         return True
     except ImportError:
         pass
+
+    if package_spec in _FAILED_AUTO_INSTALL:
+        return False
 
     # Ensure user site-packages directory is in sys.path
     try:
@@ -143,24 +149,16 @@ def auto_install_package(package_spec, import_name=None):
     except Exception:
         pass
 
-    # Candidate commands for invoking pip across various environments
+    # Build concise, targeted candidate commands
     pip_cmds = []
     if not getattr(sys, "frozen", False):
-        pip_cmds.append([sys.executable, "-m", "pip", "install", package_spec])
         pip_cmds.append([sys.executable, "-m", "pip", "install", "--break-system-packages", package_spec])
+        pip_cmds.append([sys.executable, "-m", "pip", "install", package_spec])
         pip_cmds.append([sys.executable, "-m", "pip", "install", "--user", package_spec])
-        pip_cmds.append([sys.executable, "-m", "pip", "install", "--user", "--break-system-packages", package_spec])
-
-    pip_cmds.extend([
-        ["pip3", "install", package_spec],
-        ["pip3", "install", "--break-system-packages", package_spec],
-        ["pip3", "install", "--user", package_spec],
-        ["pip3", "install", "--user", "--break-system-packages", package_spec],
-        ["python3", "-m", "pip", "install", package_spec],
-        ["python3", "-m", "pip", "install", "--break-system-packages", package_spec],
-        ["python3", "-m", "pip", "install", "--user", package_spec],
-        ["pip", "install", package_spec],
-    ])
+    else:
+        pip_cmds.append(["pip3", "install", "--break-system-packages", package_spec])
+        pip_cmds.append(["pip3", "install", package_spec])
+        pip_cmds.append(["python3", "-m", "pip", "install", package_spec])
 
     for cmd in pip_cmds:
         try:
@@ -168,7 +166,7 @@ def auto_install_package(package_spec, import_name=None):
                 cmd,
                 check=True,
                 capture_output=True,
-                timeout=120,
+                timeout=25,
                 stdin=subprocess.DEVNULL,
             )
             try:
@@ -185,6 +183,8 @@ def auto_install_package(package_spec, import_name=None):
             return True
         except Exception:
             continue
+
+    _FAILED_AUTO_INSTALL.add(package_spec)
     return False
 
 
