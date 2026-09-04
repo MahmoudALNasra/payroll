@@ -2748,6 +2748,7 @@ def restart_app():
         clean_env.pop("_MEIPASS", None)
         if platform.system() == "Windows":
             quoted_exe = f'"{sys.executable}"'
+            app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
             if getattr(sys, "frozen", False):
                 args_str = " ".join(f'"{a}"' for a in sys.argv[1:])
                 full_target = f"{quoted_exe} {args_str}".strip() if args_str else quoted_exe
@@ -2756,12 +2757,27 @@ def restart_app():
                 extra_args = " ".join(f'"{a}"' for a in sys.argv[1:])
                 full_target = f'{quoted_exe} "{script_path}" {extra_args}'.strip() if extra_args else f'{quoted_exe} "{script_path}"'
 
-            # Delay execution by ~1.5s via localhost ping. This allows the exiting parent
-            # process to terminate fully and unhook all PyInstaller _MEI temp files before
-            # the new process begins extracting.
-            cmd = f'ping 127.0.0.1 -n 2 > nul & start "" {full_target}'
+            # Release current working directory lock from any PyInstaller _MEI folder
+            try:
+                os.chdir(app_dir)
+            except Exception:
+                pass
+
+            # Delay execution by ~2.5s via localhost ping. This allows the exiting parent
+            # process to terminate fully, unhook all DLLs, and let PyInstaller remove the _MEI temp directory.
+            cmd = f'ping 127.0.0.1 -n 3 > nul & start "" {full_target}'
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
-            subprocess.Popen(cmd, shell=True, env=clean_env, close_fds=True, creationflags=flags)
+            subprocess.Popen(
+                cmd,
+                shell=True,
+                env=clean_env,
+                close_fds=True,
+                creationflags=flags,
+                cwd=app_dir,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         elif platform.system() == "Darwin":
             exe = sys.executable
             if getattr(sys, "frozen", False):
@@ -5691,7 +5707,14 @@ def commit_and_save(conn):
         f.write(SALT + encrypted)
 
 def cleanup():
-    """Securely deletes the temporary decrypted database when the app closes."""
+    """Securely deletes the temporary decrypted database when the app closes and releases directory locks."""
+    try:
+        if getattr(sys, "frozen", False):
+            app_dir = os.path.dirname(sys.executable)
+            if os.path.isdir(app_dir):
+                os.chdir(app_dir)
+    except Exception:
+        pass
     if get_db_mode() == "supabase":
         close_shared_supabase_conn()
         _persist_offline_cache()
