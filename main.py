@@ -540,7 +540,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.6"
+APP_VERSION = "2.5.7"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -8265,6 +8265,87 @@ if HAS_DEPS:
                     pass
             threading.Thread(target=_bg, daemon=True).start()
 
+        def _check_main_window_updates_bg(self):
+            """Checks for software updates while inside the main dashboard and displays a yellow banner if available."""
+            def _bg():
+                try:
+                    status, data = check_for_cloud_update()
+                    r_ver = data.get("remote_version", "Latest")
+                    if status == "update_available":
+                        def _show():
+                            try:
+                                if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
+                                    for child in self._main_upd_banner.winfo_children():
+                                        child.destroy()
+                                    
+                                    def _do_quick_install():
+                                        btn.config(text=f"⏳ Installing v{r_ver}...", state="disabled")
+                                        def _worker():
+                                            ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
+                                            def _done():
+                                                if ok:
+                                                    if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
+                                                        self._main_upd_banner.pack_forget()
+                                                    ans = messagebox.askyesno(
+                                                        "Update Installed Successfully 🎉",
+                                                        f"Update v{r_ver} has been installed successfully!\n\n"
+                                                        "To activate the new version, the app needs to restart:\n\n"
+                                                        "• [Yes] = Restart app automatically now\n"
+                                                        "• [No] = Close app cleanly (reopen manually)",
+                                                        parent=self,
+                                                    )
+                                                    if ans:
+                                                        restart_app()
+                                                    else:
+                                                        self.shutdown_app()
+                                                else:
+                                                    btn.config(text=f"❌ Retry Installing v{r_ver}", state="normal")
+                                                    messagebox.showerror("Update Failed", msg, parent=self)
+                                            self.after(0, _done)
+                                        threading.Thread(target=_worker, daemon=True).start()
+
+                                    btn = tb.Button(
+                                        self._main_upd_banner,
+                                        text=f"✨ Software Update Available: v{r_ver} — Click to Install & Restart Now",
+                                        bootstyle="warning",
+                                        cursor="hand2",
+                                        command=_do_quick_install,
+                                    )
+                                    btn.pack(fill=X, pady=4)
+                                    self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
+                            except Exception:
+                                pass
+                        self.after(0, _show)
+                    elif status == "installed_pending_restart":
+                        def _show_restart():
+                            try:
+                                if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
+                                    for child in self._main_upd_banner.winfo_children():
+                                        child.destroy()
+                                    btn = tb.Button(
+                                        self._main_upd_banner,
+                                        text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
+                                        bootstyle="success",
+                                        cursor="hand2",
+                                        command=restart_app,
+                                    )
+                                    btn.pack(fill=X, pady=4)
+                                    self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
+                            except Exception:
+                                pass
+                        self.after(0, _show_restart)
+                    else:
+                        def _hide():
+                            try:
+                                if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
+                                    self._main_upd_banner.pack_forget()
+                            except Exception:
+                                pass
+                        self.after(0, _hide)
+                except Exception:
+                    pass
+            threading.Thread(target=_bg, daemon=True).start()
+
         def show_login_page(self):
             self.clear_window()
             self.grid_rowconfigure(0, weight=1)
@@ -8351,33 +8432,11 @@ if HAS_DEPS:
             self._login_progress.grid(row=5, column=0, columnspan=2, pady=(0, 10))
             self._login_progress.grid_remove()
 
-            # Recovery & Cloud Updates Actions on Login Screen
-            recov_frame = tb.Frame(frame)
-            recov_frame.grid(row=6, column=0, columnspan=2, pady=(8, 0))
-
-            tb.Button(
-                recov_frame,
-                text="Check / Retrieve Updates",
-                bootstyle="info-outline",
-                cursor="hand2",
-                command=self.open_app_updates_dialog,
-            ).pack(side=LEFT, padx=5)
-
-            tb.Button(
-                recov_frame,
-                text="Revert / Rollback Engine",
-                bootstyle="danger-outline",
-                cursor="hand2",
-                command=self._do_quick_rollback_from_login,
-            ).pack(side=LEFT, padx=5)
-
-            tb.Button(
-                recov_frame,
-                text="Shutdown App",
-                bootstyle="secondary-outline",
-                cursor="hand2",
-                command=self.shutdown_app,
-            ).pack(side=LEFT, padx=5)
+            # Automatic Update Notification Banner on Login Screen (Appears ONLY when update is available)
+            self._login_upd_badge_frame = tb.Frame(frame)
+            self._login_upd_badge_frame.grid(row=6, column=0, columnspan=2, pady=(10, 0))
+            self._login_upd_badge_frame.grid_remove()
+            self._check_login_updates_bg()
 
             # Engine version & status indicator
             try:
@@ -8387,12 +8446,6 @@ if HAS_DEPS:
                 tb.Label(frame, text=ver_text, font=("Segoe UI", 8), bootstyle="secondary").grid(row=7, column=0, columnspan=2, pady=(10, 0))
             except Exception:
                 pass
-
-            # Automatic Update Notification Banner on Login Screen
-            self._login_upd_badge_frame = tb.Frame(frame)
-            self._login_upd_badge_frame.grid(row=8, column=0, columnspan=2, pady=(4, 0))
-            self._login_upd_badge_frame.grid_remove()
-            self._check_login_updates_bg()
 
             # Focus password entry immediately for instant typing
             try:
@@ -9239,6 +9292,12 @@ if HAS_DEPS:
             btn_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
             tb.Button(right_frame, text=btn_text, bootstyle="info", cursor="hand2", command=self.toggle_language).pack(side=LEFT)
             
+            # Dynamic Update Banner in Main Dashboard (Appears ONLY when update is available)
+            self._main_upd_banner = tb.Frame(self)
+            self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
+            self._main_upd_banner.pack_forget()
+            self._check_main_window_updates_bg()
+
             self.notebook = tb.Notebook(self, bootstyle="info")
             self.notebook.pack(fill=BOTH, expand=True, padx=20, pady=20)
             
