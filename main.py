@@ -540,7 +540,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.7"
+APP_VERSION = "2.5.9"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2760,14 +2760,13 @@ def restart_app():
         except Exception:
             pass
 
-        clean_env = os.environ.copy()
-        clean_env.pop("_DYNAMIC_UPDATE_RUNNING", None)
-        clean_env.pop("_DYNAMIC_UPDATE_ACTIVE", None)
-        clean_env.pop("_RUNNING_SAFE_MODE_FALLBACK", None)
-        clean_env.pop("_MEIPASS2", None)
-        clean_env.pop("_MEIPASS", None)
-        clean_env.pop("_PYI_APPLICATION_HOME_DIR", None)
-        clean_env.pop("_PYI_PARENT_PROCESS_LEVEL", None)
+        # 3. Clean environment: thoroughly purge ALL PyInstaller and dynamic update keys
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if not k.upper().startswith(("_MEI", "_PYI", "PYI_"))
+            and not k.startswith("_DYNAMIC_UPDATE")
+            and k != "_RUNNING_SAFE_MODE_FALLBACK"
+        }
         # Purge any temporary PyInstaller _MEI paths from PATH so new instance extracts cleanly
         if "PATH" in clean_env:
             raw_paths = clean_env["PATH"].split(os.pathsep)
@@ -2786,25 +2785,36 @@ def restart_app():
             except Exception:
                 pass
 
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            launched = False
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
-            # Primary: Native PowerShell launcher (No window, reliable sleep, no Defender VBS block)
+            # Build argument string
+            extra_args_str = " ".join(f'"{a}"' for a in extra_args) if extra_args else ""
+            target_cmd = f'"{exe_path}"' + (f" {extra_args_str}" if extra_args_str else "")
+
+            # Method 1: Dedicated self-deleting batch launcher in updates directory.
+            # Executes invisibly with CREATE_NO_WINDOW (no black terminal flicker),
+            # delays ~2 seconds via ping so current process completely exits,
+            # strips all PyInstaller variables, and launches the fresh app via Windows start.
+            launched = False
             try:
-                clean_exe = exe_path.replace("'", "''")
-                clean_app_dir = app_dir.replace("'", "''")
-                arg_clause = ""
-                if extra_args:
-                    escaped_args = [str(a).replace("'", "''") for a in extra_args]
-                    arg_clause = "-ArgumentList " + ",".join(f"'{ea}'" for ea in escaped_args)
-                ps_cmd = (
-                    "Start-Sleep -Seconds 2; "
-                    r"Remove-Item Env:\_MEIPASS* -ErrorAction SilentlyContinue; "
-                    r"Remove-Item Env:\_PYI* -ErrorAction SilentlyContinue; "
-                    f"Start-Process -FilePath '{clean_exe}' {arg_clause} -WorkingDirectory '{clean_app_dir}'"
+                upd_dir = get_updates_dir()
+                os.makedirs(upd_dir, exist_ok=True)
+                bat_path = os.path.join(upd_dir, "restart_launcher.bat")
+                bat_content = (
+                    "@echo off\r\n"
+                    "set _MEIPASS2=\r\n"
+                    "set _MEIPASS=\r\n"
+                    "set _PYI_APPLICATION_HOME_DIR=\r\n"
+                    "set _PYI_PARENT_PROCESS_LEVEL=\r\n"
+                    "ping 127.0.0.1 -n 3 >nul 2>&1\r\n"
+                    f'start "" /D "{app_dir}" {target_cmd}\r\n'
+                    'del "%~f0" >nul 2>&1\r\n'
                 )
+                with open(bat_path, "w", encoding="utf-8") as bf:
+                    bf.write(bat_content)
+
                 subprocess.Popen(
-                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                    f'cmd.exe /c "{bat_path}"',
                     cwd=app_dir,
                     env=clean_env,
                     creationflags=flags,
@@ -2812,17 +2822,18 @@ def restart_app():
                 )
                 launched = True
             except Exception:
-                pass
+                launched = False
 
-            # Fallback: cmd.exe with ping delay
+            # Method 2: Inline cmd.exe fallback
             if not launched:
                 try:
-                    full_target = f'"{exe_path}"'
-                    if extra_args:
-                        full_target += " " + " ".join(f'"{a}"' for a in extra_args)
-                    cmd = f'ping 127.0.0.1 -n 3 >nul 2>&1 & start "" {full_target}'
+                    cmd = (
+                        f'cmd.exe /c "set _MEIPASS2=& set _MEIPASS=& '
+                        f'ping 127.0.0.1 -n 3 >nul 2>&1 & '
+                        f'start "" /D "{app_dir}" {target_cmd}"'
+                    )
                     subprocess.Popen(
-                        ["cmd.exe", "/c", cmd],
+                        cmd,
                         cwd=app_dir,
                         env=clean_env,
                         creationflags=flags,
