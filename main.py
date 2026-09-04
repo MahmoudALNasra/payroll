@@ -415,7 +415,14 @@ TRANSLATIONS = {
     "Field Info": "معلومات الحقل",
     "Table Info": "معلومات الجدول",
     "✅ Approve Selected": "✅ قبول المحدد",
-    "❌ Set Pending": "❌ قيد الانتظار"
+    "❌ Set Pending": "❌ قيد الانتظار",
+    "Sync Cloud": "مزامنة السحابة",
+    "Syncing…": "جارِ المزامنة…",
+    "Connecting…": "جارِ الاتصال…",
+    "Connected": "متصل",
+    "Synced": "تمت المزامنة",
+    "Offline": "غير متصل",
+    "pending": "معلق"
 }
 
 # --- APP CONFIGURATION ---
@@ -1419,25 +1426,85 @@ def _clean_supabase_config(config):
     cfg["supabase_database"] = database
     return cfg
 
-def _open_supabase_pg_conn(timeout=6):
+def _open_supabase_pg_conn(timeout=15):
     import pg8000.dbapi
     raw_config = get_db_config()
     config = _clean_supabase_config(raw_config)
-    conn = pg8000.dbapi.connect(
-        host=config.get("supabase_host"),
-        port=int(config.get("supabase_port", 5432)),
-        user=config.get("supabase_user", "postgres"),
-        password=config.get("supabase_password"),
-        database=config.get("supabase_database", "postgres"),
-        timeout=timeout,
-    )
-    try:
-        conn.commit()
-    except Exception:
-        pass
-    return conn
+    host = config.get("supabase_host")
+    port = int(config.get("supabase_port", 5432))
+    user = config.get("supabase_user", "postgres")
+    password = config.get("supabase_password")
+    database = config.get("supabase_database", "postgres")
 
-def get_shared_supabase_conn(force_reconnect=False, timeout=6):
+    try:
+        conn = pg8000.dbapi.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            timeout=timeout,
+        )
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        return conn
+    except Exception as first_err:
+        err_msg = str(first_err).lower()
+        is_timeout_or_network = any(k in err_msg for k in ["timeout", "handshake", "timed out", "source_address is none", "connection refused", "network unreachable", "10060", "10061"])
+
+        # Extract project reference
+        ref = None
+        if host:
+            clean_h = host.replace("db.", "").strip()
+            if ".supabase.co" in clean_h:
+                ref = clean_h.split(".supabase.co")[0].strip()
+        if not ref and user and "." in user:
+            ref = user.split(".", 1)[1].strip()
+
+        if is_timeout_or_network and ref:
+            # Try connection pooler (IPv4 compatible) across candidate regions
+            candidate_regions = ["us-east-2", "us-east-1", "us-west-1", "us-west-2", "eu-central-1", "eu-west-1", "ap-southeast-1"]
+            pooler_user = f"postgres.{ref}"
+            for reg in candidate_regions:
+                pooler_host = f"aws-0-{reg}.pooler.supabase.com"
+                for pooler_port in [6543, 5432]:
+                    try:
+                        conn = pg8000.dbapi.connect(
+                            host=pooler_host,
+                            port=pooler_port,
+                            user=pooler_user,
+                            password=password,
+                            database=database,
+                            timeout=min(timeout, 8),
+                        )
+                        try:
+                            conn.commit()
+                        except Exception:
+                            pass
+                        # Auto-update local config with working IPv4 pooler
+                        try:
+                            cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
+                            if os.path.exists(cfg_path):
+                                with open(cfg_path, "r", encoding="utf-8") as f:
+                                    cur_cfg = json.load(f)
+                                cur_cfg["supabase_host"] = pooler_host
+                                cur_cfg["supabase_port"] = str(pooler_port)
+                                cur_cfg["supabase_user"] = pooler_user
+                                with open(cfg_path, "w", encoding="utf-8") as f:
+                                    json.dump(cur_cfg, f, indent=4)
+                        except Exception:
+                            pass
+                        return conn
+                    except Exception as pooler_err:
+                        p_msg = str(pooler_err).lower()
+                        if "password authentication failed" in p_msg:
+                            raise pooler_err
+                        continue
+        raise first_err
+
+def get_shared_supabase_conn(force_reconnect=False, timeout=15):
     """Reuse one Postgres connection for the whole app session, auto-reconnecting if dead."""
     global _SUPABASE_PG_CONN
     if force_reconnect and _SUPABASE_PG_CONN is not None:
@@ -1553,9 +1620,14 @@ def _is_connectivity_error(exc):
     needles = (
         "failed to connect",
         "could not connect",
+        "can't create a connection",
         "timed out",
+        "timeout",
+        "handshake",
+        "source_address is none",
         "network is unreachable",
         "unreachable",
+        "no route to host",
         "connection refused",
         "connection reset",
         "broken pipe",
@@ -7995,13 +8067,22 @@ if HAS_DEPS:
             self.lbl_logged_in_user.pack(side=LEFT, padx=10)
 
             if get_db_mode() == "supabase":
+                self.btn_sync_now = tb.Button(
+                    right_frame,
+                    text="🔄 " + self._tr("Sync Cloud"),
+                    bootstyle="info-outline",
+                    cursor="hand2",
+                    command=self.manual_sync_cloud,
+                )
+                self.btn_sync_now.pack(side=LEFT, padx=6)
+
                 self.lbl_live_sync = tb.Label(
                     right_frame,
-                    text="☁️ Sync every 30s",
+                    text="☁️ " + self._tr("Connected"),
                     font=("Segoe UI", 9),
                     bootstyle="inverse-primary",
                 )
-                self.lbl_live_sync.pack(side=LEFT, padx=8)
+                self.lbl_live_sync.pack(side=LEFT, padx=6)
             
             btn_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
             tb.Button(right_frame, text=btn_text, bootstyle="info", cursor="hand2", command=self.toggle_language).pack(side=LEFT)
@@ -8570,6 +8651,54 @@ if HAS_DEPS:
                 command=lambda: self._shop_files_show_archive(location),
             ).pack(side=LEFT, padx=10)
 
+        def manual_sync_cloud(self):
+            """Manual trigger for cloud sync with immediate visual feedback."""
+            if getattr(self, "_manual_sync_in_progress", False):
+                return
+            self._manual_sync_in_progress = True
+
+            btn = getattr(self, "btn_sync_now", None)
+            lbl = getattr(self, "lbl_live_sync", None)
+
+            if self._widget_alive(btn):
+                btn.config(text="⏳ " + self._tr("Syncing…"), state="disabled")
+            if self._widget_alive(lbl):
+                lbl.config(text="🔄 " + self._tr("Connecting…"))
+
+            def _bg():
+                ok = False
+                msg = ""
+                try:
+                    close_shared_supabase_conn()
+                    ok, msg = sync_local_cache_with_cloud(backfill=True, init_schema=False)
+                except Exception as e:
+                    ok = False
+                    msg = str(e)
+                finally:
+                    self._manual_sync_in_progress = False
+
+                def _ui():
+                    b = getattr(self, "btn_sync_now", None)
+                    l = getattr(self, "lbl_live_sync", None)
+                    if self._widget_alive(b):
+                        b.config(text="🔄 " + self._tr("Sync Cloud"), state="normal")
+                    if self._widget_alive(l):
+                        if ok:
+                            t_str = datetime.now().strftime("%H:%M:%S")
+                            l.config(text=f"✅ {self._tr('Synced')} {t_str}")
+                        else:
+                            pending = offline_pending_count()
+                            l.config(text=f"📴 {self._tr('Offline')} ({pending} {self._tr('pending')})")
+                    if ok:
+                        self._schedule_soft_ui_refresh(full=True)
+
+                try:
+                    self.after(0, _ui)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_bg, daemon=True).start()
+
         def start_live_sync(self):
             """Auto-refresh the active view from Supabase while logged in."""
             self.stop_live_sync()
@@ -8655,13 +8784,14 @@ if HAS_DEPS:
                 except Exception:
                     pass
 
+            next_interval = 12000 if (is_supabase_offline() or offline_pending_count()) else LIVE_SYNC_INTERVAL_MS
             if (
                 getattr(self, "is_logged_in", False)
                 and get_db_mode() == "supabase"
                 and self.winfo_exists()
             ):
                 self._live_sync_after_id = self.after(
-                    LIVE_SYNC_INTERVAL_MS, self._live_sync_tick
+                    next_interval, self._live_sync_tick
                 )
 
         def _schedule_soft_ui_refresh(self, full=True):
