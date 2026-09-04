@@ -125,8 +125,8 @@ _FAILED_AUTO_INSTALL = set()
 def auto_install_package(package_spec, import_name=None):
     """
     Ensures a Python package is installed and importable.
-    If missing, automatically installs it via pip without user intervention.
-    Supports macOS, Linux, and Windows.
+    If running inside a compiled standalone app (frozen PyInstaller/app bundle), returns immediately
+    without spawning any subprocesses or terminals.
     """
     global _FAILED_AUTO_INSTALL
     mod_name = import_name or package_spec.split("==")[0].split(">=")[0].replace("-", "_")
@@ -136,10 +136,13 @@ def auto_install_package(package_spec, import_name=None):
     except ImportError:
         pass
 
+    # Never attempt pip inside a compiled binary (prevents rogue terminals)
+    if getattr(sys, "frozen", False):
+        return False
+
     if package_spec in _FAILED_AUTO_INSTALL:
         return False
 
-    # Ensure user site-packages directory is in sys.path
     try:
         import site
         if hasattr(site, "getusersitepackages"):
@@ -149,26 +152,24 @@ def auto_install_package(package_spec, import_name=None):
     except Exception:
         pass
 
-    # Build concise, targeted candidate commands
-    pip_cmds = []
-    if not getattr(sys, "frozen", False):
-        pip_cmds.append([sys.executable, "-m", "pip", "install", "--break-system-packages", package_spec])
-        pip_cmds.append([sys.executable, "-m", "pip", "install", package_spec])
-        pip_cmds.append([sys.executable, "-m", "pip", "install", "--user", package_spec])
-    else:
-        pip_cmds.append(["pip3", "install", "--break-system-packages", package_spec])
-        pip_cmds.append(["pip3", "install", package_spec])
-        pip_cmds.append(["python3", "-m", "pip", "install", package_spec])
+    pip_cmds = [
+        [sys.executable, "-m", "pip", "install", "--break-system-packages", package_spec],
+        [sys.executable, "-m", "pip", "install", package_spec],
+        [sys.executable, "-m", "pip", "install", "--user", package_spec],
+    ]
+
+    kw = {
+        "check": True,
+        "capture_output": True,
+        "timeout": 20,
+        "stdin": subprocess.DEVNULL,
+    }
+    if platform.system() == "Windows":
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
     for cmd in pip_cmds:
         try:
-            subprocess.run(
-                cmd,
-                check=True,
-                capture_output=True,
-                timeout=25,
-                stdin=subprocess.DEVNULL,
-            )
+            subprocess.run(cmd, **kw)
             try:
                 import site
                 if hasattr(site, "getusersitepackages"):
@@ -189,20 +190,8 @@ def auto_install_package(package_spec, import_name=None):
 
 
 def ensure_all_dependencies():
-    """Silently ensure all required third-party packages are installed (pg8000, scramp, openpyxl, numbers-parser, etc.)."""
-    packages_to_check = [
-        ("ttkbootstrap", "ttkbootstrap"),
-        ("cryptography", "cryptography"),
-        ("pg8000", "pg8000"),
-        ("scramp", "scramp"),
-        ("openpyxl", "openpyxl"),
-        ("numbers-parser", "numbers_parser"),
-    ]
-    for pkg, mod in packages_to_check:
-        try:
-            __import__(mod)
-        except ImportError:
-            auto_install_package(pkg, mod)
+    """No-op on startup to prevent unwanted terminal popups."""
+    pass
 
 
 def _init_tooltips():
@@ -644,7 +633,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.13"
+APP_VERSION = "2.5.14"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -19189,7 +19178,6 @@ def check_machine_license():
 
 if __name__ == "__main__":
     if not HAS_DEPS:
-        ensure_all_dependencies()
         try:
             import ttkbootstrap as tb
             from ttkbootstrap.constants import *
@@ -19203,9 +19191,6 @@ if __name__ == "__main__":
         
     if not check_machine_license():
         sys.exit(1)
-
-    # Launch background dependency verification so pg8000, scramp, openpyxl, etc. are ready
-    threading.Thread(target=ensure_all_dependencies, daemon=True).start()
 
     # Dynamic update bootstrap (runs downloaded update if present, or safely falls back)
     if _check_and_run_dynamic_update():
