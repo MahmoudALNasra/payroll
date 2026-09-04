@@ -9359,23 +9359,18 @@ if HAS_DEPS:
                 svc_calc = round((rev_v * service_perc) + (hrs_v * hour_rate), 2)
 
                 # Service add-on percentage rules:
-                # 1. If barber is below 50% percentage:
-                #    - The highest one below 50% gets 50% on add-ons instead of 40%
-                #    - The rest below 50% get 40% on add-ons
-                # 2. If barber is >= 50% percentage:
-                #    - For people who have percentage checked (use_tiered) and achieve >= 50%:
-                #      they get the same percentage on add-on as sales service
-                #    - For people with fixed percentage >= 50%: add-on is also 50%
+                # 1. If employee percentage is below 50%:
+                #    - The highest add-on sales earner in this below-50% group gets 50% (0.50)
+                #    - The rest in this below-50% group get a fixed 40% (0.40)
+                # 2. If employee percentage is 50% or more (>= 50%):
+                #    - They get the same percentage on add-ons as their service sales percentage
                 if service_perc < 0.50:
                     if emp_id is not None and emp_id == top_below_50_emp:
                         addon_rate = 0.50
                     else:
                         addon_rate = 0.40
                 else:
-                    if use_tiered:
-                        addon_rate = service_perc
-                    else:
-                        addon_rate = 0.50
+                    addon_rate = service_perc
 
                 addon_calc = round(addon_v * addon_rate, 2)
                 prod_calc = round(prod_v * product_perc, 2)
