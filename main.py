@@ -540,7 +540,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.5"
+APP_VERSION = "2.5.6"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2743,8 +2743,23 @@ def restore_cloud_backup(slot_key):
 # --- IN-APP CLOUD AUTO-UPDATER & FAIL-SAFE CRASH GUARD ---
 
 def restart_app():
-    """Cleanly restart the current application process."""
+    """Cleanly restart the current application process with full detachment."""
     try:
+        # 1. Destroy Tk root if active so GUI vanishes immediately
+        try:
+            import tkinter
+            root = tkinter._default_root
+            if root and root.winfo_exists():
+                root.destroy()
+        except Exception:
+            pass
+
+        # 2. Flush connections and temp files
+        try:
+            cleanup()
+        except Exception:
+            pass
+
         clean_env = os.environ.copy()
         clean_env.pop("_DYNAMIC_UPDATE_RUNNING", None)
         clean_env.pop("_DYNAMIC_UPDATE_ACTIVE", None)
@@ -2758,17 +2773,12 @@ def restart_app():
             raw_paths = clean_env["PATH"].split(os.pathsep)
             purged = [p for p in raw_paths if "_MEI" not in p]
             clean_env["PATH"] = os.pathsep.join(purged)
+
         if platform.system() == "Windows":
-            app_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
-            if getattr(sys, "frozen", False):
-                bat_target = f'"{sys.executable}"'
-                if len(sys.argv) > 1:
-                    bat_target += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
-            else:
-                script_path = os.path.abspath(sys.argv[0]) if sys.argv else "payroll_app.py"
-                bat_target = f'"{sys.executable}" "{script_path}"'
-                if len(sys.argv) > 1:
-                    bat_target += " " + " ".join(f'"{a}"' for a in sys.argv[1:])
+            is_frozen = getattr(sys, "frozen", False)
+            app_dir = os.path.dirname(sys.executable) if is_frozen else os.path.dirname(os.path.abspath(sys.argv[0] or "."))
+            exe_path = sys.executable if is_frozen else sys.executable
+            extra_args = sys.argv[1:] if is_frozen else ([os.path.abspath(sys.argv[0])] + sys.argv[1:] if sys.argv else ["payroll_app.py"])
 
             # Release current working directory lock from any PyInstaller _MEI folder
             try:
@@ -2776,53 +2786,49 @@ def restart_app():
             except Exception:
                 pass
 
-            pid = os.getpid()
-            bat_path = os.path.join(tempfile.gettempdir(), f"payroll_restart_{pid}.bat")
-            bat_code = (
-                "@echo off\r\n"
-                "timeout /t 2 /nobreak >nul 2>&1\r\n"
-                "set _MEIPASS2=\r\n"
-                "set _MEIPASS=\r\n"
-                "set _PYI_APPLICATION_HOME_DIR=\r\n"
-                "set _PYI_PARENT_PROCESS_LEVEL=\r\n"
-                f'cd /d "{app_dir}"\r\n'
-                f"start \"\" {bat_target}\r\n"
-                'del "%~f0" >nul 2>&1\r\n'
-            )
-            try:
-                with open(bat_path, "w", encoding="utf-8") as bf:
-                    bf.write(bat_code)
-            except Exception as e:
-                messagebox.showinfo("Restart Needed", f"Please close and reopen the application manually.\n\n({e})")
-                return
-
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             launched = False
-            # Method 1: Silent execution via VBScript wrapper (no black console window)
+
+            # Primary: Native PowerShell launcher (No window, reliable sleep, no Defender VBS block)
             try:
-                vbs_path = os.path.join(tempfile.gettempdir(), f"payroll_silent_{pid}.vbs")
-                vbs_code = (
-                    'Set sh = CreateObject("WScript.Shell")\r\n'
-                    f'sh.Run Chr(34) & "{bat_path}" & Chr(34), 0, False\r\n'
-                    'Set fso = CreateObject("Scripting.FileSystemObject")\r\n'
-                    'On Error Resume Next\r\n'
-                    'fso.DeleteFile WScript.ScriptFullName\r\n'
+                clean_exe = exe_path.replace("'", "''")
+                clean_app_dir = app_dir.replace("'", "''")
+                arg_clause = ""
+                if extra_args:
+                    escaped_args = [str(a).replace("'", "''") for a in extra_args]
+                    arg_clause = "-ArgumentList " + ",".join(f"'{ea}'" for ea in escaped_args)
+                ps_cmd = (
+                    "Start-Sleep -Seconds 2; "
+                    r"Remove-Item Env:\_MEIPASS* -ErrorAction SilentlyContinue; "
+                    r"Remove-Item Env:\_PYI* -ErrorAction SilentlyContinue; "
+                    f"Start-Process -FilePath '{clean_exe}' {arg_clause} -WorkingDirectory '{clean_app_dir}'"
                 )
-                with open(vbs_path, "w", encoding="utf-8") as vf:
-                    vf.write(vbs_code)
-                subprocess.Popen(["wscript.exe", vbs_path], cwd=app_dir, close_fds=True)
+                subprocess.Popen(
+                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                    cwd=app_dir,
+                    env=clean_env,
+                    creationflags=flags,
+                    close_fds=True,
+                )
                 launched = True
             except Exception:
                 pass
 
-            # Method 2: Direct cmd.exe with CREATE_NO_WINDOW if wscript is unavailable
+            # Fallback: cmd.exe with ping delay
             if not launched:
                 try:
-                    cflags = 0
-                    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-                        cflags |= subprocess.CREATE_NO_WINDOW
-                    if hasattr(subprocess, "DETACHED_PROCESS"):
-                        cflags |= subprocess.DETACHED_PROCESS
-                    subprocess.Popen(["cmd.exe", "/c", bat_path], cwd=app_dir, creationflags=cflags, close_fds=True)
+                    full_target = f'"{exe_path}"'
+                    if extra_args:
+                        full_target += " " + " ".join(f'"{a}"' for a in extra_args)
+                    cmd = f'ping 127.0.0.1 -n 3 >nul 2>&1 & start "" {full_target}'
+                    subprocess.Popen(
+                        ["cmd.exe", "/c", cmd],
+                        cwd=app_dir,
+                        env=clean_env,
+                        creationflags=flags,
+                        close_fds=True,
+                    )
+                    launched = True
                 except Exception as ex:
                     messagebox.showinfo("Restart Needed", f"Please close and reopen the application manually.\n\n({ex})")
                     return
