@@ -422,7 +422,14 @@ TRANSLATIONS = {
     "Connected": "متصل",
     "Synced": "تمت المزامنة",
     "Offline": "غير متصل",
-    "pending": "معلق"
+    "pending": "معلق",
+    "Sync Cloud Now": "مزامنة السحابة الآن",
+    "Cloud Synchronization": "مزامنة السحابة",
+    "Revenue Data Export": "تصدير بيانات الإيرادات",
+    "Export Revenue to CSV / Excel": "تصدير الإيرادات إلى CSV / Excel",
+    "+Add Rate": "+إضافة النسبة/الأجر",
+    "+Add Rate for": "+إضافة النسبة لـ",
+    "Missing Rate": "النسبة غير محددة"
 }
 
 # --- APP CONFIGURATION ---
@@ -430,6 +437,11 @@ APP_TITLE = "Highend Payroll App - Custom Made ✂️"
 APP_LOGO_TITLE = "💈 HIGHEND PAYROLL 💈"
 APP_GEOMETRY = "1250x900"
 APP_THEME = "darkly"
+APP_VERSION = "2.5.0"
+APP_BUILD_DATE = "2026-09-04"
+DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
+DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
+
 def get_default_app_dir():
     import platform
     if platform.system() == "Windows":
@@ -442,6 +454,23 @@ def get_default_app_dir():
         base_dir = os.path.expanduser("~")
         app_dir = os.path.join(base_dir, ".payrollprodata")
     return app_dir
+
+def get_updates_dir():
+    d = os.path.join(get_default_app_dir(), "updates")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def get_updates_script_path():
+    return os.path.join(get_updates_dir(), "payroll_app.py")
+
+def get_safe_mode_flag_path():
+    return os.path.join(get_updates_dir(), "safe_mode.flag")
+
+def get_last_crash_log_path():
+    return os.path.join(get_updates_dir(), "last_crash.log")
 
 def _auto_discover_existing_database():
     """If the active app data directory has no database, scan adjacent folders for previous payroll_data.enc."""
@@ -2262,13 +2291,35 @@ def _build_cloud_backup_payload():
 
 
 def _decode_cloud_backup_payload(payload):
-    token = decrypt_val(payload) if payload is not None else payload
-    if isinstance(token, dict):
-        return token
-    raw = token
-    if isinstance(raw, str):
-        gz = base64.b64decode(raw.encode("ascii"))
-        data = gzip.decompress(gz)
+    if payload is None:
+        return None
+    try:
+        token = decrypt_val(payload) if isinstance(payload, str) else payload
+        if isinstance(token, dict):
+            return token
+        raw = token
+        if isinstance(raw, str):
+            try:
+                gz = base64.b64decode(raw.encode("ascii"))
+                data = gzip.decompress(gz)
+                return json.loads(data.decode("utf-8"))
+            except Exception:
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    pass
+        elif isinstance(raw, (bytes, bytearray)):
+            try:
+                data = gzip.decompress(raw)
+                return json.loads(data.decode("utf-8"))
+            except Exception:
+                try:
+                    return json.loads(raw.decode("utf-8"))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
 def get_device_identifier():
     import platform
     import socket
@@ -2489,38 +2540,11 @@ def list_all_backups(limit=50):
     return combined[:limit]
 
 
-def restore_cloud_backup(slot_key):
-    """Restores data from either a local device snapshot or a Supabase cloud backup."""
-    if str(slot_key).startswith("local::"):
-        raw_key = str(slot_key)[7:]
-        b_dir = get_local_backups_dir()
-        json_file = os.path.join(b_dir, f"snapshot_{raw_key}.json.gz")
-        payload = None
-        if os.path.isfile(json_file):
-            with open(json_file, "r", encoding="utf-8") as f:
-                payload = f.read()
-        if not payload:
-            enc_file = os.path.join(b_dir, f"backup_{raw_key}.enc")
-            if os.path.isfile(enc_file):
-                active_enc = os.path.join(get_default_app_dir(), "payroll_data.enc")
-                import shutil
-                shutil.copy2(enc_file, active_enc)
-                load_database()
-                return True, "Restored from local encrypted file."
-            return False, "Local backup file not found."
-    else:
-        if get_db_mode() != "supabase" or is_supabase_offline():
-            return False, "Cloud is offline"
-        pg = get_shared_supabase_conn()
-        cur = pg.cursor()
-        cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (slot_key,))
-        row = cur.fetchone()
-        if not row or not row[0]:
-            return False, "Backup not found in cloud."
-        payload = row[0]
-
-    snapshot = _decode_cloud_backup_payload(payload)
+def restore_snapshot_dict(snapshot, source_name="backup"):
+    """Restores database tables from a decoded snapshot dictionary."""
     tables = (snapshot or {}).get("tables") or {}
+    if not tables:
+        return False, "No tables found in snapshot."
     path = ensure_offline_cache_open()
     lite = _original_sqlite3_connect(path, timeout=30)
     try:
@@ -2567,10 +2591,462 @@ def restore_cloud_backup(slot_key):
         except Exception:
             pass
     try:
-        log_user_action("backup", extra_summary=f"Restored backup {slot_key}")
+        log_user_action("backup", extra_summary=f"Restored backup from {source_name}")
     except Exception:
         pass
     return True, "ok"
+
+
+def restore_cloud_backup(slot_key):
+    """Restores data from either a local device snapshot or a Supabase cloud backup."""
+    if str(slot_key).startswith("local::"):
+        raw_key = str(slot_key)[7:]
+        b_dir = get_local_backups_dir()
+        json_file = os.path.join(b_dir, f"snapshot_{raw_key}.json.gz")
+        payload = None
+        if os.path.isfile(json_file):
+            with open(json_file, "r", encoding="utf-8") as f:
+                payload = f.read()
+        if not payload:
+            enc_file = os.path.join(b_dir, f"backup_{raw_key}.enc")
+            if os.path.isfile(enc_file):
+                active_enc = os.path.join(get_default_app_dir(), "payroll_data.enc")
+                import shutil
+                shutil.copy2(enc_file, active_enc)
+                load_database()
+                return True, "Restored from local encrypted file."
+            return False, "Local backup file not found."
+    else:
+        if get_db_mode() != "supabase" or is_supabase_offline():
+            return False, "Cloud is offline"
+        pg = get_shared_supabase_conn()
+        cur = pg.cursor()
+        cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (slot_key,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            return False, "Backup not found in cloud."
+        payload = row[0]
+
+    snapshot = _decode_cloud_backup_payload(payload)
+    if not snapshot:
+        return False, "Could not decode backup payload."
+    return restore_snapshot_dict(snapshot, source_name=f"slot:{slot_key}")
+
+
+# --- IN-APP CLOUD AUTO-UPDATER & FAIL-SAFE CRASH GUARD ---
+
+def restart_app():
+    """Cleanly restart the current application process."""
+    try:
+        if getattr(sys, "frozen", False):
+            if platform.system() == "Darwin":
+                exe = sys.executable
+                if ".app/Contents/MacOS" in exe:
+                    app_bundle = exe[:exe.rfind(".app/Contents/MacOS") + 4]
+                    subprocess.Popen(["open", "-n", app_bundle])
+                else:
+                    subprocess.Popen([exe] + sys.argv[1:])
+            else:
+                subprocess.Popen([sys.executable] + sys.argv[1:])
+        else:
+            subprocess.Popen([sys.executable] + sys.argv)
+    except Exception as e:
+        messagebox.showinfo("Restart Needed", f"Please close and reopen the app manually to complete the update.\n\n({e})")
+        return
+    sys.exit(0)
+
+
+def get_custom_update_server_url():
+    """Retrieve the configured update server URL or return the default."""
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("SELECT value FROM app_settings WHERE key IN ('update_server_url', 'github_raw_url') ORDER BY CASE WHEN key='update_server_url' THEN 0 ELSE 1 END")
+        r = cur.fetchone()
+        conn.close()
+        if r and r[0] and str(r[0]).strip():
+            return str(r[0]).strip()
+    except Exception:
+        pass
+    return DEFAULT_UPDATE_SERVER_URL
+
+get_custom_github_raw_url = get_custom_update_server_url
+
+
+def set_custom_update_server_url(url):
+    """Save a custom update server URL to the settings database."""
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('update_server_url', ?)", (url.strip(),))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+set_custom_github_raw_url = set_custom_update_server_url
+
+
+def get_update_auth_token():
+    """Retrieve private cloud update access token if configured (from Supabase cloud_config or local DB)."""
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("SELECT value FROM app_settings WHERE key = 'update_auth_token'")
+        r = cur.fetchone()
+        conn.close()
+        if r and r[0] and str(r[0]).strip():
+            return str(r[0]).strip()
+    except Exception:
+        pass
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            pg = get_shared_supabase_conn()
+            cur = pg.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS cloud_config (key TEXT PRIMARY KEY, value TEXT)")
+            cur.execute("SELECT value FROM cloud_config WHERE key = 'update_auth_token'")
+            row = cur.fetchone()
+            if row and row[0] and str(row[0]).strip():
+                return str(row[0]).strip()
+        except Exception:
+            pass
+    return os.environ.get("UPDATE_AUTH_TOKEN") or ""
+
+
+def set_update_auth_token(token_str, sync_to_cloud=True):
+    """Save the private update access token locally and optionally sync to Supabase."""
+    tok = str(token_str or "").strip()
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
+        cur.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('update_auth_token', ?)", (tok,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    if sync_to_cloud and get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            pg = get_shared_supabase_conn()
+            cur = pg.cursor()
+            cur.execute("CREATE TABLE IF NOT EXISTS cloud_config (key TEXT PRIMARY KEY, value TEXT)")
+            cur.execute("INSERT INTO cloud_config (key, value) VALUES ('update_auth_token', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (tok,))
+            pg.commit()
+        except Exception:
+            pass
+
+
+def get_active_code_info():
+    """Returns metadata about the currently running code engine."""
+    is_safe_mode = os.environ.get("_RUNNING_SAFE_MODE_FALLBACK") == "1" or os.path.isfile(get_safe_mode_flag_path())
+    is_dynamic = os.environ.get("_DYNAMIC_UPDATE_ACTIVE") == "1" or os.environ.get("_DYNAMIC_UPDATE_RUNNING") == "1"
+    
+    current_file = None
+    if is_dynamic and os.path.isfile(get_updates_script_path()):
+        current_file = get_updates_script_path()
+    else:
+        current_file = os.path.abspath(__file__)
+        
+    code_hash = "unknown"
+    file_size = 0
+    version = APP_VERSION
+    last_modified = ""
+    try:
+        if current_file and os.path.isfile(current_file):
+            with open(current_file, "rb") as f:
+                content = f.read()
+            code_hash = hashlib.sha256(content).hexdigest()
+            file_size = len(content)
+            mtime = os.path.getmtime(current_file)
+            last_modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            import re
+            m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', content.decode("utf-8", errors="ignore"))
+            if m:
+                version = m.group(1)
+    except Exception:
+        pass
+
+    return {
+        "version": version,
+        "hash": code_hash,
+        "is_dynamic": is_dynamic,
+        "is_safe_mode": is_safe_mode,
+        "file_size": file_size,
+        "last_modified": last_modified,
+        "current_file": current_file,
+    }
+
+
+def check_for_cloud_update():
+    """
+    Checks the cloud server for new updates.
+    Returns (status: str, data: dict)
+    status: 'update_available' | 'up_to_date' | 'error'
+    """
+    url = get_custom_update_server_url()
+    import urllib.request
+    headers = {"User-Agent": "PayrollApp-Updater/2.5"}
+    token = get_update_auth_token()
+    if token:
+        headers["Authorization"] = f"token {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw_bytes = resp.read()
+            remote_code = raw_bytes.decode("utf-8", errors="replace")
+    except Exception as e:
+        return "error", {"error": str(e), "url": url}
+
+    remote_hash = hashlib.sha256(raw_bytes).hexdigest()
+    local_info = get_active_code_info()
+    local_hash = local_info.get("hash") or ""
+
+    import re
+    m_ver = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', remote_code)
+    remote_version = m_ver.group(1) if m_ver else "Latest"
+
+    is_different = (remote_hash != local_hash)
+    
+    try:
+        log_user_action(
+            "app_update_check",
+            extra_summary=f"Checked for software updates: {'Update available' if is_different else 'Already up to date'}",
+            row={"remote_version": remote_version, "remote_hash": remote_hash[:10], "local_hash": local_hash[:10]}
+        )
+    except Exception:
+        pass
+
+    data = {
+        "remote_code": remote_code,
+        "remote_hash": remote_hash,
+        "remote_version": remote_version,
+        "size_bytes": len(raw_bytes),
+        "local_info": local_info,
+        "url": url,
+    }
+    if is_different:
+        return "update_available", data
+    return "up_to_date", data
+
+check_for_github_update = check_for_cloud_update
+
+
+def install_cloud_update(code_str, remote_hash=""):
+    """
+    Validates syntax, backs up previous version, writes update to disk,
+    logs action to Supabase, and clears the safe-mode flag.
+    Returns (ok: bool, msg: str)
+    """
+    if not code_str or len(code_str.strip()) < 500:
+        return False, "Downloaded code is empty or truncated."
+
+    # 1. Syntax Check
+    try:
+        compile(code_str, "payroll_app.py", "exec")
+    except SyntaxError as syn_err:
+        err_msg = f"Syntax error at line {syn_err.lineno}: {syn_err.msg}"
+        try:
+            log_user_action(
+                "update_syntax_error",
+                extra_summary=f"Update failed syntax validation: {err_msg[:80]}",
+                row={"error": str(syn_err), "line": syn_err.lineno, "hash": remote_hash[:10]}
+            )
+        except Exception:
+            pass
+        return False, f"Downloaded update cannot be installed because it contains syntax errors:\n\n{err_msg}"
+
+    updates_dir = get_updates_dir()
+    current_update = get_updates_script_path()
+    bak_file = os.path.join(updates_dir, "payroll_app.py.bak")
+
+    # 2. Backup existing update
+    try:
+        if os.path.isfile(current_update):
+            shutil.copy2(current_update, bak_file)
+            archive_dir = os.path.join(updates_dir, "backups")
+            os.makedirs(archive_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(current_update, os.path.join(archive_dir, f"payroll_app_{ts}.py"))
+            old_baks = sorted([os.path.join(archive_dir, f) for f in os.listdir(archive_dir) if f.endswith(".py")], key=os.path.getmtime)
+            if len(old_baks) > 10:
+                for ob in old_baks[:-10]:
+                    try:
+                        os.remove(ob)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    # 3. Write new code
+    try:
+        with open(current_update, "w", encoding="utf-8") as f:
+            f.write(code_str)
+    except Exception as e:
+        return False, f"Failed to write update file: {e}"
+
+    # 4. Remove safe mode flag if any
+    safe_flag = get_safe_mode_flag_path()
+    if os.path.isfile(safe_flag):
+        try:
+            os.remove(safe_flag)
+        except Exception:
+            pass
+
+    # 5. Write metadata
+    try:
+        import re
+        m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', code_str)
+        new_ver = m.group(1) if m else "Latest"
+        meta_file = os.path.join(updates_dir, "version_meta.json")
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": new_ver,
+                "installed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "hash": remote_hash,
+                "user": _session_user_name(),
+                "machine": get_device_identifier(),
+            }, f, indent=2)
+    except Exception:
+        new_ver = "Latest"
+
+    # 6. Log to Supabase
+    try:
+        log_user_action(
+            "app_update",
+            extra_summary=f"Installed software update {new_ver} ({remote_hash[:8]})",
+            row={"version": new_ver, "hash": remote_hash, "size_bytes": len(code_str.encode("utf-8"))}
+        )
+    except Exception:
+        pass
+
+    return True, f"Version {new_ver} installed successfully!"
+
+install_github_update = install_cloud_update
+
+
+def rollback_cloud_update(target="bak"):
+    """
+    Rolls back update:
+    target='bak': restores payroll_app.py.bak
+    target='factory': moves payroll_app.py to .disabled to run the built-in factory version.
+    """
+    updates_dir = get_updates_dir()
+    current_update = get_updates_script_path()
+    bak_file = os.path.join(updates_dir, "payroll_app.py.bak")
+    safe_flag = get_safe_mode_flag_path()
+
+    if target == "bak":
+        if not os.path.isfile(bak_file):
+            return False, "No previous update backup (.bak) found."
+        try:
+            shutil.copy2(bak_file, current_update)
+            if os.path.isfile(safe_flag):
+                os.remove(safe_flag)
+            log_user_action("app_rollback", extra_summary="Rolled back to previous update (.bak)")
+            return True, "Successfully restored previous update version."
+        except Exception as e:
+            return False, f"Failed to restore backup: {e}"
+    elif target == "factory":
+        try:
+            if os.path.isfile(current_update):
+                dis_path = os.path.join(updates_dir, f"payroll_app_{datetime.now().strftime('%Y%m%d_%H%M%S')}.disabled")
+                shutil.move(current_update, dis_path)
+            if os.path.isfile(safe_flag):
+                os.remove(safe_flag)
+            log_user_action("app_rollback", extra_summary="Reverted to built-in factory version")
+            return True, "Reverted to factory built-in version."
+        except Exception as e:
+            return False, f"Failed to revert to factory version: {e}"
+    return False, "Unknown rollback target."
+
+rollback_github_update = rollback_cloud_update
+
+
+def _check_and_run_dynamic_update():
+    """
+    Host bootstrap loader:
+    If a downloaded update exists at <app_dir>/updates/payroll_app.py,
+    attempt to run it dynamically via runpy.
+    If it crashes on launch, catch the crash, record details in last_crash.log,
+    flag safe_mode, log to Supabase, display a recovery popup, and allow the built-in code to run!
+    """
+    if os.environ.get("_DYNAMIC_UPDATE_RUNNING") == "1":
+        return False
+        
+    update_file = get_updates_script_path()
+    if not os.path.isfile(update_file):
+        return False
+        
+    safe_flag = get_safe_mode_flag_path()
+    if os.path.isfile(safe_flag):
+        os.environ["_RUNNING_SAFE_MODE_FALLBACK"] = "1"
+        return False
+
+    try:
+        with open(update_file, "r", encoding="utf-8") as f:
+            code_str = f.read()
+        if len(code_str.strip()) < 500:
+            return False
+        compile(code_str, update_file, "exec")
+    except Exception as e:
+        try:
+            with open(safe_flag, "w", encoding="utf-8") as sf:
+                sf.write(f"Syntax error in downloaded update: {e}")
+        except Exception:
+            pass
+        os.environ["_RUNNING_SAFE_MODE_FALLBACK"] = "1"
+        return False
+
+    # Execute dynamic update
+    os.environ["_DYNAMIC_UPDATE_RUNNING"] = "1"
+    os.environ["_DYNAMIC_UPDATE_ACTIVE"] = "1"
+    import runpy
+    import traceback
+    try:
+        runpy.run_path(update_file, run_name="__main__")
+        sys.exit(0)
+    except SystemExit as se:
+        sys.exit(se.code if se.code is not None else 0)
+    except Exception as exc:
+        tb_str = traceback.format_exc()
+        try:
+            with open(get_last_crash_log_path(), "w", encoding="utf-8") as lf:
+                lf.write(f"Crash Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                lf.write(f"Error: {exc}\n\nTraceback:\n{tb_str}\n")
+        except Exception:
+            pass
+        try:
+            with open(safe_flag, "w", encoding="utf-8") as sf:
+                sf.write(f"Update crashed on boot: {exc}\n{tb_str[:500]}")
+        except Exception:
+            pass
+        try:
+            log_user_action(
+                "update_crash",
+                extra_summary=f"Update failed to boot: {str(exc)[:80]}",
+                row={"error": str(exc), "traceback": tb_str[:2000]}
+            )
+        except Exception:
+            pass
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showwarning(
+                "Safe Mode Activated ⚠️",
+                f"The recently downloaded update encountered an error during startup:\n\n{exc}\n\n"
+                f"The application has safely recovered and fallen back to the built-in version.\n"
+                f"You can continue working, check for a fixed update, or roll back in Settings ➔ App Updates.",
+            )
+            root.destroy()
+        except Exception:
+            pass
+        os.environ["_RUNNING_SAFE_MODE_FALLBACK"] = "1"
+        os.environ.pop("_DYNAMIC_UPDATE_RUNNING", None)
+        return False
+
 
 
 def _merge_action_logs_into_local(lcur, use_cols, packed_rows):
@@ -4769,6 +5245,54 @@ def cycle_label(cycle_key):
 def cycle_label_with_year(cycle_key):
     """Full human label e.g. 'August 2026 - Cycle 1 (08/03 - 08/16)'."""
     return cycle_label(cycle_key)
+
+def last_completed_cycle_for_date(date_val=None):
+    """Return the cycle_key for the most recently completed 14-day payroll cycle.
+    If the cycle containing date_val is still in progress, the last completed cycle
+    is the 14-day cycle immediately preceding it."""
+    if date_val is None:
+        dt = datetime.today()
+    elif isinstance(date_val, str):
+        dt = _parse_any_date(date_val) or datetime.today()
+    else:
+        dt = date_val
+    cur_ck = cycle_for_date(dt.strftime("%Y-%m-%d"))
+    if not cur_ck:
+        return cur_ck
+    parsed = parse_cycle_key(cur_ck)
+    if not parsed:
+        return cur_ck
+    cur_start, _ = parsed
+    last_ended_start = cur_start - timedelta(days=14)
+    return last_ended_start.strftime("%Y-%m-%d")
+
+def get_earliest_entry_date(default=None):
+    """Return the earliest record_date or expense_date from the database as 'YYYY-MM-DD'."""
+    if default is None:
+        default = (datetime.today() - timedelta(days=30)).strftime('%Y-%m-%d')
+    try:
+        if not TEMP_DB_PATH or not os.path.exists(TEMP_DB_PATH):
+            return default
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT MIN(d) FROM (
+                SELECT MIN(record_date) AS d FROM payroll_records WHERE record_date IS NOT NULL AND TRIM(record_date) != ''
+                UNION ALL
+                SELECT MIN(expense_date) AS d FROM expenses WHERE expense_date IS NOT NULL AND TRIM(expense_date) != ''
+            )
+        """)
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            iso = normalize_iso_date(str(row[0]).strip())
+            if iso:
+                return iso
+            return str(row[0]).strip()
+    except Exception:
+        pass
+    return default
+
 
 def get_formatted_cycle_choices(active_cycle_key=None, start_from_june_2026=True):
     """
@@ -7926,6 +8450,7 @@ if HAS_DEPS:
             """Apply current hidden columns to tree_calendar."""
             if not self._widget_alive(getattr(self, "tree_calendar", None)):
                 return
+            hidden = get_calendar_hidden_columns()
             disp_cols = [c for c in self.columns if c != self._tr("Name")]
             self.apply_and_memorize_column_widths(
                 "calendar_table",
@@ -8067,15 +8592,6 @@ if HAS_DEPS:
             self.lbl_logged_in_user.pack(side=LEFT, padx=10)
 
             if get_db_mode() == "supabase":
-                self.btn_sync_now = tb.Button(
-                    right_frame,
-                    text="🔄 " + self._tr("Sync Cloud"),
-                    bootstyle="info-outline",
-                    cursor="hand2",
-                    command=self.manual_sync_cloud,
-                )
-                self.btn_sync_now.pack(side=LEFT, padx=6)
-
                 self.lbl_live_sync = tb.Label(
                     right_frame,
                     text="☁️ " + self._tr("Connected"),
@@ -8875,7 +9391,10 @@ if HAS_DEPS:
         def setup_calendar_tab(self):
             self.rev_cal_year = datetime.today().year
             today_iso = datetime.today().strftime('%Y-%m-%d')
-            cur_ck = cycle_for_date(today_iso)
+            cur_ck = last_completed_cycle_for_date(today_iso)
+            p = parse_cycle_key(cur_ck)
+            if p:
+                self.rev_cal_year = p[0].year
             self.selected_rev_cycles = {cur_ck} if cur_ck else {f"{self.rev_cal_year}-01-1"}
             self.cycle_card_widgets = {}
 
@@ -8919,8 +9438,13 @@ if HAS_DEPS:
             action_lf = tb.Labelframe(top_frame, text=self._tr("Actions"), padding=(8, 4), bootstyle="primary")
             action_lf.pack(side=RIGHT, fill=Y)
             
+            self.btn_missing_rate_action = tb.Button(
+                action_lf,
+                text="⚠️ " + self._tr("+Add Rate"),
+                bootstyle="danger",
+                cursor="hand2",
+            )
             tb.Button(action_lf, text=self._tr("Import Excel Sales"), bootstyle="info", cursor="hand2", command=self.open_excel_import_dialog).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("💾 Export CSV"), bootstyle="success", cursor="hand2", command=self.export_excel).pack(side=LEFT, padx=4)
             tb.Button(action_lf, text=self._tr("✏️ Edit"), bootstyle="warning", cursor="hand2", command=self.edit_selected_record).pack(side=LEFT, padx=4)
             tb.Button(action_lf, text=self._tr("🗑️ Delete"), bootstyle="danger", cursor="hand2", command=self.delete_selected_record).pack(side=LEFT, padx=4)
             tb.Button(action_lf, text=self._tr("⚙️ Columns"), bootstyle="secondary-outline", cursor="hand2", command=self.open_calendar_columns_dialog).pack(side=LEFT, padx=4)
@@ -9191,7 +9715,7 @@ if HAS_DEPS:
 
         def select_current_rev_cycle(self):
             today_str = datetime.today().strftime('%Y-%m-%d')
-            cur_ck = cycle_for_date(today_str)
+            cur_ck = last_completed_cycle_for_date(today_str)
             p = parse_cycle_key(cur_ck)
             if p and p[0].year != self.rev_cal_year:
                 self.rev_cal_year = p[0].year
@@ -9413,8 +9937,11 @@ if HAS_DEPS:
             # Pre-compute employee payout details and add-on sales to apply rules:
             # 1. Below 50%: top add-on earner gets 50%, rest get 40%
             # 2. At or above 50%: if tiered checked, get their service %; if fixed >= 50%, get 50%
+            # 3. Hourly employees (hour_rate > 0 and no percentage/not tiered):
+            #    (hours worked * hour rate) + (100% * tip)
             emp_service_perc = {}
             emp_use_tiered = {}
+            emp_is_hourly = {}
             addon_by_emp = {}
             payout_cache = {}
 
@@ -9425,6 +9952,9 @@ if HAS_DEPS:
                 if emp_id not in emp_service_perc:
                     rec_perc = row[10]
                     emp_perc = row[11]
+                    rec_hr = row[8]
+                    emp_hr = row[9]
+                    hr_num = to_float(rec_hr if rec_hr is not None else emp_hr, 0.0)
                     use_tiered = (row[16] == 1 or row[16] == '1' or row[16] is True)
                     emp_use_tiered[emp_id] = use_tiered
                     if use_tiered:
@@ -9436,16 +9966,24 @@ if HAS_DEPS:
                             emp_service_perc[emp_id] = to_float(s_perc, 0.0)
                         else:
                             emp_service_perc[emp_id] = 0.0
+                        emp_is_hourly[emp_id] = False
                     else:
-                        emp_service_perc[emp_id] = to_float(rec_perc if rec_perc is not None else emp_perc, 0.0)
+                        s_perc = to_float(rec_perc if rec_perc is not None else emp_perc, 0.0)
+                        emp_service_perc[emp_id] = s_perc
+                        emp_is_hourly[emp_id] = (hr_num > 0 and s_perc <= 0)
 
             top_below_50_emp = None
             top_below_50_amt = -1.0
             for eid, amt in addon_by_emp.items():
                 if eid is None:
                     continue
+                if emp_is_hourly.get(eid, False):
+                    # Hourly employees do not compete for commission add-on rate
+                    continue
                 s_perc = emp_service_perc.get(eid, 0.0)
-                if s_perc < 0.50:
+                is_tiered = emp_use_tiered.get(eid, False)
+                # Only commission barbers below 50%
+                if (is_tiered or s_perc > 0) and s_perc < 0.50:
                     if amt > top_below_50_amt:
                         top_below_50_amt = amt
                         top_below_50_emp = eid
@@ -9457,6 +9995,7 @@ if HAS_DEPS:
             total_hrs = 0.0
             total_svc_calc = 0.0
             total_calc = 0.0
+            missing_rate_emp_ids = {}
 
             for r_idx, (row, row_ck) in enumerate(table_rows):
                 emp_name = row[2]
@@ -9469,6 +10008,7 @@ if HAS_DEPS:
 
                 service_perc = emp_service_perc.get(emp_id, 0.0)
                 use_tiered = emp_use_tiered.get(emp_id, False)
+                is_hourly = emp_is_hourly.get(emp_id, (hour_rate > 0 and not use_tiered and service_perc <= 0))
 
                 if use_tiered and emp_id in payout_cache:
                     _, _, product_perc, t_hr = payout_cache[emp_id]
@@ -9485,31 +10025,35 @@ if HAS_DEPS:
                 loc_v = row[3] if row[3] else ""
                 hrs_v = to_float(row[12], 0.0)
 
-                # Service sales calculation: (Service revenue * service percentage) + (hours * hourly rate)
-                svc_calc = round((rev_v * service_perc) + (hrs_v * hour_rate), 2)
+                rate_missing = (not use_tiered and service_perc <= 0 and hour_rate <= 0)
+                hours_missing = (is_hourly and hrs_v <= 0)
 
-                # Service add-on percentage rules:
-                # 1. If employee percentage is below 50%:
-                #    - The highest add-on sales earner in this below-50% group gets 50% (0.50)
-                #    - The rest in this below-50% group get a fixed 40% (0.40)
-                # 2. If employee percentage is 50% or more (>= 50%):
-                #    - They get the same percentage on add-ons as their service sales percentage
-                if service_perc < 0.50:
-                    if emp_id is not None and emp_id == top_below_50_emp:
-                        addon_rate = 0.50
-                    else:
-                        addon_rate = 0.40
+                if rate_missing and emp_id:
+                    missing_rate_emp_ids[emp_id] = emp_name
+
+                if is_hourly:
+                    svc_calc = round(hrs_v * hour_rate, 2)
+                    addon_calc = 0.0
+                    tip_calc = round(tip_v * 1.0, 2)
+                    calc_v = round(svc_calc + tip_calc, 2)
+                elif rate_missing:
+                    svc_calc = 0.0
+                    addon_calc = 0.0
+                    tip_calc = round(tip_v * 1.0, 2)
+                    calc_v = round(tip_calc, 2)
                 else:
-                    addon_rate = service_perc
-
-                addon_calc = round(addon_v * addon_rate, 2)
-                prod_calc = round(prod_v * product_perc, 2)
-                tip_calc = round(tip_v * 1.0, 2)
-
-                # TOTAL CALCULATION FOR EACH EMPLOYEE:
-                # Service Sales + Service Add-on + Tip (100%)
-                # Product sales are EXCLUDED from total calculations!
-                calc_v = round(svc_calc + addon_calc + tip_calc, 2)
+                    svc_calc = round((rev_v * service_perc) + (hrs_v * hour_rate), 2)
+                    if service_perc < 0.50:
+                        if emp_id is not None and emp_id == top_below_50_emp:
+                            addon_rate = 0.50
+                        else:
+                            addon_rate = 0.40
+                    else:
+                        addon_rate = service_perc
+                    addon_calc = round(addon_v * addon_rate, 2)
+                    prod_calc = round(prod_v * product_perc, 2)
+                    tip_calc = round(tip_v * 1.0, 2)
+                    calc_v = round(svc_calc + addon_calc + tip_calc, 2)
 
                 total_rev += rev_v
                 total_addon += addon_v
@@ -9520,6 +10064,38 @@ if HAS_DEPS:
                 total_calc += calc_v
 
                 cyc_display = cycle_label(row_ck) if row_ck else ""
+
+                if rate_missing:
+                    hr_disp = "⚠️ Not Set"
+                    perc_disp = "🔴 Missing Rate (+Add)"
+                elif is_hourly:
+                    hr_disp = f"${hour_rate:,.2f}/hr"
+                    perc_disp = "Hourly (No %)"
+                elif use_tiered:
+                    hr_disp = f"${hour_rate:,.2f}/hr" if hour_rate > 0 else "0.00/hr"
+                    perc_disp = f"{service_perc * 100:.0f}% (P: {product_perc * 100:.0f}%)"
+                else:
+                    hr_disp = f"${hour_rate:,.2f}/hr" if hour_rate > 0 else "0.00/hr"
+                    perc_disp = f"{service_perc * 100:.1f}%"
+
+                if is_hourly and hours_missing:
+                    hrs_disp = f"⚠️ {hrs_v:.1f} (Missing)"
+                else:
+                    hrs_disp = f"{hrs_v:.1f}"
+
+                if rate_missing:
+                    calc_disp = f"⚠️ ${calc_v:,.2f} (+Add Rate)"
+                elif is_hourly and hours_missing:
+                    calc_disp = f"⚠️ ${calc_v:,.2f} (Need Hours)"
+                else:
+                    calc_disp = f"⭐ ${calc_v:,.2f} ⭐"
+
+                row_tags = ()
+                if rate_missing:
+                    row_tags = ('missing_rate',)
+                elif is_hourly and hours_missing:
+                    row_tags = ('missing_hours',)
+
                 tree_row = [
                     row[0],
                     row[1],
@@ -9531,17 +10107,17 @@ if HAS_DEPS:
                     f"${addon_v:,.2f}",
                     f"${prod_v:,.2f}",
                     f"${tip_v:,.2f}",
-                    f"${hour_rate:,.2f}/hr" if hour_rate else "0.00/hr",
-                    f"{service_perc * 100:.0f}% (P: {product_perc * 100:.0f}%)" if use_tiered else f"{service_perc * 100:.1f}%",
-                    f"{hrs_v:.1f}",
-                    f"⭐ ${calc_v:,.2f} ⭐",
+                    hr_disp,
+                    perc_disp,
+                    hrs_disp,
+                    calc_disp,
                     row[14] if row[14] else "",
                     row[15] if row[15] else "",
                 ]
                 iid = f"row_{row[0]}_{r_idx}"
-                self.tree_calendar.insert('', tk.END, iid=iid, values=tree_row)
+                self.tree_calendar.insert('', tk.END, iid=iid, values=tree_row, tags=row_tags)
                 if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
-                    self.tree_frozen.insert('', tk.END, iid=iid, values=(row[2],))
+                    self.tree_frozen.insert('', tk.END, iid=iid, values=(row[2],), tags=row_tags)
 
             self.tree_calendar.insert('', tk.END, iid='spacer_row', values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
             if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
@@ -9556,9 +10132,25 @@ if HAS_DEPS:
                 "", "",
             ), tags=('totals',))
             self.tree_calendar.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
+            self.tree_calendar.tag_configure('missing_rate', foreground='#e74c3c', font=('Segoe UI', 9, 'bold'))
+            self.tree_calendar.tag_configure('missing_hours', foreground='#e67e22', font=('Segoe UI', 9, 'bold'))
             if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
                 self.tree_frozen.insert('', tk.END, iid='totals_row', values=("=== TOTALS ===",), tags=('totals',))
                 self.tree_frozen.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
+                self.tree_frozen.tag_configure('missing_rate', foreground='#e74c3c', font=('Segoe UI', 9, 'bold'))
+                self.tree_frozen.tag_configure('missing_hours', foreground='#e67e22', font=('Segoe UI', 9, 'bold'))
+
+            btn_add_rate = getattr(self, "btn_missing_rate_action", None)
+            if self._widget_alive(btn_add_rate):
+                if missing_rate_emp_ids:
+                    first_eid, first_ename = next(iter(missing_rate_emp_ids.items()))
+                    btn_add_rate.config(
+                        text=f"⚠️ {self._tr('+Add Rate for')} {first_ename}",
+                        command=lambda eid=first_eid: self.open_employee_edit_by_id(eid),
+                    )
+                    btn_add_rate.pack(side=LEFT, padx=4)
+                else:
+                    btn_add_rate.pack_forget()
 
             # Format summary banner text
             num_sel = len(self.selected_rev_cycles)
@@ -9575,30 +10167,58 @@ if HAS_DEPS:
             )
 
         def export_excel(self):
-            rows = self.tree_calendar.get_children()
+            if hasattr(self, "tree_calendar"):
+                rows = self.tree_calendar.get_children()
+                if not rows or len(rows) <= 2:
+                    self.load_calendar_data(quiet=True)
+                    rows = self.tree_calendar.get_children()
+            else:
+                rows = []
+
             if not rows:
-                messagebox.showinfo("Export", "No data available to export.")
+                messagebox.showinfo(self._tr("Export"), self._tr("No data available to export."))
                 return
                 
             filepath = filedialog.asksaveasfilename(
-                defaultextension=".xlsx",
-                filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")],
-                title="Save Dashboard Data"
+                defaultextension=".csv",
+                filetypes=[
+                    ("CSV Files", "*.csv"),
+                    ("Excel Files", "*.xlsx"),
+                    ("All Files", "*.*")
+                ],
+                title=self._tr("Save Revenue Data")
             )
             
             if filepath:
                 try:
-                    import openpyxl
-                    wb = openpyxl.Workbook()
-                    ws = wb.active
-                    ws.title = "Revenue Dashboard"
-                    ws.append(list(self.columns[1:]))
+                    cols_to_export = list(self.columns[1:])
+                    data_rows = []
                     for item in rows:
-                        ws.append(list(self.tree_calendar.item(item)['values'][1:]))
-                    wb.save(filepath)
-                    messagebox.showinfo("Success", f"Data successfully exported to:\n{filepath}")
+                        if item in ('spacer_row', 'totals_row'):
+                            continue
+                        vals = self.tree_calendar.item(item)['values']
+                        if vals and len(vals) > 1:
+                            data_rows.append(list(vals[1:]))
+                    
+                    if filepath.lower().endswith(".csv"):
+                        import csv
+                        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(cols_to_export)
+                            for r in data_rows:
+                                writer.writerow(r)
+                    else:
+                        import openpyxl
+                        wb = openpyxl.Workbook()
+                        ws = wb.active
+                        ws.title = "Revenue Dashboard"
+                        ws.append(cols_to_export)
+                        for r in data_rows:
+                            ws.append(r)
+                        wb.save(filepath)
+                    messagebox.showinfo(self._tr("Success"), f"{self._tr('Data successfully exported to:')}\n{filepath}")
                 except Exception as e:
-                    messagebox.showerror("Error", f"Could not save Excel file.\n{e}")
+                    messagebox.showerror(self._tr("Error"), f"{self._tr('Could not save file:')}\n{e}")
 
         def delete_selected_record(self):
             selected = self.tree_calendar.selection()
@@ -9644,6 +10264,27 @@ if HAS_DEPS:
             record_id = item['values'][0]
             if not record_id:
                 return
+            
+            if "missing_rate" in (item.get("tags", ()) or ()):
+                vals = item.get("values", [])
+                emp_name = vals[3] if len(vals) > 3 else ""
+                if messagebox.askyesno(
+                    self._tr("Missing Rate"),
+                    f"Employee '{emp_name}' does not have a percentage or hourly rate configured.\n\n"
+                    "Would you like to open the employee settings now to configure their rate/percentage?",
+                    parent=self
+                ):
+                    try:
+                        conn_e = sqlite3.connect(TEMP_DB_PATH)
+                        c_e = conn_e.cursor()
+                        c_e.execute("SELECT employee_id FROM payroll_records WHERE id=?", (record_id,))
+                        row_e = c_e.fetchone()
+                        conn_e.close()
+                        if row_e and row_e[0]:
+                            self.open_employee_edit_by_id(row_e[0])
+                            return
+                    except Exception:
+                        pass
             
             conn = sqlite3.connect(TEMP_DB_PATH)
             cursor = conn.cursor()
@@ -9888,9 +10529,6 @@ if HAS_DEPS:
             header_frame.pack(fill=X, padx=25, pady=(20, 20))
             
             tb.Label(header_frame, text=self._tr("👥 Employee Management"), font=("Segoe UI", 22, "bold"), bootstyle="primary").pack(side=LEFT)
-            
-            tb.Button(header_frame, text=self._tr("⚙️ Database & App Settings"), bootstyle="secondary outline", cursor="hand2", command=self.open_settings_password_prompt).pack(side=RIGHT, padx=6)
-            tb.Button(header_frame, text=self._tr("🗄️ Database & Cloud Sync"), bootstyle="info outline", cursor="hand2", command=lambda: self.open_settings_dialog(default_tab="database")).pack(side=RIGHT, padx=6)
             
             btn_frame = tb.Frame(self.tab_names)
             btn_frame.pack(fill=X, padx=25, pady=(0, 15))
@@ -10594,6 +11232,42 @@ if HAS_DEPS:
             set_summary_period("all")
             poll_summary()
 
+        def open_employee_edit_by_id(self, emp_id):
+            if not emp_id:
+                return
+            try:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("SELECT first_name, last_name, phone, email, hour_rate, percentage, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered_payout FROM employees WHERE id=?", (emp_id,))
+                emp = cursor.fetchone()
+                conn.close()
+                if emp:
+                    f_name, l_name, phone, email, emp_rate, emp_perc, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered = emp
+                    f_name = decrypt_val(f_name) or ""
+                    l_name = decrypt_val(l_name) or ""
+                    phone = decrypt_val(phone) or ""
+                    email = decrypt_val(email) or ""
+                    ssn = decrypt_val(ssn) or ""
+                    address = decrypt_val(address) or ""
+                    start_date = decrypt_val(start_date) or ""
+                    end_date = decrypt_val(end_date) or ""
+
+                    rate_num = to_float(decrypt_val(emp_rate), 0.0)
+                    emp_rate = f"{rate_num:g}" if rate_num > 0 else ""
+
+                    perc_num = to_float(decrypt_val(emp_perc), 0.0)
+                    if perc_num > 1.0:
+                        emp_perc = f"{perc_num:g}"
+                    elif perc_num > 0.0:
+                        emp_perc = f"{perc_num * 100:g}"
+                    else:
+                        emp_perc = ""
+
+                    use_tiered = use_tiered if use_tiered else 0
+                    self.open_employee_dialog(emp_id, f_name, l_name, phone, email, emp_rate, emp_perc, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to open employee editor: {e}", parent=self)
+
         def edit_selected_employee(self):
             selected = self.tree_names.selection()
             if not selected:
@@ -10601,37 +11275,7 @@ if HAS_DEPS:
                 return
             item = self.tree_names.item(selected[0])
             emp_id = item['values'][0]
-            
-            conn = sqlite3.connect(TEMP_DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT first_name, last_name, phone, email, hour_rate, percentage, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered_payout FROM employees WHERE id=?", (emp_id,))
-            emp = cursor.fetchone()
-            conn.close()
-            
-            if emp:
-                f_name, l_name, phone, email, emp_rate, emp_perc, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered = emp
-                f_name = decrypt_val(f_name) or ""
-                l_name = decrypt_val(l_name) or ""
-                phone = decrypt_val(phone) or ""
-                email = decrypt_val(email) or ""
-                ssn = decrypt_val(ssn) or ""
-                address = decrypt_val(address) or ""
-                start_date = decrypt_val(start_date) or ""
-                end_date = decrypt_val(end_date) or ""
-
-                rate_num = to_float(decrypt_val(emp_rate), 0.0)
-                emp_rate = f"{rate_num:g}" if rate_num > 0 else ""
-
-                perc_num = to_float(decrypt_val(emp_perc), 0.0)
-                if perc_num > 1.0:
-                    emp_perc = f"{perc_num:g}"
-                elif perc_num > 0.0:
-                    emp_perc = f"{perc_num * 100:g}"
-                else:
-                    emp_perc = ""
-
-                use_tiered = use_tiered if use_tiered else 0
-                self.open_employee_dialog(emp_id, f_name, l_name, phone, email, emp_rate, emp_perc, ssn, address, start_date, end_date, cv_path, id_photo_path, personal_photo_path, use_tiered)
+            self.open_employee_edit_by_id(emp_id)
 
         def open_employee_dialog(self, emp_id=None, f_name="", l_name="", phone="", email="", current_rate="", current_perc="", ssn="", address="", start_date="", end_date="", cv_path="", id_photo_path="", personal_photo_path="", use_tiered_payout=0):
             dialog = tb.Toplevel(self)
@@ -10825,14 +11469,16 @@ if HAS_DEPS:
                     messagebox.showerror("Error", "Hour rate and percentage cannot be negative.", parent=dialog)
                     return
                     
-                if fn.lower() == "shop" or use_tiered_var.get() == 1:
+                if fn.lower() == "shop":
+                    pass
+                elif use_tiered_var.get() == 1:
                     pass
                 else:
                     if rate_val > 0 and perc_val > 0:
                         messagebox.showerror("Error", "An employee can only have an Hour Rate OR a Percentage, not both.", parent=dialog)
                         return
                     if rate_val <= 0 and perc_val <= 0:
-                        messagebox.showerror("Validation Error", "You must configure either an Hour Rate or a Percentage greater than 0.", parent=dialog)
+                        messagebox.showerror("Validation Error", "You must configure either an Hour Rate, a Percentage greater than 0, or enable 'Use Tiered Commission'.", parent=dialog)
                         return
                 
                 if perc_val > 1.0:
@@ -13906,9 +14552,9 @@ if HAS_DEPS:
             self.card_net.pack(side=LEFT, expand=True, fill=X, padx=5)
             
             today = datetime.today()
-            start = today.replace(day=1)
+            earliest = get_earliest_entry_date()
             self.fin_from_date.entry.delete(0, tk.END)
-            self.fin_from_date.entry.insert(0, start.strftime('%Y-%m-%d'))
+            self.fin_from_date.entry.insert(0, earliest)
             self.fin_to_date.entry.delete(0, tk.END)
             self.fin_to_date.entry.insert(0, today.strftime('%Y-%m-%d'))
             
@@ -13949,6 +14595,7 @@ if HAS_DEPS:
 
         def set_fin_period(self, period):
             today = datetime.today()
+            self._fin_from_user_set = True
             if period == "today":
                 self.fin_from_date.entry.delete(0, tk.END)
                 self.fin_from_date.entry.insert(0, today.strftime('%Y-%m-%d'))
@@ -13967,10 +14614,12 @@ if HAS_DEPS:
                 self.fin_to_date.entry.delete(0, tk.END)
                 self.fin_to_date.entry.insert(0, today.strftime('%Y-%m-%d'))
             elif period == "all":
+                self._fin_from_user_set = False
+                earliest = get_earliest_entry_date()
                 self.fin_from_date.entry.delete(0, tk.END)
-                self.fin_from_date.entry.insert(0, today.replace(year=today.year - 10).strftime('%Y-%m-%d'))
+                self.fin_from_date.entry.insert(0, earliest)
                 self.fin_to_date.entry.delete(0, tk.END)
-                self.fin_to_date.entry.insert(0, today.replace(year=today.year + 10).strftime('%Y-%m-%d'))
+                self.fin_to_date.entry.insert(0, today.strftime('%Y-%m-%d'))
             self.load_financials_data(quiet=True)
 
         def poll_fin_filters(self):
@@ -14979,6 +15628,155 @@ if HAS_DEPS:
                 except Exception as e:
                     messagebox.showerror("Restore Failed", str(e), parent=top)
 
+            def do_download_backup():
+                sel = bak_tree.selection()
+                if not sel:
+                    messagebox.showwarning("Select Backup", "Please select a backup from the list to download.", parent=top)
+                    return
+                key = sel[0]
+                payload = None
+                if str(key).startswith("local::"):
+                    raw_key = str(key)[7:]
+                    b_dir = get_local_backups_dir()
+                    json_file = os.path.join(b_dir, f"snapshot_{raw_key}.json.gz")
+                    if os.path.isfile(json_file):
+                        with open(json_file, "r", encoding="utf-8") as f:
+                            payload = f.read()
+                    if not payload:
+                        enc_file = os.path.join(b_dir, f"backup_{raw_key}.enc")
+                        if os.path.isfile(enc_file):
+                            dest = filedialog.asksaveasfilename(
+                                title="Download Backup File",
+                                initialfile=f"payroll_backup_{raw_key}.enc",
+                                defaultextension=".enc",
+                                filetypes=[("Encrypted Database (*.enc)", "*.enc"), ("All Files (*.*)", "*.*")],
+                                parent=top,
+                            )
+                            if dest:
+                                import shutil
+                                shutil.copy2(enc_file, dest)
+                                messagebox.showinfo("Success", f"Backup downloaded to:\n{dest}", parent=top)
+                                log_user_action("backup_download", extra_summary=f"Downloaded local backup {key} to {os.path.basename(dest)}")
+                            return
+                else:
+                    if get_db_mode() == "supabase" and not is_supabase_offline():
+                        try:
+                            pg = get_shared_supabase_conn()
+                            cur = pg.cursor()
+                            cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (key,))
+                            row = cur.fetchone()
+                            if row and row[0]:
+                                payload = row[0]
+                        except Exception as e:
+                            messagebox.showerror("Error", f"Failed to fetch cloud backup: {e}", parent=top)
+                            return
+
+                if not payload:
+                    messagebox.showerror("Error", "Could not retrieve backup data for the selected entry.", parent=top)
+                    return
+
+                safe_key = str(key).replace("::", "_").replace(" ", "_")
+                save_path = filedialog.asksaveasfilename(
+                    title="Save Backup File As",
+                    initialfile=f"payroll_backup_{safe_key}.json.gz",
+                    defaultextension=".json.gz",
+                    filetypes=[
+                        ("Compressed Backup (*.json.gz)", "*.json.gz"),
+                        ("JSON Snapshot (*.json)", "*.json"),
+                        ("All Files (*.*)", "*.*"),
+                    ],
+                    parent=top,
+                )
+                if not save_path:
+                    return
+
+                try:
+                    snapshot = _decode_cloud_backup_payload(payload)
+                    if not snapshot:
+                        messagebox.showerror("Download Error", "Could not decode backup payload.", parent=top)
+                        return
+                    if save_path.endswith(".json"):
+                        with open(save_path, "w", encoding="utf-8") as f:
+                            json.dump(snapshot, f, indent=2, default=str)
+                    else:
+                        raw_json = json.dumps(snapshot, default=str).encode("utf-8")
+                        compressed = gzip.compress(raw_json)
+                        with open(save_path, "wb") as f:
+                            f.write(compressed)
+                    log_user_action("backup_download", extra_summary=f"Downloaded backup {key} to {os.path.basename(save_path)}")
+                    messagebox.showinfo("Download Complete", f"Backup successfully saved to:\n{save_path}", parent=top)
+                except Exception as exc:
+                    messagebox.showerror("Download Failed", f"Failed to save backup file:\n{exc}", parent=top)
+
+            def do_load_backup_file():
+                file_path = filedialog.askopenfilename(
+                    title="Select Backup File to Load & Restore",
+                    filetypes=[
+                        ("All Supported Backups (*.json.gz, *.json, *.enc)", "*.json.gz;*.json;*.enc"),
+                        ("Compressed Snapshot (*.json.gz)", "*.json.gz"),
+                        ("JSON Snapshot (*.json)", "*.json"),
+                        ("Encrypted Database (*.enc)", "*.enc"),
+                        ("All Files (*.*)", "*.*"),
+                    ],
+                    parent=top,
+                )
+                if not file_path:
+                    return
+
+                fn = os.path.basename(file_path)
+                if not messagebox.askyesno(
+                    "Confirm Restore from File",
+                    f"Restoring from file will replace current application data with the contents of:\n\n{fn}\n\nAre you sure you want to proceed?",
+                    icon="warning",
+                    parent=top,
+                ):
+                    return
+
+                try:
+                    if file_path.endswith(".enc"):
+                        active_enc = os.path.join(get_default_app_dir(), "payroll_data.enc")
+                        import shutil
+                        shutil.copy2(file_path, active_enc)
+                        load_database()
+                        log_user_action("backup_load_file", extra_summary=f"Restored database from file: {fn}")
+                        messagebox.showinfo("Restore Success", f"Database successfully restored from:\n{fn}", parent=top)
+                        try:
+                            self._schedule_soft_ui_refresh(full=True)
+                        except Exception:
+                            pass
+                        refresh_all()
+                        return
+
+                    snapshot = None
+                    if file_path.endswith(".json.gz"):
+                        with open(file_path, "rb") as f:
+                            gz_data = f.read()
+                        raw_str = gzip.decompress(gz_data).decode("utf-8")
+                        snapshot = json.loads(raw_str)
+                    else:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        snapshot = _decode_cloud_backup_payload(content)
+                        if not snapshot:
+                            snapshot = json.loads(content)
+
+                    if not snapshot or not isinstance(snapshot.get("tables"), dict):
+                        messagebox.showerror("Invalid File", "The selected file does not contain valid payroll backup data.", parent=top)
+                        return
+
+                    ok, msg = restore_snapshot_dict(snapshot, source_name=f"file:{fn}")
+                    if ok:
+                        messagebox.showinfo("Restore Success", f"Successfully loaded and restored backup from:\n{fn}", parent=top)
+                        try:
+                            self._schedule_soft_ui_refresh(full=True)
+                        except Exception:
+                            pass
+                        refresh_all()
+                    else:
+                        messagebox.showerror("Restore Failed", str(msg), parent=top)
+                except Exception as exc:
+                    messagebox.showerror("Restore Error", f"Failed to restore from file:\n{exc}", parent=top)
+
             def refresh_all():
                 load_logs()
                 load_backups()
@@ -14986,15 +15784,35 @@ if HAS_DEPS:
             user_filter.bind("<<ComboboxSelected>>", lambda e: load_logs())
             btn_row = tb.Frame(bak_lf)
             btn_row.pack(fill=X, pady=(8, 0))
-            tb.Button(btn_row, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 8))
-            tb.Button(btn_row, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT)
+            tb.Button(btn_row, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row, text=self._tr("💾 Download Selected File"), bootstyle="info outline", command=do_download_backup).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row, text=self._tr("📂 Load Backup from Disk..."), bootstyle="primary outline", command=do_load_backup_file).pack(side=LEFT)
             refresh_all()
 
         def _build_database_and_cloud_panel(self, parent, dialog):
             """Embeds Supabase Cloud settings with live 1GB storage meter, and local directory changer."""
+            export_frame = tb.Labelframe(parent, text=self._tr("Revenue Data Export"), padding=(15, 10), bootstyle="secondary")
+            export_frame.pack(side=BOTTOM, fill=X, padx=10, pady=(5, 10))
+
+            tb.Label(
+                export_frame,
+                text=self._tr("Export the full table of revenue records and calculations to CSV or Excel:"),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+            ).pack(side=LEFT, padx=(5, 15))
+
+            tb.Button(
+                export_frame,
+                text=self._tr("Export Revenue to CSV / Excel"),
+                bootstyle="success",
+                cursor="hand2",
+                command=self.export_excel,
+            ).pack(side=RIGHT, padx=5)
+
             db_notebook = tb.Notebook(parent, bootstyle="info")
-            db_notebook.pack(fill=BOTH, expand=True, padx=10, pady=10)
+            db_notebook.pack(side=TOP, fill=BOTH, expand=True, padx=10, pady=(10, 5))
 
             def _create_scrollable_subtab(parent_nb, title):
                 tab = tb.Frame(parent_nb)
@@ -15036,6 +15854,23 @@ if HAS_DEPS:
             # --- SUB-TAB 1: SUPABASE CLOUD ---
             tab_remote_wrapper, tab_remote = _create_scrollable_subtab(db_notebook, self._tr("☁️ Supabase Cloud Database"))
             
+            # --- Cloud Sync Action Bar ---
+            sync_card = tb.Labelframe(tab_remote, text=self._tr("Cloud Synchronization"), padding=12, bootstyle="primary")
+            sync_card.pack(fill=X, pady=(0, 10))
+
+            self.btn_sync_now = tb.Button(
+                sync_card,
+                text="🔄 " + self._tr("Sync Cloud Now"),
+                bootstyle="success",
+                cursor="hand2",
+                command=self.manual_sync_cloud,
+            )
+            self.btn_sync_now.pack(side=LEFT, padx=(0, 10))
+
+            is_cloud = (get_db_mode() == "supabase")
+            sync_status_txt = "☁️ " + self._tr("Connected") + " (Live Cloud Database)" if is_cloud else "💻 Local Database Mode"
+            tb.Label(sync_card, text=sync_status_txt, font=("Segoe UI", 10, "bold"), bootstyle="info" if is_cloud else "secondary").pack(side=LEFT, padx=5)
+
             # --- Live 1 GB Free Tier Storage Meter ---
             storage_card = tb.Labelframe(tab_remote, text=self._tr("📊 Supabase Cloud Storage (1 GB Free Tier)"), padding=12, bootstyle="info")
             storage_card.pack(fill=X, pady=(5, 12))
@@ -15281,6 +16116,53 @@ if HAS_DEPS:
             tb.Button(btn_row, text="📁 Sync Local Files → Cloud", bootstyle="info", command=do_sync_files).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="Clean Up Cloud Duplicates", bootstyle="secondary", command=do_cleanup_cloud).pack(side=LEFT)
 
+            # --- Multi-Device First-Time Integration Guide ---
+            guide_card = tb.Labelframe(tab_remote, text=self._tr("📖 First-Time Cloud Setup & Multi-Device Integration Guide"), padding=14, bootstyle="info")
+            guide_card.pack(fill=X, pady=(15, 10))
+
+            is_ar = (getattr(self, 'lang', 'en') == 'ar')
+            if is_ar:
+                guide_lines = (
+                    "📋 خطوات ربط ومزامنة جهاز جديد للمرة الأولى:\n\n"
+                    "1️⃣ الجهاز الرئيسي (الجهاز الأول الذي يحتوي على البيانات الأصلية):\n"
+                    "   • أدخل بيانات Supabase: المضيف (Host)، كلمة مرور قاعدة البيانات، المنفذ (6543)، واسم المستخدم.\n"
+                    "   • اضغط على 'التحقق وحفظ الإعدادات' للتأكد من الاتصال بنجاح.\n"
+                    "   • اضغط على 'Upload Local → Cloud' لرفع كامل سجلات الرواتب والموظفين والمصروفات إلى السحابة.\n"
+                    "   • اضغط على '📁 Sync Local Files → Cloud' لرفع مستندات وصور الموظفين.\n\n"
+                    "2️⃣ الجهاز الثاني (الكمبيوتر المحمول أو الجهاز الإضافي):\n"
+                    "   • افتح نفس هذه النافذة (إعدادات قاعدة البيانات والسحابة) على الجهاز الجديد.\n"
+                    "   • أدخل نفس إعدادات وبيانات Supabase تماماً واضغط 'التحقق وحفظ الإعدادات'.\n"
+                    "   • اضغط على زر '🔄 مزامنة السحابة الآن' لتحميل كامل قاعدة البيانات والملفات تلقائياً للجهاز.\n\n"
+                    "3️⃣ الاستخدام اليومي والمزامنة التلقائية:\n"
+                    "   • تتم مزامنة التغييرات تلقائياً في الخلفية بين كل الأجهزة المرتبطة.\n"
+                    "   • يمكنك الضغط على '🔄 مزامنة السحابة الآن' في أي وقت لإجراء مزامنة فورية وتحديث كل الجداول."
+                )
+            else:
+                guide_lines = (
+                    "📋 Step-by-Step Multi-Device Integration Guide:\n\n"
+                    "1️⃣ Primary PC (Source of Truth with Existing Data):\n"
+                    "   • Enter your Supabase credentials: Host, Database Password, Port (6543), Database (postgres), and User.\n"
+                    "   • Click 'Verify & Save Configuration' to confirm the cloud connection succeeds.\n"
+                    "   • Click 'Upload Local → Cloud' to push all existing payroll records, employees, and expenses to Supabase.\n"
+                    "   • Click '📁 Sync Local Files → Cloud' to upload employee documents and photos.\n\n"
+                    "2️⃣ Secondary Device (Laptop or Second Workstation):\n"
+                    "   • Open this exact Database & Cloud Settings tab on the second device.\n"
+                    "   • Enter the identical Supabase credentials and click 'Verify & Save Configuration'.\n"
+                    "   • Click '🔄 Sync Cloud Now' at the top of this tab to download the entire database and documents.\n\n"
+                    "3️⃣ Daily Continuous Synchronization:\n"
+                    "   • All changes synchronize automatically in the background between active devices.\n"
+                    "   • You can click '🔄 Sync Cloud Now' at any time to force an instant refresh across all tabs."
+                )
+
+            lbl_guide = tb.Label(
+                guide_card,
+                text=guide_lines,
+                font=("Segoe UI", 9),
+                justify=RIGHT if is_ar else LEFT,
+                wraplength=640,
+            )
+            lbl_guide.pack(fill=X, padx=5, pady=5)
+
             # --- SUB-TAB 2: LOCAL DIR ---
             tab_local_wrapper, tab_local = _create_scrollable_subtab(db_notebook, self._tr("📁 Local Storage Directory"))
             tb.Label(tab_local, text=self._tr("Current storage directory:"), font=("Segoe UI", 10, "bold")).pack(pady=(10, 5))
@@ -15334,6 +16216,332 @@ if HAS_DEPS:
             local_btn_frame.pack(pady=15)
             tb.Button(local_btn_frame, text=self._tr("Reset to Default"), bootstyle="secondary", command=reset_local_default).pack(side=LEFT, padx=10)
             tb.Button(local_btn_frame, text=self._tr("Save Configuration"), bootstyle="success", command=save_local_config).pack(side=LEFT, padx=10)
+
+        def _build_app_updates_panel(self, parent, dialog):
+            """Settings panel for cloud in-app updates, fail-safe recovery, and Supabase audit history."""
+            top = dialog
+            
+            canvas = tk.Canvas(parent, highlightthickness=0, borderwidth=0)
+            vscroll = tb.Scrollbar(parent, orient=VERTICAL, command=canvas.yview)
+            inner = tb.Frame(canvas, padding=16)
+            
+            inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+            canvas.configure(yscrollcommand=vscroll.set)
+            
+            def _on_canvas_configure(e):
+                try:
+                    canvas.itemconfigure(win_id, width=e.width)
+                except Exception:
+                    pass
+            canvas.bind("<Configure>", _on_canvas_configure)
+            
+            vscroll.pack(side=RIGHT, fill=Y)
+            canvas.pack(side=LEFT, fill=BOTH, expand=True)
+
+            # --- 1. CURRENT ENGINE STATUS CARD ---
+            info = get_active_code_info()
+            status_lf = tb.Labelframe(inner, text=self._tr("🚀 Current Engine & Version Status"), padding=14, bootstyle="info")
+            status_lf.pack(fill=X, pady=(0, 14))
+            
+            status_grid = tb.Frame(status_lf)
+            status_grid.pack(fill=X)
+            
+            if info["is_safe_mode"]:
+                engine_txt = "⚠️ Built-in Factory Engine (Safe Mode Fallback)"
+                engine_style = "warning"
+            elif info["is_dynamic"]:
+                engine_txt = "🟢 Cloud-Updated Engine"
+                engine_style = "success"
+            else:
+                engine_txt = "📦 Built-in Factory Engine"
+                engine_style = "info"
+                
+            tb.Label(status_grid, text="Active Engine:", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky=W, pady=3, padx=(0, 12))
+            tb.Label(status_grid, text=engine_txt, font=("Segoe UI", 10, "bold"), bootstyle=engine_style).grid(row=0, column=1, sticky=W, pady=3)
+            
+            tb.Label(status_grid, text="Active Version:", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, sticky=W, pady=3, padx=(0, 12))
+            tb.Label(status_grid, text=f"v{info['version']} (Build Date: {APP_BUILD_DATE})", font=("Segoe UI", 10)).grid(row=1, column=1, sticky=W, pady=3)
+            
+            tb.Label(status_grid, text="Active Code Hash:", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky=W, pady=3, padx=(0, 12))
+            tb.Label(status_grid, text=f"{info['hash'][:16]}...", font=("Segoe UI", 9, "italic"), bootstyle="secondary").grid(row=2, column=1, sticky=W, pady=3)
+            
+            tb.Label(status_grid, text="Updates Location:", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky=W, pady=3, padx=(0, 12))
+            tb.Label(status_grid, text=get_updates_dir(), font=("Segoe UI", 9), bootstyle="secondary").grid(row=3, column=1, sticky=W, pady=3)
+
+            # Safe mode / Crash diagnostics box
+            safe_flag = get_safe_mode_flag_path()
+            crash_log = get_last_crash_log_path()
+            if os.path.isfile(safe_flag) or info["is_safe_mode"]:
+                safe_box = tb.Frame(status_lf, bootstyle="danger", padding=10)
+                safe_box.pack(fill=X, pady=(10, 0))
+                
+                safe_msg = "⚠️ A downloaded update crashed on launch. The app automatically fell back to the safe built-in engine.\nYou can check for a cloud update or roll back."
+                if os.path.isfile(crash_log):
+                    try:
+                        with open(crash_log, "r", encoding="utf-8") as lf:
+                            first_lines = "".join([lf.readline() for _ in range(3)]).strip()
+                            if first_lines:
+                                safe_msg += f"\n\nCrash summary:\n{first_lines}"
+                    except Exception:
+                        pass
+                tb.Label(safe_box, text=safe_msg, bootstyle="inverse-danger", font=("Segoe UI", 9), wraplength=650, justify=LEFT).pack(anchor=W, pady=(0, 8))
+                
+                def _view_crash_log():
+                    if not os.path.isfile(crash_log):
+                        messagebox.showinfo("Crash Log", "No crash log file found.", parent=top)
+                        return
+                    try:
+                        with open(crash_log, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    except Exception as ce:
+                        content = f"Error reading crash log: {ce}"
+                    c_dlg = tb.Toplevel(top)
+                    c_dlg.title("Last Crash Diagnostics & Traceback")
+                    c_dlg.geometry("700x500")
+                    c_txt = tk.Text(c_dlg, wrap=WORD, font=("Consolas", 10))
+                    c_txt.pack(fill=BOTH, expand=True, padx=10, pady=10)
+                    c_txt.insert("1.0", content)
+                    c_txt.configure(state="disabled")
+                    tb.Button(c_dlg, text="Close", bootstyle="secondary", command=c_dlg.destroy).pack(pady=(0, 10))
+
+                def _clear_safe_mode():
+                    if os.path.isfile(safe_flag):
+                        try:
+                            os.remove(safe_flag)
+                        except Exception:
+                            pass
+                    messagebox.showinfo("Safe Mode Cleared", "Safe mode flag cleared. The app will attempt to run the update on next restart.", parent=top)
+                    safe_box.pack_forget()
+
+                btn_c_row = tb.Frame(safe_box, bootstyle="danger")
+                btn_c_row.pack(anchor=W)
+                tb.Button(btn_c_row, text="📋 View Full Crash Report", bootstyle="light", command=_view_crash_log).pack(side=LEFT, padx=(0, 8))
+                tb.Button(btn_c_row, text="🧹 Clear Safe Mode Flag", bootstyle="warning", command=_clear_safe_mode).pack(side=LEFT)
+
+            # --- 2. CLOUD UPDATE & CHECK ACTIONS ---
+            upd_lf = tb.Labelframe(inner, text=self._tr("🔄 Cloud Software Updates"), padding=14, bootstyle="primary")
+            upd_lf.pack(fill=X, pady=(0, 14))
+
+            tb.Label(
+                upd_lf,
+                text=self._tr("Check for and install the latest official software updates directly over the cloud:"),
+                font=("Segoe UI", 10),
+                bootstyle="secondary",
+                wraplength=680,
+                justify=LEFT,
+            ).pack(anchor=W, pady=(0, 10))
+
+            url_row = tb.Frame(upd_lf)
+            url_row.pack(fill=X, pady=(0, 10))
+            tb.Label(url_row, text="Update Server URL:", font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 10))
+            ent_url = tb.Entry(url_row, font=("Segoe UI", 9))
+            ent_url.pack(side=LEFT, fill=X, expand=True, padx=(0, 8))
+            ent_url.insert(0, get_custom_update_server_url())
+
+            def _save_url():
+                set_custom_update_server_url(ent_url.get().strip())
+                messagebox.showinfo("Saved", "Update server URL configuration saved.", parent=top)
+            tb.Button(url_row, text="💾 Save URL", bootstyle="secondary outline", command=_save_url).pack(side=LEFT)
+
+            lbl_check_status = tb.Label(upd_lf, text="Ready to check for updates.", font=("Segoe UI", 10, "italic"), bootstyle="secondary")
+            lbl_check_status.pack(anchor=W, pady=(0, 10))
+
+            btn_act_row = tb.Frame(upd_lf)
+            btn_act_row.pack(fill=X, pady=(0, 8))
+
+            cached_update = {"data": None}
+
+            def _do_check_update():
+                lbl_check_status.configure(text="⏳ Connecting to cloud update server and checking for updates...", bootstyle="info")
+                btn_check.configure(state="disabled")
+
+                def run_bg():
+                    status, data = check_for_cloud_update()
+                    def update_ui():
+                        btn_check.configure(state="normal")
+                        if status == "error":
+                            lbl_check_status.configure(text=f"❌ Check failed: {data.get('error')}", bootstyle="danger")
+                            messagebox.showerror("Update Check Failed", f"Could not fetch update from server:\n\n{data.get('error')}", parent=top)
+                        elif status == "up_to_date":
+                            lbl_check_status.configure(text=f"✅ You are running the latest version! (Code Hash: {data.get('remote_hash', '')[:8]})", bootstyle="success")
+                            messagebox.showinfo("Up to Date", f"Your application is completely up to date!\n\nVersion: v{data.get('remote_version')}\nCode Hash: {data.get('remote_hash', '')[:12]}", parent=top)
+                        elif status == "update_available":
+                            cached_update["data"] = data
+                            size_kb = int(data.get("size_bytes", 0)) / 1024
+                            lbl_check_status.configure(
+                                text=f"✨ Update Available! New Version: v{data.get('remote_version')} ({size_kb:.0f} KB). Ready to install.",
+                                bootstyle="warning"
+                            )
+                            if messagebox.askyesno(
+                                "Update Available ✨",
+                                f"A new version is available!\n\n"
+                                f"• New Version: v{data.get('remote_version')}\n"
+                                f"• Current Version: v{info.get('version')}\n"
+                                f"• Download Size: {size_kb:.0f} KB\n\n"
+                                f"Would you like to download and install this update now?",
+                                parent=top
+                            ):
+                                _do_install_update(data)
+                    try:
+                        top.after(0, update_ui)
+                    except Exception:
+                        pass
+
+                import threading
+                threading.Thread(target=run_bg, daemon=True).start()
+
+            def _do_install_update(data=None):
+                if not data:
+                    data = cached_update.get("data")
+                if not data or not data.get("remote_code"):
+                    _do_check_update()
+                    return
+
+                code = data.get("remote_code")
+                r_hash = data.get("remote_hash")
+                lbl_check_status.configure(text="⏳ Validating syntax and installing update...", bootstyle="info")
+                
+                ok, msg = install_cloud_update(code, r_hash)
+                if ok:
+                    lbl_check_status.configure(text="✅ Update installed successfully!", bootstyle="success")
+                    load_update_logs()
+                    if messagebox.askyesno(
+                        "Update Installed 🎉",
+                        f"{msg}\n\nThe application must restart to apply the updated engine.\n\nRestart now?",
+                        parent=top,
+                    ):
+                        dialog.destroy()
+                        restart_app()
+                else:
+                    lbl_check_status.configure(text=f"❌ Installation aborted: {msg}", bootstyle="danger")
+                    messagebox.showerror("Installation Failed", msg, parent=top)
+
+            def _do_rollback_bak():
+                bak_path = os.path.join(get_updates_dir(), "payroll_app.py.bak")
+                if not os.path.isfile(bak_path):
+                    messagebox.showwarning("Rollback", "No previous update backup (.bak) was found on this computer.", parent=top)
+                    return
+                mtime = datetime.fromtimestamp(os.path.getmtime(bak_path)).strftime("%Y-%m-%d %H:%M:%S")
+                if not messagebox.askyesno(
+                    "Roll Back Update ⏮️",
+                    f"This will restore the previous update backup from:\n{mtime}\n\nContinue?",
+                    parent=top,
+                ):
+                    return
+                ok, msg = rollback_cloud_update(target="bak")
+                if ok:
+                    messagebox.showinfo("Rollback Success", f"{msg}\n\nPlease restart the application to apply the rollback.", parent=top)
+                    load_update_logs()
+                    if messagebox.askyesno("Restart Now", "Restart application now?", parent=top):
+                        dialog.destroy()
+                        restart_app()
+                else:
+                    messagebox.showerror("Rollback Failed", msg, parent=top)
+
+            def _do_revert_factory():
+                if not messagebox.askyesno(
+                    "Revert to Factory Built-in Version 🏭",
+                    "This will remove the downloaded dynamic update and return the application to its original built-in code engine.\n\nContinue?",
+                    parent=top,
+                ):
+                    return
+                ok, msg = rollback_cloud_update(target="factory")
+                if ok:
+                    messagebox.showinfo("Reverted", f"{msg}\n\nPlease restart the application to run the built-in version.", parent=top)
+                    load_update_logs()
+                    if messagebox.askyesno("Restart Now", "Restart application now?", parent=top):
+                        dialog.destroy()
+                        restart_app()
+                else:
+                    messagebox.showerror("Revert Failed", msg, parent=top)
+
+            btn_check = tb.Button(btn_act_row, text=self._tr("🔄 Check for Updates Now"), bootstyle="primary", command=_do_check_update)
+            btn_check.pack(side=LEFT, padx=(0, 8))
+
+            tb.Button(btn_act_row, text=self._tr("⬇️ Install Update Now"), bootstyle="success", command=lambda: _do_install_update()).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_act_row, text=self._tr("⏮️ Roll Back to Previous Backup"), bootstyle="warning outline", command=_do_rollback_bak).pack(side=LEFT, padx=(0, 8))
+            tb.Button(btn_act_row, text=self._tr("🏭 Revert to Factory Built-in"), bootstyle="danger outline", command=_do_revert_factory).pack(side=LEFT)
+
+            # --- 3. UPDATE AUDIT & CLOUD LOGS ---
+            hist_lf = tb.Labelframe(inner, text=self._tr("📋 Supabase Update & Recovery Audit History"), padding=12, bootstyle="secondary")
+            hist_lf.pack(fill=BOTH, expand=True, pady=(0, 8))
+
+            hist_cols = ("When", "User", "Action", "Summary")
+            hist_holder = tb.Frame(hist_lf)
+            hist_holder.pack(fill=BOTH, expand=True)
+            hist_tree = tb.Treeview(hist_holder, columns=hist_cols, show="headings", height=7, bootstyle="secondary")
+            hist_tree.heading("When", text=self._tr("Date & Time"))
+            hist_tree.heading("User", text=self._tr("Device / User"))
+            hist_tree.heading("Action", text=self._tr("Action Type"))
+            hist_tree.heading("Summary", text=self._tr("Details"))
+            hist_tree.column("When", width=140, anchor=CENTER)
+            hist_tree.column("User", width=150, anchor=W)
+            hist_tree.column("Action", width=150, anchor=CENTER)
+            hist_tree.column("Summary", width=300, anchor=W)
+            self._attach_tree_scrollbars(hist_holder, hist_tree)
+
+            def load_update_logs():
+                for item in hist_tree.get_children():
+                    hist_tree.delete(item)
+                
+                rows_found = []
+                try:
+                    conn = sqlite3.connect(TEMP_DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT created_at, user_name, action, summary
+                        FROM user_action_log
+                        WHERE action LIKE 'app_%' OR action LIKE 'update_%'
+                        ORDER BY id DESC LIMIT 50
+                        """
+                    )
+                    for r in cur.fetchall() or []:
+                        rows_found.append((r[0] or "", plain_label(r[1]) or "", r[2] or "", r[3] or ""))
+                    conn.close()
+                except Exception:
+                    pass
+
+                if get_db_mode() == "supabase" and not is_supabase_offline():
+                    try:
+                        pg = get_shared_supabase_conn()
+                        cur = pg.cursor()
+                        cur.execute(
+                            """
+                            SELECT created_at, user_name, action, summary
+                            FROM user_action_log
+                            WHERE action LIKE 'app_%' OR action LIKE 'update_%'
+                            ORDER BY created_at DESC LIMIT 50
+                            """
+                        )
+                        for r in cur.fetchall() or []:
+                            rows_found.append((r[0] or "", plain_label(r[1]) or "", r[2] or "", r[3] or ""))
+                    except Exception:
+                        pass
+
+                seen = set()
+                final_rows = []
+                for rf in rows_found:
+                    sig = (rf[0], rf[1], rf[2], rf[3])
+                    if sig not in seen:
+                        seen.add(sig)
+                        final_rows.append(rf)
+                final_rows.sort(key=lambda x: str(x[0]), reverse=True)
+
+                for r in final_rows[:40]:
+                    act = r[2]
+                    act_label = {
+                        "app_update": "🚀 Update Installed",
+                        "app_rollback": "⏮️ Rolled Back",
+                        "update_crash": "⚠️ Crash / Safe Mode",
+                        "app_update_check": "🔍 Update Checked",
+                        "update_syntax_error": "❌ Syntax Rejected",
+                    }.get(act, act)
+                    hist_tree.insert("", tk.END, values=(r[0], r[1], act_label, r[3]))
+
+            tb.Button(hist_lf, text=self._tr("🔄 Refresh History Log"), bootstyle="secondary outline", command=load_update_logs).pack(anchor=W, pady=(8, 0))
+            load_update_logs()
 
         def open_settings_dialog(self, default_tab=None):
             dialog = tb.Toplevel(self)
@@ -16028,8 +17236,15 @@ if HAS_DEPS:
             notebook.add(tab_db, text=self._tr("🗄️ Database & Cloud"))
             self._build_database_and_cloud_panel(tab_db, dialog)
 
+            # --- SOFTWARE UPDATES TAB ---
+            tab_update = tb.Frame(notebook)
+            notebook.add(tab_update, text=self._tr("🚀 App Updates"))
+            self._build_app_updates_panel(tab_update, dialog)
+
             if default_tab in ("database", "supabase", "db"):
                 notebook.select(tab_db)
+            elif default_tab in ("update", "updates", "github"):
+                notebook.select(tab_update)
             elif default_tab in ("activity", "logs", "backups"):
                 notebook.select(tab_act)
             elif default_tab == "locations":
@@ -16513,8 +17728,10 @@ if HAS_DEPS:
                     day_hdr_text = str(day)
                     note_tag_text = ""
                 
-                lbl_day = tb.Label(cell_frame, text=day_hdr_text, font=("Segoe UI", 11, "bold"), anchor="nw")
-                lbl_day.pack(anchor=NW, padx=5, pady=2)
+                cell_hdr = tb.Frame(cell_frame)
+                cell_hdr.pack(fill=X, padx=4, pady=2)
+                lbl_day = tb.Label(cell_hdr, text=day_hdr_text, font=("Segoe UI", 11, "bold"), anchor="w")
+                lbl_day.pack(side=LEFT)
                 
                 if day_envelopes:
                     day_total = sum(to_float(env["amount"], 0.0) for env in day_envelopes)
@@ -16534,6 +17751,7 @@ if HAS_DEPS:
 
                     if complete_and_approved:
                         cell_frame.config(bootstyle="success")
+                        cell_hdr.config(bootstyle="success")
                         lbl_day.config(bootstyle="inverse-success")
                         loc_count = f"{len(present_locs)}/{len(required_locations)}" if required_locations else str(len(day_envelopes))
                         lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 11, "bold"), bootstyle="inverse-success")
@@ -16555,7 +17773,8 @@ if HAS_DEPS:
                             lbl_note_tag.pack(pady=(2, 0))
                     else:
                         cell_frame.config(bootstyle="danger")
-                        lbl_day.pack_forget()
+                        cell_hdr.config(bootstyle="danger")
+                        lbl_day.config(bootstyle="inverse-danger")
 
                         if missing_locs:
                             branch_text = f"{self._tr('Missing')}: {', '.join(missing_locs)}"
@@ -16567,15 +17786,8 @@ if HAS_DEPS:
                             )))
                             branch_text = ", ".join(issue_locations) if issue_locations else self._tr("Pending")
 
-                        # Pack both day and branch text in a single horizontal header frame to save vertical space
-                        header = tb.Frame(cell_frame, bootstyle="danger")
-                        header.pack(fill=X, padx=5, pady=2)
-
-                        lbl_day.config(bootstyle="inverse-danger")
-                        lbl_day.pack(in_=header, side=LEFT)
-
-                        lbl_branch = tb.Label(header, text=branch_text, font=("Segoe UI", 8, "bold"), bootstyle="inverse-danger", anchor=E)
-                        lbl_branch.pack(side=RIGHT, fill=X, expand=True)
+                        lbl_branch = tb.Label(cell_hdr, text=branch_text, font=("Segoe UI", 8, "bold"), bootstyle="inverse-danger", anchor=E)
+                        lbl_branch.pack(side=RIGHT, padx=(4, 0))
 
                         lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 11, "bold"), bootstyle="inverse-danger")
                         lbl_amount.pack(pady=(2, 2))
@@ -16595,6 +17807,7 @@ if HAS_DEPS:
                             lbl_note_tag.pack(pady=(2, 0))
                 else:
                     cell_frame.config(bootstyle="light")
+                    cell_hdr.config(bootstyle="light")
                     lbl_day.config(bootstyle="secondary")
                     if note_tag_text:
                         lbl_note_tag = tb.Label(
@@ -16612,9 +17825,12 @@ if HAS_DEPS:
                     widget.config(cursor="hand2")
                     
                 make_bind(cell_frame)
+                make_bind(cell_hdr)
                 make_bind(lbl_day)
                 for w in cell_frame.winfo_children():
                     make_bind(w)
+                    for sub_w in w.winfo_children():
+                        make_bind(sub_w)
                 
                 current_col += 1
                 if current_col > 6:
@@ -17017,6 +18233,10 @@ if __name__ == "__main__":
         
     if not check_machine_license():
         sys.exit(1)
+
+    # Dynamic update bootstrap (runs downloaded update if present, or safely falls back)
+    if _check_and_run_dynamic_update():
+        sys.exit(0)
 
     app = PayrollApp()
     app.mainloop()
