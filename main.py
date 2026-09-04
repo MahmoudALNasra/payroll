@@ -540,7 +540,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.3"
+APP_VERSION = "2.5.4"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2929,68 +2929,121 @@ def _parse_version_tuple(v_str):
     return tuple(nums)
 
 
+def _resolve_realtime_update_url(url, auth_token=None):
+    """
+    If the update URL points to a GitHub repository raw file, resolves the latest
+    commit SHA via the GitHub commits Atom feed or GitHub API so the request bypasses
+    Fastly/GitHub CDN's 5-minute (300-second) raw caching window completely.
+    """
+    import re, time, urllib.request
+    m = re.match(r'^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$', str(url).strip())
+    if not m:
+        return url, ""
+    owner, repo, branch, path = m.groups()
+    sha = ""
+
+    # 1. Try GitHub commits Atom feed (instant, unauthenticated, never cached by CDN)
+    try:
+        atom_url = f"https://github.com/{owner}/{repo}/commits/{branch}.atom?_cb={int(time.time())}"
+        headers = {"User-Agent": "PayrollApp-Updater/2.5", "Cache-Control": "no-cache", "Pragma": "no-cache"}
+        req = urllib.request.Request(atom_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+            shas = re.findall(r'/commit/([a-f0-9]{40})', text)
+            if shas:
+                sha = shas[0]
+    except Exception:
+        pass
+
+    # 2. Try GitHub API fallback if Atom feed did not yield a SHA
+    if not sha:
+        try:
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}"
+            headers = {"User-Agent": "PayrollApp-Updater/2.5", "Cache-Control": "no-cache", "Pragma": "no-cache"}
+            if auth_token:
+                headers["Authorization"] = f"token {auth_token}"
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                import json
+                d = json.loads(resp.read().decode("utf-8"))
+                sha = d.get("sha", "")
+        except Exception:
+            pass
+
+    if sha and len(sha) == 40:
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}/{path}", sha
+
+    return url, ""
+
+
 def get_active_code_info():
-    """Returns metadata about the currently running code engine."""
+    """Returns metadata about the currently running code engine and disk updates."""
     is_safe_mode = os.environ.get("_RUNNING_SAFE_MODE_FALLBACK") == "1" or os.path.isfile(get_safe_mode_flag_path())
     is_dynamic = (os.environ.get("_DYNAMIC_UPDATE_ACTIVE") == "1" or os.environ.get("_DYNAMIC_UPDATE_RUNNING") == "1") and not is_safe_mode
-    
+
+    # In-memory runtime version is strictly the loaded code's APP_VERSION
+    running_version = APP_VERSION
+    running_build_date = APP_BUILD_DATE
+
     current_file = None
     if is_dynamic and os.path.isfile(get_updates_script_path()):
         current_file = get_updates_script_path()
     else:
         current_file = os.path.abspath(__file__)
-        
+
     code_hash = ""
     norm_hash = ""
     file_size = 0
-    version = APP_VERSION
-    build_date = APP_BUILD_DATE
     last_modified = ""
 
-    # Check version_meta.json if dynamic
-    if is_dynamic:
-        meta_file = os.path.join(get_updates_dir(), "version_meta.json")
-        if os.path.isfile(meta_file):
-            try:
-                with open(meta_file, "r", encoding="utf-8") as mf:
-                    meta = json.load(mf)
-                    if meta.get("version"):
-                        version = meta.get("version")
-                    if meta.get("build_date"):
-                        build_date = meta.get("build_date")
-                    if meta.get("hash"):
-                        code_hash = meta.get("hash")
-                    if meta.get("norm_hash"):
-                        norm_hash = meta.get("norm_hash")
-            except Exception:
-                pass
-
+    # Inspect current running script file
     try:
         if current_file and os.path.isfile(current_file):
             with open(current_file, "rb") as f:
                 content = f.read()
-            if not code_hash:
-                code_hash = hashlib.sha256(content).hexdigest()
-            if not norm_hash:
-                norm_hash = hashlib.sha256(content.replace(b"\r\n", b"\n").strip()).hexdigest()
+            code_hash = hashlib.sha256(content).hexdigest()
+            norm_hash = hashlib.sha256(content.replace(b"\r\n", b"\n").strip()).hexdigest()
             file_size = len(content)
             mtime = os.path.getmtime(current_file)
             last_modified = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-            import re
-            m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', content.decode("utf-8", errors="ignore"))
-            if m:
-                version = m.group(1)
-            m_d = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', content.decode("utf-8", errors="ignore"))
-            if m_d:
-                build_date = m_d.group(1)
     except Exception:
         pass
 
+    # Inspect disk updates file if present
+    disk_version = running_version
+    disk_build_date = running_build_date
+    disk_norm_hash = norm_hash
+    upd_path = get_updates_script_path()
+    if os.path.isfile(upd_path):
+        try:
+            with open(upd_path, "rb") as uf:
+                disk_content = uf.read()
+            disk_norm_hash = hashlib.sha256(disk_content.replace(b"\r\n", b"\n").strip()).hexdigest()
+            import re
+            m = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', disk_content.decode("utf-8", errors="ignore"))
+            if m:
+                disk_version = m.group(1)
+            m_d = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', disk_content.decode("utf-8", errors="ignore"))
+            if m_d:
+                disk_build_date = m_d.group(1)
+        except Exception:
+            pass
+
+    pending_restart = bool(
+        disk_version != running_version
+        and _parse_version_tuple(disk_version) > _parse_version_tuple(running_version)
+    )
+
     return {
-        "version": version,
-        "build_date": build_date,
+        "version": running_version,
+        "running_version": running_version,
+        "disk_version": disk_version,
+        "pending_restart": pending_restart,
+        "build_date": running_build_date,
+        "disk_build_date": disk_build_date,
         "hash": code_hash,
         "norm_hash": norm_hash,
+        "disk_norm_hash": disk_norm_hash,
         "is_dynamic": is_dynamic,
         "is_safe_mode": is_safe_mode,
         "file_size": file_size,
@@ -3002,19 +3055,26 @@ def get_active_code_info():
 def check_for_cloud_update():
     """
     Checks the cloud server for new updates.
+    Automatically resolves the latest commit SHA for GitHub URLs to bypass CDN caches.
     Returns (status: str, data: dict)
-    status: 'update_available' | 'up_to_date' | 'error'
+    status: 'update_available' | 'installed_pending_restart' | 'up_to_date' | 'error'
     """
     url = get_custom_update_server_url()
+    token = get_update_auth_token()
     import time, urllib.request
-    sep = "&" if "?" in url else "?"
-    req_url = f"{url}{sep}_cb={int(time.time())}"
+
+    # Bypass CDN cache by resolving real-time commit SHA when using GitHub
+    req_url, resolved_sha = _resolve_realtime_update_url(url, auth_token=token)
+    if not resolved_sha:
+        sep = "&" if "?" in req_url else "?"
+        req_url = f"{req_url}{sep}_cb={int(time.time())}"
+
     headers = {
         "User-Agent": "PayrollApp-Updater/2.5",
-        "Cache-Control": "no-cache",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
+        "Expires": "0",
     }
-    token = get_update_auth_token()
     if token:
         headers["Authorization"] = f"token {token}"
     req = urllib.request.Request(req_url, headers=headers)
@@ -3038,121 +3098,62 @@ def check_for_cloud_update():
     remote_norm_hash = hashlib.sha256(raw_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
 
     local_info = get_active_code_info()
-    local_hash = local_info.get("hash") or ""
-    local_norm_hash = local_info.get("norm_hash") or ""
-    local_version = local_info.get("version") or APP_VERSION
-    local_build_date = local_info.get("build_date") or APP_BUILD_DATE
+    running_version = local_info.get("running_version") or APP_VERSION
+    running_norm_hash = local_info.get("norm_hash") or ""
+    disk_version = local_info.get("disk_version") or running_version
+    disk_norm_hash = local_info.get("disk_norm_hash") or running_norm_hash
 
     import re
     m_ver = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', remote_code)
-    remote_version = m_ver.group(1) if m_ver else local_version
+    remote_version = m_ver.group(1) if m_ver else running_version
 
     m_date = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', remote_code)
     remote_build_date = m_date.group(1) if m_date else ""
 
     remote_tuple = _parse_version_tuple(remote_version)
-    local_tuple = _parse_version_tuple(local_version)
+    running_tuple = _parse_version_tuple(running_version)
+    disk_tuple = _parse_version_tuple(disk_version)
 
-    meta_hash = ""
-    meta_norm_hash = ""
-    meta_file = os.path.join(get_updates_dir(), "version_meta.json")
-    if os.path.isfile(meta_file):
-        try:
-            with open(meta_file, "r", encoding="utf-8") as mf:
-                meta_data = json.load(mf)
-                meta_hash = meta_data.get("hash") or ""
-                meta_norm_hash = meta_data.get("norm_hash") or ""
-        except Exception:
-            pass
-
-    # Check if this exact update is already downloaded and saved on disk
-    upd_path = get_updates_script_path()
-    disk_is_current = False
-    if os.path.isfile(upd_path):
-        try:
-            with open(upd_path, "rb") as uf:
-                disk_bytes = uf.read()
-            disk_norm = hashlib.sha256(disk_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
-            if disk_norm == remote_norm_hash:
-                disk_is_current = True
-        except Exception:
-            pass
-
-    is_update_available = False
-
-    if disk_is_current:
-        if local_info.get("is_dynamic"):
-            is_update_available = False
-        else:
-            data = {
-                "remote_code": remote_code,
-                "remote_hash": remote_hash,
-                "remote_version": remote_version,
-                "remote_build_date": remote_build_date,
-                "size_bytes": len(raw_bytes),
-                "local_info": local_info,
-            }
-            return "installed_pending_restart", data
-    elif remote_tuple > local_tuple:
-        is_update_available = True
-    elif remote_tuple < local_tuple:
-        is_update_available = False
-    else:
-        # Same semantic version
-        if meta_hash and (remote_hash == meta_hash or (meta_norm_hash and remote_norm_hash == meta_norm_hash)):
-            is_update_available = False
-        elif local_norm_hash and remote_norm_hash == local_norm_hash:
-            is_update_available = False
-        elif local_hash and remote_hash == local_hash:
-            is_update_available = False
-        else:
-            upd_path = get_updates_script_path()
-            if os.path.isfile(upd_path):
-                try:
-                    with open(upd_path, "rb") as uf:
-                        disk_bytes = uf.read()
-                    disk_norm = hashlib.sha256(disk_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
-                    if disk_norm == remote_norm_hash:
-                        is_update_available = False
-                    else:
-                        if remote_build_date and local_build_date and remote_build_date < local_build_date:
-                            is_update_available = False
-                        else:
-                            is_update_available = True
-                except Exception:
-                    is_update_available = False
-            else:
-                # Factory binary (no dynamic update file on disk yet)
-                if remote_build_date and local_build_date and remote_build_date < local_build_date:
-                    is_update_available = False
-                else:
-                    # Remote code differs from local factory code, update is available
-                    is_update_available = True
-    
-    try:
-        log_user_action(
-            "app_update_check",
-            extra_summary=f"Checked for software updates: {'Update available' if is_update_available else 'Already up to date'}",
-            row={"remote_version": remote_version, "remote_hash": remote_hash[:10]}
-        )
-    except Exception:
-        pass
-
-    disp_version = remote_version
-    if remote_version == local_version and is_update_available:
-        disp_version = f"{remote_version} (Rev {remote_hash[:8]})"
+    # Check if disk file already has this exact code
+    disk_matches_remote = bool(disk_norm_hash and disk_norm_hash == remote_norm_hash)
 
     data = {
         "remote_code": remote_code,
         "remote_hash": remote_hash,
-        "remote_version": disp_version,
+        "remote_version": remote_version,
         "remote_build_date": remote_build_date,
         "size_bytes": len(raw_bytes),
         "local_info": local_info,
+        "commit_sha": resolved_sha,
     }
-    if is_update_available:
+
+    try:
+        log_user_action(
+            "app_update_check",
+            extra_summary=f"Checked software updates: Remote v{remote_version} vs Running v{running_version}",
+            row={"remote_version": remote_version, "running_version": running_version, "disk_matches": disk_matches_remote}
+        )
+    except Exception:
+        pass
+
+    if disk_matches_remote:
+        # Code is already on disk! Check if running process needs restart to activate
+        if running_tuple < remote_tuple or running_norm_hash != remote_norm_hash:
+            return "installed_pending_restart", data
+        else:
+            return "up_to_date", data
+
+    # Disk does not match remote code
+    if remote_tuple > running_tuple or remote_tuple > disk_tuple:
         return "update_available", data
-    return "up_to_date", data
+    elif remote_tuple < running_tuple and remote_tuple < disk_tuple:
+        return "up_to_date", data
+    else:
+        # Same semantic version tuple (e.g. revisions/fixes within same version tag)
+        if remote_norm_hash != running_norm_hash and remote_norm_hash != disk_norm_hash:
+            data["remote_version"] = f"{remote_version} (Rev {remote_hash[:8]})"
+            return "update_available", data
+        return "up_to_date", data
 
 check_for_github_update = check_for_cloud_update
 
@@ -17055,6 +17056,19 @@ if HAS_DEPS:
                         elif status == "up_to_date":
                             lbl_check_status.configure(text=f"✅ You are running the latest version! (Code Hash: {data.get('remote_hash', '')[:8]})", bootstyle="success")
                             messagebox.showinfo("Up to Date", f"Your application is completely up to date!\n\nVersion: v{data.get('remote_version')}\nCode Hash: {data.get('remote_hash', '')[:12]}", parent=top)
+                        elif status == "installed_pending_restart":
+                            lbl_check_status.configure(
+                                text=f"✅ Update v{data.get('remote_version')} is downloaded and ready! Close & reopen to activate.",
+                                bootstyle="info"
+                            )
+                            if messagebox.askyesno(
+                                "Update Ready to Activate 🎉",
+                                f"Update v{data.get('remote_version')} has already been downloaded and saved on disk!\n\n"
+                                f"To activate the new version, the application must close and reopen.\n\n"
+                                f"Would you like to close the application cleanly now?",
+                                parent=top
+                            ):
+                                self.shutdown_app()
                         elif status == "update_available":
                             cached_update["data"] = data
                             size_kb = int(data.get("size_bytes", 0)) / 1024
