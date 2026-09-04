@@ -540,7 +540,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.9"
+APP_VERSION = "2.5.10"
 APP_BUILD_DATE = "2026-09-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2796,29 +2796,34 @@ def restart_app():
             # delays ~2 seconds via ping so current process completely exits,
             # strips all PyInstaller variables, and launches the fresh app via Windows start.
             launched = False
+            comspec = os.environ.get("COMSPEC") or "cmd.exe"
             try:
                 upd_dir = get_updates_dir()
                 os.makedirs(upd_dir, exist_ok=True)
                 bat_path = os.path.join(upd_dir, "restart_launcher.bat")
                 bat_content = (
                     "@echo off\r\n"
+                    f'cd /d "{app_dir}"\r\n'
                     "set _MEIPASS2=\r\n"
                     "set _MEIPASS=\r\n"
                     "set _PYI_APPLICATION_HOME_DIR=\r\n"
                     "set _PYI_PARENT_PROCESS_LEVEL=\r\n"
                     "ping 127.0.0.1 -n 3 >nul 2>&1\r\n"
-                    f'start "" /D "{app_dir}" {target_cmd}\r\n'
+                    f'start "" {target_cmd}\r\n'
                     'del "%~f0" >nul 2>&1\r\n'
                 )
                 with open(bat_path, "w", encoding="utf-8") as bf:
                     bf.write(bat_content)
 
                 subprocess.Popen(
-                    f'cmd.exe /c "{bat_path}"',
+                    f'"{comspec}" /c "{bat_path}"',
                     cwd=app_dir,
                     env=clean_env,
                     creationflags=flags,
                     close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
                 launched = True
             except Exception:
@@ -2828,9 +2833,10 @@ def restart_app():
             if not launched:
                 try:
                     cmd = (
-                        f'cmd.exe /c "set _MEIPASS2=& set _MEIPASS=& '
+                        f'"{comspec}" /c "set _MEIPASS2=& set _MEIPASS=& '
+                        f'cd /d "{app_dir}" & '
                         f'ping 127.0.0.1 -n 3 >nul 2>&1 & '
-                        f'start "" /D "{app_dir}" {target_cmd}"'
+                        f'start "" {target_cmd}"'
                     )
                     subprocess.Popen(
                         cmd,
@@ -2838,6 +2844,9 @@ def restart_app():
                         env=clean_env,
                         creationflags=flags,
                         close_fds=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                     )
                     launched = True
                 except Exception as ex:
@@ -2861,7 +2870,10 @@ def restart_app():
     except Exception as e:
         messagebox.showinfo("Restart Needed", f"Please close and reopen the app manually to complete the update.\n\n({e})")
         return
-    sys.exit(0)
+    try:
+        os._exit(0)
+    except Exception:
+        sys.exit(0)
 
 
 def get_custom_update_server_url():
