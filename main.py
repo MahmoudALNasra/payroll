@@ -638,7 +638,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.16"
+APP_VERSION = "2.5.17"
 APP_BUILD_DATE = "2026-09-05"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -7671,13 +7671,24 @@ if HAS_DEPS:
             self.title(APP_TITLE)
             
             # Start zoomed/maximized automatically (ideal for 13" MacBook keeping dock and top menu bar visible)
-            try:
-                self.wm_attributes("-zoomed", True)
-            except Exception:
+            if platform.system() == "Darwin":
                 try:
-                    self.state('zoomed')
+                    self.update_idletasks()
+                    sw = self.winfo_screenwidth()
+                    sh = self.winfo_screenheight()
+                    win_w = max(1120, min(sw - 20, 1440))
+                    win_h = max(740, min(sh - 75, 960))
+                    self.geometry(f"{win_w}x{win_h}+10+25")
                 except Exception:
-                    self.geometry("1100x700")
+                    self.geometry("1180x760")
+            else:
+                try:
+                    self.wm_attributes("-zoomed", True)
+                except Exception:
+                    try:
+                        self.state('zoomed')
+                    except Exception:
+                        self.geometry("1180x760")
             
             # Check Tcl/Tk version on macOS to warn if running the buggy 8.5 system version
             if platform.system() == "Darwin":
@@ -9033,8 +9044,9 @@ if HAS_DEPS:
             if win not in self._active_modal_popups:
                 self._active_modal_popups.append(win)
             try:
-                win.attributes("-topmost", True)
                 win.lift()
+                if platform.system() != "Darwin":
+                    win.attributes("-topmost", True)
             except Exception:
                 pass
 
@@ -9046,26 +9058,36 @@ if HAS_DEPS:
                         next_top = self._active_modal_popups[-1]
                         if self._widget_alive(next_top):
                             try:
-                                next_top.attributes("-topmost", True)
+                                if platform.system() != "Darwin":
+                                    next_top.attributes("-topmost", True)
                                 next_top.lift()
                                 next_top.focus_set()
                             except Exception:
                                 pass
 
             win.bind("<Destroy>", _on_win_destroy, add="+")
-            self._ensure_popup_click_redirection()
+            if platform.system() != "Darwin":
+                self._ensure_popup_click_redirection()
 
         def _ensure_popup_click_redirection(self):
             """Ensure clicking anywhere outside the active modal brings it back to the front."""
+            if platform.system() == "Darwin":
+                return
             if getattr(self, "_popup_interceptor_bound", False):
                 return
             self._popup_interceptor_bound = True
 
             def _is_descendant_of(w, parent):
+                if w is None or parent is None:
+                    return False
+                w_str = str(w)
+                p_str = str(parent)
+                if w_str == p_str or w_str.startswith(p_str + ".") or (p_str in w_str):
+                    return True
                 cur = w
                 for _ in range(32):
                     if cur is None:
-                        return False
+                        break
                     if cur is parent:
                         return True
                     cur = getattr(cur, "master", None)
@@ -9086,7 +9108,6 @@ if HAS_DEPS:
                 try:
                     top_popup.deiconify()
                     top_popup.lift()
-                    top_popup.attributes("-topmost", True)
                     top_popup.focus_force()
                     top_popup.bell()
                 except Exception:
@@ -18706,16 +18727,16 @@ if HAS_DEPS:
             self.cash_cal_year = datetime.today().year
             self.cash_cal_month = datetime.today().month
             
-            self.cash_cal_container = tb.Frame(self.tab_cash_cal, padding=10)
+            self.cash_cal_container = tb.Frame(self.tab_cash_cal, padding=(8, 4))
             self.cash_cal_container.pack(fill=BOTH, expand=True)
             
             ctrl_frame = tb.Frame(self.cash_cal_container)
-            ctrl_frame.pack(fill=X, pady=(10, 20))
+            ctrl_frame.pack(fill=X, pady=(4, 6))
             
-            tb.Button(ctrl_frame, text="◀ Prev", bootstyle="outline-primary", command=self.prev_cash_month).pack(side=LEFT, padx=10)
-            self.lbl_cash_month_year = tb.Label(ctrl_frame, text="", font=("Segoe UI", 16, "bold"))
-            self.lbl_cash_month_year.pack(side=LEFT, padx=20)
-            tb.Button(ctrl_frame, text="Next ▶", bootstyle="outline-primary", command=self.next_cash_month).pack(side=LEFT, padx=10)
+            tb.Button(ctrl_frame, text="◀ Prev", bootstyle="outline-primary", command=self.prev_cash_month).pack(side=LEFT, padx=6)
+            self.lbl_cash_month_year = tb.Label(ctrl_frame, text="", font=("Segoe UI", 15, "bold"))
+            self.lbl_cash_month_year.pack(side=LEFT, padx=12)
+            tb.Button(ctrl_frame, text="Next ▶", bootstyle="outline-primary", command=self.next_cash_month).pack(side=LEFT, padx=6)
             self.btn_cash_month_lock = tb.Button(
                 ctrl_frame,
                 text=self._tr("🔒 Lock Month"),
@@ -18723,17 +18744,17 @@ if HAS_DEPS:
                 cursor="hand2",
                 command=self.open_cash_month_lock_dialog,
             )
-            self.btn_cash_month_lock.pack(side=LEFT, padx=15)
+            self.btn_cash_month_lock.pack(side=LEFT, padx=10)
             tb.Button(
                 ctrl_frame,
                 text=self._tr("Delete Month Envelopes"),
                 bootstyle="danger outline",
                 cursor="hand2",
                 command=self.delete_month_envelopes,
-            ).pack(side=LEFT, padx=8)
+            ).pack(side=LEFT, padx=6)
             
-            self.lbl_cash_cal_summary = tb.Label(ctrl_frame, text="", font=("Segoe UI", 12, "italic"), bootstyle="secondary")
-            self.lbl_cash_cal_summary.pack(side=RIGHT, padx=20)
+            self.lbl_cash_cal_summary = tb.Label(ctrl_frame, text="", font=("Segoe UI", 11, "italic"), bootstyle="secondary")
+            self.lbl_cash_cal_summary.pack(side=RIGHT, padx=10)
 
             self.calendar_grid_frame = tb.Frame(self.cash_cal_container)
             self.calendar_grid_frame.pack(fill=BOTH, expand=True)
@@ -19147,8 +19168,8 @@ if HAS_DEPS:
             
             headers = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
             for col, h in enumerate(headers):
-                lbl = tb.Label(self.calendar_grid_frame, text=self._tr(h), font=("Segoe UI", 11, "bold"), anchor=CENTER, bootstyle="secondary")
-                lbl.grid(row=0, column=col, sticky="nsew", padx=2, pady=5)
+                lbl = tb.Label(self.calendar_grid_frame, text=self._tr(h), font=("Segoe UI", 10, "bold"), anchor=CENTER, bootstyle="secondary")
+                lbl.grid(row=0, column=col, sticky="nsew", padx=2, pady=2)
                 self.calendar_grid_frame.columnconfigure(col, weight=1, uniform="equal")
                 
             cal_first_weekday, _ = calendar.monthrange(year, month)
@@ -19174,7 +19195,7 @@ if HAS_DEPS:
                 num_notes = len(day_notes)
 
                 # Format day header and note mark:
-                # Day header displays clean day number; stars are kept only next to the word notes
+                # Stars are only displayed next to the word notes; placed in header so always visible
                 day_hdr_text = str(day)
                 if num_notes == 1:
                     note_tag_text = "⭐ 1 Note"
@@ -19186,9 +19207,19 @@ if HAS_DEPS:
                     note_tag_text = ""
                 
                 cell_hdr = tb.Frame(cell_frame)
-                cell_hdr.pack(fill=X, padx=4, pady=2)
-                lbl_day = tb.Label(cell_hdr, text=day_hdr_text, font=("Segoe UI", 11, "bold"), anchor="w")
+                cell_hdr.pack(fill=X, padx=3, pady=(2, 0))
+                lbl_day = tb.Label(cell_hdr, text=day_hdr_text, font=("Segoe UI", 10, "bold"), anchor="w")
                 lbl_day.pack(side=LEFT)
+
+                lbl_note_tag = None
+                if note_tag_text:
+                    lbl_note_tag = tb.Label(
+                        cell_hdr,
+                        text=note_tag_text,
+                        font=("Segoe UI", 8, "bold"),
+                        anchor=E,
+                    )
+                    lbl_note_tag.pack(side=RIGHT)
                 
                 if day_envelopes:
                     day_total = sum(to_float(env["amount"], 0.0) for env in day_envelopes)
@@ -19202,36 +19233,30 @@ if HAS_DEPS:
                     all_approved = all(
                         str(env.get("status") or "").strip() == "Approved" for env in day_envelopes
                     )
-                    # Green only when every location has an envelope AND all are approved.
-                    # Red if a location is missing (e.g. only 1 of 2) or any envelope is pending.
                     complete_and_approved = locations_complete and all_approved and len(day_envelopes) > 0
 
                     if complete_and_approved:
                         cell_frame.config(bootstyle="success")
                         cell_hdr.config(bootstyle="success")
                         lbl_day.config(bootstyle="inverse-success")
+                        if lbl_note_tag:
+                            lbl_note_tag.config(bootstyle="inverse-success")
                         loc_count = f"{len(present_locs)}/{len(required_locations)}" if required_locations else str(len(day_envelopes))
-                        lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 11, "bold"), bootstyle="inverse-success")
-                        lbl_amount.pack(pady=3)
+                        lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 10, "bold"), bootstyle="inverse-success")
+                        lbl_amount.pack(pady=(2, 1))
                         lbl_count = tb.Label(
                             cell_frame,
                             text=f"{loc_count} {self._tr('Approved')}",
                             font=("Segoe UI", 8),
                             bootstyle="inverse-success",
                         )
-                        lbl_count.pack()
-                        if note_tag_text:
-                            lbl_note_tag = tb.Label(
-                                cell_frame,
-                                text=note_tag_text,
-                                font=("Segoe UI", 8, "bold"),
-                                bootstyle="inverse-success",
-                            )
-                            lbl_note_tag.pack(pady=(2, 0))
+                        lbl_count.pack(pady=(0, 2))
                     else:
                         cell_frame.config(bootstyle="danger")
                         cell_hdr.config(bootstyle="danger")
                         lbl_day.config(bootstyle="inverse-danger")
+                        if lbl_note_tag:
+                            lbl_note_tag.config(bootstyle="inverse-danger")
 
                         if missing_locs:
                             branch_text = f"{self._tr('Missing')}: {', '.join(missing_locs)}"
@@ -19243,37 +19268,25 @@ if HAS_DEPS:
                             )))
                             branch_text = ", ".join(issue_locations) if issue_locations else self._tr("Pending")
 
-                        lbl_branch = tb.Label(cell_hdr, text=branch_text, font=("Segoe UI", 8, "bold"), bootstyle="inverse-danger", anchor=E)
-                        lbl_branch.pack(side=RIGHT, padx=(4, 0))
+                        if not note_tag_text:
+                            lbl_branch = tb.Label(cell_hdr, text=branch_text, font=("Segoe UI", 8, "bold"), bootstyle="inverse-danger", anchor=E)
+                            lbl_branch.pack(side=RIGHT, padx=(2, 0))
 
-                        lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 11, "bold"), bootstyle="inverse-danger")
-                        lbl_amount.pack(pady=(2, 2))
+                        lbl_amount = tb.Label(cell_frame, text=f"${day_total:,.2f}", font=("Segoe UI", 10, "bold"), bootstyle="inverse-danger")
+                        lbl_amount.pack(pady=(2, 1))
                         if required_locations:
-                            status_txt = f"{len(present_locs)}/{len(required_locations)} {self._tr('locations')}"
+                            loc_str = f"{len(present_locs)}/{len(required_locations)} {self._tr('locations')}"
+                            status_txt = f"{loc_str} • {branch_text}" if note_tag_text else loc_str
                         else:
                             status_txt = f"{len(day_envelopes)} {self._tr('Pending')}"
                         lbl_count = tb.Label(cell_frame, text=status_txt, font=("Segoe UI", 8), bootstyle="inverse-danger")
-                        lbl_count.pack()
-                        if note_tag_text:
-                            lbl_note_tag = tb.Label(
-                                cell_frame,
-                                text=note_tag_text,
-                                font=("Segoe UI", 8, "bold"),
-                                bootstyle="inverse-danger",
-                            )
-                            lbl_note_tag.pack(pady=(2, 0))
+                        lbl_count.pack(pady=(0, 2))
                 else:
                     cell_frame.config(bootstyle="light")
                     cell_hdr.config(bootstyle="light")
                     lbl_day.config(bootstyle="secondary")
-                    if note_tag_text:
-                        lbl_note_tag = tb.Label(
-                            cell_frame,
-                            text=note_tag_text,
-                            font=("Segoe UI", 8, "bold"),
-                            bootstyle="warning",
-                        )
-                        lbl_note_tag.pack(pady=4)
+                    if lbl_note_tag:
+                        lbl_note_tag.config(bootstyle="warning")
                     
                 click_date = f"{year}-{month:02d}-{day:02d}"
                 
