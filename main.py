@@ -638,8 +638,8 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.15"
-APP_BUILD_DATE = "2026-09-04"
+APP_VERSION = "2.5.16"
+APP_BUILD_DATE = "2026-09-05"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
 
@@ -8351,13 +8351,19 @@ if HAS_DEPS:
             dlg.minsize(700, 520)
             try:
                 dlg.transient(self)
-                dlg.grab_set()
             except Exception:
                 pass
+            self._safe_grab_set(dlg)
+
+            def _close_app_updates():
+                self._safe_grab_release(dlg)
+                dlg.destroy()
+
+            dlg.protocol("WM_DELETE_WINDOW", _close_app_updates)
 
             bottom_bar = tb.Frame(dlg, padding=(14, 10))
             bottom_bar.pack(side=BOTTOM, fill=X)
-            tb.Button(bottom_bar, text=self._tr("Close"), bootstyle="secondary", width=12, command=dlg.destroy).pack(side=RIGHT)
+            tb.Button(bottom_bar, text=self._tr("Close"), bootstyle="secondary", width=12, command=_close_app_updates).pack(side=RIGHT)
 
             content_frame = tb.Frame(dlg)
             content_frame.pack(side=TOP, fill=BOTH, expand=True)
@@ -9101,6 +9107,7 @@ if HAS_DEPS:
                 win.lift()
                 win.focus_force()
                 win.attributes("-topmost", True)
+                win.after(250, lambda: win.attributes("-topmost", False) if win and win.winfo_exists() else None)
             except Exception:
                 pass
             self._register_modal_popup(win)
@@ -9481,9 +9488,15 @@ if HAS_DEPS:
             dialog.title(self._tr("⚙️ Customize Table Columns"))
             dialog.geometry("520x620")
             dialog.transient(parent)
-            dialog.grab_set()
+            self._safe_grab_set(dialog)
             dialog.focus_set()
             
+            def _close_col_dialog():
+                self._safe_grab_release(dialog)
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", _close_col_dialog)
+
             main_f = tb.Frame(dialog, padding=20)
             main_f.pack(fill=BOTH, expand=True)
             
@@ -9549,7 +9562,7 @@ if HAS_DEPS:
                         new_hidden.add(self._tr(col_key))
                 save_calendar_hidden_columns(new_hidden)
                 self.refresh_calendar_column_visibility()
-                dialog.destroy()
+                _close_col_dialog()
                 messagebox.showinfo(
                     self._tr("Columns Updated"),
                     self._tr("Table columns display updated successfully."),
@@ -9563,7 +9576,7 @@ if HAS_DEPS:
             tb.Button(btn_f, text=self._tr("Save & Apply"), bootstyle="success", cursor="hand2", command=_save_and_apply).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Select All"), bootstyle="secondary-outline", cursor="hand2", command=lambda: _select_all_cols(True)).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=lambda: (_select_all_cols(True), check_vars.get("Written Up", tk.BooleanVar()).set(False))).pack(side=LEFT, padx=5)
-            tb.Button(btn_f, text=self._tr("Cancel"), bootstyle="secondary", cursor="hand2", command=dialog.destroy).pack(side=RIGHT, padx=5)
+            tb.Button(btn_f, text=self._tr("Cancel"), bootstyle="secondary", cursor="hand2", command=_close_col_dialog).pack(side=RIGHT, padx=5)
 
         def refresh_calendar_column_visibility(self):
             """Apply current hidden columns to tree_calendar."""
@@ -9777,9 +9790,15 @@ if HAS_DEPS:
                 win.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
                 win.geometry("1000x640")
-            win.grab_set()
+            self._safe_grab_set(win)
             win.focus_force()
             self._present_window(win)
+
+            def _close_shop_files():
+                self._safe_grab_release(win)
+                win.destroy()
+
+            win.protocol("WM_DELETE_WINDOW", _close_shop_files)
 
             self._shop_files_location = None
             self._shop_files_doc_map = {}
@@ -9797,7 +9816,7 @@ if HAS_DEPS:
                 text=self._tr("Close Window"),
                 bootstyle="light",
                 cursor="hand2",
-                command=win.destroy,
+                command=_close_shop_files,
             ).pack(side=RIGHT)
 
             self._shop_files_subtitle = tb.Label(
@@ -16383,20 +16402,33 @@ if HAS_DEPS:
                 if rec:
                     self.open_edit_record_dialog(rec_id, rec)
 
-        def open_settings_password_prompt(self):
+        def open_settings_password_prompt(self, default_tab=None):
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("⚙️ Enter Password"))
             dialog.geometry("400x250")
-            dialog.transient(self)
-            dialog.grab_set()
+            try:
+                dialog.transient(self)
+            except Exception:
+                pass
+            self._safe_grab_set(dialog)
+            self._present_window(dialog)
             dialog.focus_set()
             
             # Center on screen
-            sw = dialog.winfo_screenwidth()
-            sh = dialog.winfo_screenheight()
-            x = (sw - 400) // 2
-            y = (sh - 250) // 2
-            dialog.geometry(f"400x250+{x}+{y}")
+            try:
+                sw = dialog.winfo_screenwidth()
+                sh = dialog.winfo_screenheight()
+                x = (sw - 400) // 2
+                y = (sh - 250) // 2
+                dialog.geometry(f"400x250+{x}+{y}")
+            except Exception:
+                pass
+
+            def _close_prompt():
+                self._safe_grab_release(dialog)
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", _close_prompt)
             
             tb.Label(dialog, text=self._tr("Password:"), font=("Segoe UI", 12, "bold")).pack(pady=20)
             
@@ -16437,36 +16469,26 @@ if HAS_DEPS:
                         row = cursor.fetchone()
                     conn.close()
                 except Exception as e:
-                    try:
-                        if _is_dead_pg_error(e) or _is_connectivity_error(e):
-                            get_shared_supabase_conn(force_reconnect=True)
-                            conn = sqlite3.connect(TEMP_DB_PATH)
-                            cursor = conn.cursor()
-                            cursor.execute("SELECT password FROM users WHERE username=?", (who,))
-                            row = cursor.fetchone()
-                            if not row:
-                                cursor.execute("SELECT password FROM users WHERE username=?", (DEFAULT_ADMIN_USERNAME,))
-                                row = cursor.fetchone()
-                            conn.close()
-                        else:
-                            raise
-                    except Exception as e2:
-                        messagebox.showerror("Error", f"Could not verify password:\n{e2}", parent=dialog)
-                        return
+                    messagebox.showerror("Error", f"Could not verify password:\n{e}", parent=dialog)
+                    return
                 
                 if row:
                     stored_pw = decrypt_val(row[0]) if row[0] is not None else None
                     import hashlib
                     hashed_input = hashlib.sha256(entered_pw.encode('utf-8')).hexdigest()
                     if stored_pw == hashed_input or stored_pw == entered_pw:
+                        self._safe_grab_release(dialog)
                         dialog.destroy()
-                        self.open_settings_dialog()
+                        self.after(50, lambda: self.open_settings_dialog(default_tab=default_tab))
                         return
                 
                 messagebox.showerror("Error", "Invalid Password.", parent=dialog)
                 
             pw_entry.bind("<Return>", check_password)
-            tb.Button(dialog, text=self._tr("Unlock"), bootstyle="primary", command=check_password).pack(pady=10)
+            btn_box = tb.Frame(dialog)
+            btn_box.pack(pady=10)
+            tb.Button(btn_box, text=self._tr("Unlock"), bootstyle="primary", command=check_password).pack(side=LEFT, padx=5)
+            tb.Button(btn_box, text=self._tr("Cancel"), bootstyle="secondary", command=_close_prompt).pack(side=LEFT, padx=5)
 
         def _build_activity_and_backup_panel(self, parent):
             """Per-user activity log and twice-daily Supabase backups."""
@@ -16493,7 +16515,7 @@ if HAS_DEPS:
             def _act_mousewheel(event):
                 try:
                     if getattr(event, "delta", 0):
-                        delta = int(-1 * (event.delta / 120))
+                        delta = int(-1 * (event.delta / 120)) if platform.system() != "Darwin" else int(-1 * event.delta)
                     elif getattr(event, "num", 0) == 5:
                         delta = 1
                     elif getattr(event, "num", 0) == 4:
@@ -16518,10 +16540,13 @@ if HAS_DEPS:
                 except Exception:
                     pass
 
-            canvas.bind("<Enter>", _bind_wheel)
-            canvas.bind("<Leave>", _unbind_wheel)
-            inner.bind("<Enter>", _bind_wheel)
-            inner.bind("<Leave>", _unbind_wheel)
+            if platform.system() == "Darwin":
+                canvas.bind("<MouseWheel>", _act_mousewheel)
+            else:
+                canvas.bind("<Enter>", _bind_wheel)
+                canvas.bind("<Leave>", _unbind_wheel)
+                inner.bind("<Enter>", _bind_wheel)
+                inner.bind("<Leave>", _unbind_wheel)
 
             vscroll.pack(side=RIGHT, fill=Y)
             canvas.pack(side=LEFT, fill=BOTH, expand=True)
@@ -16534,13 +16559,21 @@ if HAS_DEPS:
             row_dates.pack(fill=X, pady=(0, 8))
 
             tb.Label(row_dates, text=self._tr("From Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
-            start_dt_ent = tb.DateEntry(row_dates, bootstyle="primary", dateformat='%Y-%m-%d', width=10)
+            if platform.system() == "Darwin":
+                start_dt_ent = tb.Entry(row_dates, width=12)
+                start_dt_ent.entry = start_dt_ent
+            else:
+                start_dt_ent = tb.DateEntry(row_dates, bootstyle="primary", dateformat='%Y-%m-%d', width=10)
             start_dt_ent.entry.delete(0, tk.END)
             start_dt_ent.entry.insert(0, (datetime.today() - timedelta(days=30)).strftime('%Y-%m-%d'))
             start_dt_ent.pack(side=LEFT, padx=(0, 16))
 
             tb.Label(row_dates, text=self._tr("To Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 4))
-            end_dt_ent = tb.DateEntry(row_dates, bootstyle="primary", dateformat='%Y-%m-%d', width=10)
+            if platform.system() == "Darwin":
+                end_dt_ent = tb.Entry(row_dates, width=12)
+                end_dt_ent.entry = end_dt_ent
+            else:
+                end_dt_ent = tb.DateEntry(row_dates, bootstyle="primary", dateformat='%Y-%m-%d', width=10)
             end_dt_ent.entry.delete(0, tk.END)
             end_dt_ent.entry.insert(0, datetime.today().strftime('%Y-%m-%d'))
             end_dt_ent.pack(side=LEFT)
@@ -17746,7 +17779,7 @@ if HAS_DEPS:
                 justify=LEFT,
             ).pack(anchor=W, pady=(0, 8))
 
-            cur_central_min = get_central_min_required_version()
+            cur_central_min = MIN_REQUIRED_VERSION
             lbl_central_status = tb.Label(
                 policy_lf,
                 text=f"Currently Enforced Minimum: v{cur_central_min}   |   Current Running App: v{APP_VERSION}",
@@ -17762,6 +17795,32 @@ if HAS_DEPS:
             ent_min_ver = tb.Entry(pol_row, width=12, font=("Segoe UI", 10))
             ent_min_ver.insert(0, cur_central_min)
             ent_min_ver.pack(side=LEFT, padx=(0, 10))
+
+            def _async_load_central_min():
+                def _worker():
+                    try:
+                        m_ver = get_central_min_required_version()
+                        def _apply():
+                            try:
+                                if not dialog.winfo_exists():
+                                    return
+                                lbl_central_status.configure(
+                                    text=f"Currently Enforced Minimum: v{m_ver}   |   Current Running App: v{APP_VERSION}"
+                                )
+                                ent_min_ver.delete(0, tk.END)
+                                ent_min_ver.insert(0, m_ver)
+                            except Exception:
+                                pass
+                        top.after(0, _apply)
+                    except Exception:
+                        pass
+                import threading
+                threading.Thread(target=_worker, daemon=True).start()
+
+            try:
+                dialog.after(100, _async_load_central_min)
+            except Exception:
+                pass
 
             def _save_enforced_version():
                 val = ent_min_ver.get().strip()
@@ -17831,9 +17890,6 @@ if HAS_DEPS:
             self._attach_tree_scrollbars(hist_holder, hist_tree)
 
             def load_update_logs():
-                for item in hist_tree.get_children():
-                    hist_tree.delete(item)
-                
                 rows_found = []
                 try:
                     conn = sqlite3.connect(TEMP_DB_PATH)
@@ -17852,43 +17908,59 @@ if HAS_DEPS:
                 except Exception:
                     pass
 
-                if get_db_mode() == "supabase" and not is_supabase_offline():
+                def _render_rows(rf_list):
                     try:
-                        pg = get_shared_supabase_conn()
-                        cur = pg.cursor()
-                        cur.execute(
-                            """
-                            SELECT created_at, user_name, action, summary
-                            FROM user_action_log
-                            WHERE action LIKE 'app_%' OR action LIKE 'update_%' OR action = 'set_min_app_version'
-                            ORDER BY created_at DESC LIMIT 50
-                            """
-                        )
-                        for r in cur.fetchall() or []:
-                            rows_found.append((r[0] or "", plain_label(r[1]) or "", r[2] or "", r[3] or ""))
+                        if not dialog.winfo_exists():
+                            return
+                        for item in hist_tree.get_children():
+                            hist_tree.delete(item)
+                        seen = set()
+                        final_rows = []
+                        for rf in rf_list:
+                            sig = (rf[0], rf[1], rf[2], rf[3])
+                            if sig not in seen:
+                                seen.add(sig)
+                                final_rows.append(rf)
+                        final_rows.sort(key=lambda x: str(x[0]), reverse=True)
+
+                        for r in final_rows[:40]:
+                            act = r[2]
+                            act_label = {
+                                "app_update": "🚀 Update Installed",
+                                "app_rollback": "⏮️ Rolled Back",
+                                "update_crash": "⚠️ Crash / Safe Mode",
+                                "app_update_check": "🔍 Update Checked",
+                                "update_syntax_error": "❌ Syntax Rejected",
+                                "set_min_app_version": "🛡️ Enforced Min Version",
+                            }.get(act, act)
+                            hist_tree.insert("", tk.END, values=(r[0], r[1], act_label, r[3]))
                     except Exception:
                         pass
 
-                seen = set()
-                final_rows = []
-                for rf in rows_found:
-                    sig = (rf[0], rf[1], rf[2], rf[3])
-                    if sig not in seen:
-                        seen.add(sig)
-                        final_rows.append(rf)
-                final_rows.sort(key=lambda x: str(x[0]), reverse=True)
+                _render_rows(rows_found)
 
-                for r in final_rows[:40]:
-                    act = r[2]
-                    act_label = {
-                        "app_update": "🚀 Update Installed",
-                        "app_rollback": "⏮️ Rolled Back",
-                        "update_crash": "⚠️ Crash / Safe Mode",
-                        "app_update_check": "🔍 Update Checked",
-                        "update_syntax_error": "❌ Syntax Rejected",
-                        "set_min_app_version": "🛡️ Enforced Min Version",
-                    }.get(act, act)
-                    hist_tree.insert("", tk.END, values=(r[0], r[1], act_label, r[3]))
+                def _fetch_remote_logs():
+                    if get_db_mode() == "supabase" and not is_supabase_offline():
+                        try:
+                            pg = get_shared_supabase_conn()
+                            cur = pg.cursor()
+                            cur.execute(
+                                """
+                                SELECT created_at, user_name, action, summary
+                                FROM user_action_log
+                                WHERE action LIKE 'app_%' OR action LIKE 'update_%' OR action = 'set_min_app_version'
+                                ORDER BY created_at DESC LIMIT 50
+                                """
+                            )
+                            combined = list(rows_found)
+                            for r in cur.fetchall() or []:
+                                combined.append((r[0] or "", plain_label(r[1]) or "", r[2] or "", r[3] or ""))
+                            top.after(0, lambda: _render_rows(combined))
+                        except Exception:
+                            pass
+
+                import threading
+                threading.Thread(target=_fetch_remote_logs, daemon=True).start()
 
             tb.Button(hist_lf, text=self._tr("🔄 Refresh History Log"), bootstyle="secondary outline", command=load_update_logs).pack(anchor=W, pady=(8, 0))
             load_update_logs()
@@ -17905,19 +17977,29 @@ if HAS_DEPS:
                 dialog.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
                 dialog.geometry("860x700")
-            dialog.transient(self)
-            dialog.grab_set()
+            try:
+                dialog.transient(self)
+            except Exception:
+                pass
+            self._safe_grab_set(dialog)
             dialog.focus_set()
             
             notebook = tb.Notebook(dialog, bootstyle="info")
             footer = tb.Frame(dialog)
             footer.pack(side=BOTTOM, fill=X, padx=20, pady=(6, 14))
+
+            def _close_settings():
+                self._safe_grab_release(dialog)
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", _close_settings)
+
             tb.Button(
                 footer,
                 text=self._tr("Close Window"),
                 bootstyle="secondary",
                 cursor="hand2",
-                command=dialog.destroy,
+                command=_close_settings,
             ).pack(side=RIGHT)
             notebook.pack(fill=BOTH, expand=True, padx=20, pady=(16, 4))
             
@@ -18226,7 +18308,9 @@ if HAS_DEPS:
 
             def _comm_mousewheel(event):
                 try:
-                    comm_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                    delta = int(-1 * (event.delta / 120)) if platform.system() != "Darwin" else int(-1 * event.delta)
+                    if delta:
+                        comm_canvas.yview_scroll(delta, "units")
                 except Exception:
                     pass
 
@@ -18243,10 +18327,13 @@ if HAS_DEPS:
                 except Exception:
                     pass
 
-            comm_canvas.bind("<Enter>", _bind_comm_wheel)
-            comm_canvas.bind("<Leave>", _unbind_comm_wheel)
-            comm_inner.bind("<Enter>", _bind_comm_wheel)
-            comm_inner.bind("<Leave>", _unbind_comm_wheel)
+            if platform.system() == "Darwin":
+                comm_canvas.bind("<MouseWheel>", _comm_mousewheel)
+            else:
+                comm_canvas.bind("<Enter>", _bind_comm_wheel)
+                comm_canvas.bind("<Leave>", _unbind_comm_wheel)
+                comm_inner.bind("<Enter>", _bind_comm_wheel)
+                comm_inner.bind("<Leave>", _unbind_comm_wheel)
 
             comm_scroll.pack(side=RIGHT, fill=Y)
             comm_canvas.pack(side=LEFT, fill=BOTH, expand=True)
@@ -18506,7 +18593,7 @@ if HAS_DEPS:
 
             _build_tier_editor(comm_inner, self._tr("Service sales commissions"), "service")
             _build_tier_editor(comm_inner, self._tr("Product sales commissions"), "product")
-            dialog.bind("<Destroy>", lambda e: _unbind_comm_wheel())
+            dialog.bind("<Destroy>", lambda e: _unbind_comm_wheel() if getattr(e, "widget", None) is dialog else None, add="+")
 
             tab_cols = tb.Frame(notebook, padding=24)
             notebook.add(tab_cols, text=self._tr("📊 Table Columns"))
@@ -18724,9 +18811,19 @@ if HAS_DEPS:
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("Delete Month Envelopes"))
             dialog.geometry("440x240")
-            dialog.transient(self)
-            dialog.grab_set()
+            try:
+                dialog.transient(self)
+            except Exception:
+                pass
+            self._safe_grab_set(dialog)
             self._present_window(dialog)
+
+            def _close_del_dlg():
+                self._safe_grab_release(dialog)
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", _close_del_dlg)
+
             ym = self.cash_year_month()
             tb.Label(
                 dialog,
@@ -18764,14 +18861,14 @@ if HAS_DEPS:
                         cur.execute(f"DELETE FROM expenses WHERE id IN ({placeholders})", ids)
                         commit_and_save(conn)
                     conn.close()
-                    dialog.destroy()
+                    _close_del_dlg()
                     self.load_cash_calendar_data(quiet=True)
                     messagebox.showinfo("Deleted", f"Removed {len(ids)} envelope(s) for {ym}.", parent=self)
                 except Exception as e:
                     messagebox.showerror("Error", str(e), parent=dialog)
 
             tb.Button(dialog, text=self._tr("Delete Month Envelopes"), bootstyle="danger", command=do_delete).pack(pady=16)
-            tb.Button(dialog, text=self._tr("Cancel"), bootstyle="secondary", command=dialog.destroy).pack()
+            tb.Button(dialog, text=self._tr("Cancel"), bootstyle="secondary", command=_close_del_dlg).pack()
 
         def open_cash_month_lock_dialog(self):
             import calendar
@@ -18782,9 +18879,19 @@ if HAS_DEPS:
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("Unlock Month") if locked else self._tr("Lock Month"))
             dialog.geometry("480x340")
-            dialog.transient(self)
-            dialog.grab_set()
+            try:
+                dialog.transient(self)
+            except Exception:
+                pass
+            self._safe_grab_set(dialog)
+            self._present_window(dialog)
             dialog.focus_set()
+
+            def _close_lock_dlg():
+                self._safe_grab_release(dialog)
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", _close_lock_dlg)
 
             if locked:
                 explain = (
@@ -18844,7 +18951,7 @@ if HAS_DEPS:
                         )
                     commit_and_save(conn)
                     conn.close()
-                    dialog.destroy()
+                    _close_lock_dlg()
                     self.load_cash_calendar_data(quiet=True)
                     messagebox.showinfo(
                         "Success",
@@ -18857,7 +18964,7 @@ if HAS_DEPS:
             btn_row = tb.Frame(dialog)
             btn_row.pack(pady=20)
             tb.Button(btn_row, text=confirm_label, bootstyle=boot, command=do_confirm).pack(side=LEFT, padx=8)
-            tb.Button(btn_row, text=self._tr("Cancel"), bootstyle="secondary", command=dialog.destroy).pack(side=LEFT, padx=8)
+            tb.Button(btn_row, text=self._tr("Cancel"), bootstyle="secondary", command=_close_lock_dlg).pack(side=LEFT, padx=8)
 
         def prev_cash_month(self):
             self.cash_cal_month -= 1
