@@ -638,8 +638,8 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.17"
-APP_BUILD_DATE = "2026-09-05"
+APP_VERSION = "2.5.18"
+APP_BUILD_DATE = "2026-09-09"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
 
@@ -9126,23 +9126,22 @@ if HAS_DEPS:
                 pass
             try:
                 win.lift()
-                win.focus_force()
-                win.attributes("-topmost", True)
-                win.after(250, lambda: win.attributes("-topmost", False) if win and win.winfo_exists() else None)
+                if platform.system() != "Darwin":
+                    win.focus_force()
+                    win.attributes("-topmost", True)
+                    win.after(250, lambda: win.attributes("-topmost", False) if win and win.winfo_exists() else None)
+                else:
+                    win.focus_set()
             except Exception:
                 pass
-            self._register_modal_popup(win)
+            if platform.system() != "Darwin":
+                self._register_modal_popup(win)
 
         def _safe_grab_set(self, win):
             """Modal grab without nested grabs. Skip entirely on macOS Aqua Tk."""
-            if win is None:
+            if win is None or platform.system() == "Darwin":
                 return
             self._register_modal_popup(win)
-            try:
-                if platform.system() == "Darwin":
-                    return
-            except Exception:
-                pass
             try:
                 current = win.grab_current()
                 if current is not None:
@@ -12264,10 +12263,15 @@ if HAS_DEPS:
 
                     notes = plain_label(ex[3]) if len(ex) > 3 and ex[3] else ""
                     tip_given_val = to_float(ex[5], 0.0) if len(ex) > 5 else 0.0
-                    if is_tip_expense and tip_given_val:
-                        tip_note = f"{self._tr('Tip given to employee:')} ${tip_given_val:,.2f}"
+                    base_exp = to_float(ex[2], 0.0)
+                    if is_tip_expense and tip_given_val > 0:
+                        total_payout = base_exp + tip_given_val
+                        tip_note = f"{self._tr('Tip given to employee:')} ${tip_given_val:,.2f} (Base: ${base_exp:,.2f} + Tip: ${tip_given_val:,.2f} = Total: ${total_payout:,.2f})"
                         notes = f"{notes} — {tip_note}".strip(" —") if notes else tip_note
-                    combined.append((ex[0], "", category_name, None, None, None, None, None, None, ex[2], notes, 'expense'))
+                        exp_amount = total_payout
+                    else:
+                        exp_amount = base_exp
+                    combined.append((ex[0], "", category_name, None, None, None, None, None, None, exp_amount, notes, 'expense'))
                     
                 # Sort descending by date
                 combined.sort(key=lambda x: x[0], reverse=True)
@@ -13989,17 +13993,22 @@ if HAS_DEPS:
                     continue
                 cycle_disp = cycle_label(cycle_key_val) if cycle_key_val else ""
 
-                if is_tip_flag.lower() in ("yes", "true", "1") and tip_given_val:
-                    tip_note = f"{self._tr('Tip given to employee:')} ${tip_given_val:,.2f}"
+                has_tip = is_tip_flag.lower() in ("yes", "true", "1") and tip_given_val > 0
+                if has_tip:
+                    total_payout = amt_val + tip_given_val
+                    tip_note = f"{self._tr('Tip given to employee:')} ${tip_given_val:,.2f} (Base: ${amt_val:,.2f} + Tip: ${tip_given_val:,.2f} = Total: ${total_payout:,.2f})"
                     desc = f"{desc}  ·  {tip_note}".strip(" ·") if desc else tip_note
+                    effective_amt = total_payout
+                else:
+                    effective_amt = amt_val
                 
                 if is_income_expense_category(category):
                     total_revenue += amt_val
                     formatted_amt = f"+${amt_val:,.2f}"
                     row_tag = ("income",)
                 else:
-                    total_amt += amt_val
-                    formatted_amt = f"-${amt_val:,.2f}"
+                    total_amt += effective_amt
+                    formatted_amt = f"-${effective_amt:,.2f}"
                     row_tag = ("expense",)
                     
                 if category == "Cash Envelope Received" and assignee_name:
@@ -14504,6 +14513,29 @@ if HAS_DEPS:
                 font=("Segoe UI", 8),
                 bootstyle="secondary",
             )
+            lbl_total_paid_preview = tb.Label(
+                form,
+                text="",
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="success",
+            )
+
+            def _update_tip_preview(*_):
+                if cat_cbo.get() == "Salary Payment" and tip_var.get():
+                    try:
+                        b_amt = float(str(amt_ent.get() or "0").replace(",", "").replace("$", "").strip() or 0)
+                    except Exception:
+                        b_amt = 0.0
+                    try:
+                        t_amt = float(str(tip_given_ent.get() or "0").replace(",", "").replace("$", "").strip() or 0)
+                    except Exception:
+                        t_amt = 0.0
+                    total_p = b_amt + t_amt
+                    lbl_total_paid_preview.config(
+                        text=f"💵 {self._tr('Total Paid to Employee (Salary + Tip):')} ${total_p:,.2f}"
+                    )
+                else:
+                    lbl_total_paid_preview.config(text="")
 
             # Received From field (row 3)
             lbl_assignee = tb.Label(form, text=self._tr("Received From:"), font=("Segoe UI", 10, "bold"))
@@ -14686,6 +14718,14 @@ if HAS_DEPS:
                 r = 5 + extra
                 lbl_amt.grid(row=r, column=0, **pad)
                 amt_ent.grid(row=r, column=1, **ent_pad)
+                if cat == "Salary Payment" and tip_var.get():
+                    extra += 1
+                    r = 5 + extra
+                    lbl_total_paid_preview.grid(row=r, column=1, sticky=W, padx=12, pady=(0, 4))
+                    _update_tip_preview()
+                else:
+                    lbl_total_paid_preview.grid_remove()
+
                 lbl_status.grid(row=r + 1, column=0, **pad)
                 status_cbo.grid(row=r + 1, column=1, **ent_pad)
                 lbl_pay.grid(row=r + 2, column=0, **pad)
@@ -14700,6 +14740,8 @@ if HAS_DEPS:
 
             tip_chk.configure(command=layout_conditional_fields)
             cat_cbo.bind("<<ComboboxSelected>>", layout_conditional_fields)
+            tip_given_ent.bind("<KeyRelease>", _update_tip_preview)
+            amt_ent.bind("<KeyRelease>", _update_tip_preview)
             layout_conditional_fields()
             
             def save_expense():
@@ -15927,7 +15969,7 @@ if HAS_DEPS:
                         summary_data[e_id]["tips"] += to_float(tip, 0.0)
                         
                 cursor.execute('''
-                    SELECT employee_id, category, amount
+                    SELECT employee_id, category, amount, is_tip, tip_given
                     FROM expenses
                     WHERE expense_date >= ? AND expense_date <= ?
                 ''', (from_d, to_d))
@@ -15935,8 +15977,12 @@ if HAS_DEPS:
                     if row is None or len(row) < 3:
                         continue
                     emp_id, cat, amt = row[0], row[1], row[2]
+                    is_tip_val = plain_label(row[3]) if len(row) > 3 else ""
+                    tip_g = to_float(row[4], 0.0) if len(row) > 4 else 0.0
                     e_id = emp_id if emp_id else shop_id
                     amt_val = to_float(amt, 0.0)
+                    if is_tip_val.lower() in ("yes", "true", "1") and tip_g > 0:
+                        amt_val += tip_g
                     cat_plain = plain_label(cat)
                     if e_id in summary_data:
                         if is_income_expense_category(cat_plain):
@@ -16331,7 +16377,7 @@ if HAS_DEPS:
             
             # Fetch expenses list
             query_ex = '''
-                SELECT id, expense_date, employee_id, category, amount, description, cycle_key
+                SELECT id, expense_date, employee_id, category, amount, description, cycle_key, is_tip, tip_given
                 FROM expenses
                 WHERE expense_date >= ? AND expense_date <= ?
             '''
@@ -16355,6 +16401,10 @@ if HAS_DEPS:
                     continue
                 emp_name = name_map.get(e_id, "General/None")
                 amount = to_float(amount, 0.0)
+                is_tip_val = plain_label(row[7]) if len(row) > 7 else ""
+                tip_g = to_float(row[8], 0.0) if len(row) > 8 else 0.0
+                if is_tip_val.lower() in ("yes", "true", "1") and tip_g > 0:
+                    amount = amount + tip_g
                 cat_plain = plain_label(category)
                 
                 is_income = is_income_expense_category(cat_plain)
@@ -16427,10 +16477,11 @@ if HAS_DEPS:
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("⚙️ Enter Password"))
             dialog.geometry("400x250")
-            try:
-                dialog.transient(self)
-            except Exception:
-                pass
+            if platform.system() != "Darwin":
+                try:
+                    dialog.transient(self)
+                except Exception:
+                    pass
             self._safe_grab_set(dialog)
             self._present_window(dialog)
             dialog.focus_set()
@@ -16527,6 +16578,9 @@ if HAS_DEPS:
             canvas.configure(yscrollcommand=vscroll.set)
 
             def _on_canvas_configure(e):
+                if getattr(canvas, "_last_cfg_w", None) == e.width:
+                    return
+                canvas._last_cfg_w = e.width
                 try:
                     canvas.itemconfigure(win_id, width=e.width)
                 except Exception:
@@ -17032,41 +17086,17 @@ if HAS_DEPS:
             btn_container = tb.Frame(bak_lf)
             btn_container.pack(fill=X, pady=(10, 0))
 
-            b_refresh = tb.Button(btn_container, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all)
-            b_backup = tb.Button(btn_container, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now)
-            b_restore = tb.Button(btn_container, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore)
-            b_download = tb.Button(btn_container, text=self._tr("💾 Download Selected File"), bootstyle="info outline", command=do_download_backup)
-            b_load = tb.Button(btn_container, text=self._tr("📂 Load Backup from Disk..."), bootstyle="primary outline", command=do_load_backup_file)
+            btn_row1 = tb.Frame(btn_container)
+            btn_row1.pack(fill=X, pady=2)
+            tb.Button(btn_row1, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row1, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row1, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT, padx=(0, 6))
 
-            action_buttons = [b_refresh, b_backup, b_restore, b_download, b_load]
-            button_subrows = []
+            btn_row2 = tb.Frame(btn_container)
+            btn_row2.pack(fill=X, pady=2)
+            tb.Button(btn_row2, text=self._tr("💾 Download Selected File"), bootstyle="info outline", command=do_download_backup).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row2, text=self._tr("📂 Load Backup from Disk..."), bootstyle="primary outline", command=do_load_backup_file).pack(side=LEFT, padx=(0, 6))
 
-            def reflow_buttons(event=None):
-                avail_w = btn_container.winfo_width()
-                if avail_w <= 10:
-                    return
-                for b in action_buttons:
-                    b.pack_forget()
-                for f in button_subrows:
-                    f.destroy()
-                button_subrows.clear()
-
-                cur_f = tb.Frame(btn_container)
-                cur_f.pack(fill=X, pady=2)
-                button_subrows.append(cur_f)
-                cur_w = 0
-                pad = 8
-                for b in action_buttons:
-                    req_w = b.winfo_reqwidth()
-                    if cur_w > 0 and (cur_w + req_w + pad) > avail_w:
-                        cur_f = tb.Frame(btn_container)
-                        cur_f.pack(fill=X, pady=2)
-                        button_subrows.append(cur_f)
-                        cur_w = 0
-                    b.pack(in_=cur_f, side=LEFT, padx=(0, pad))
-                    cur_w += req_w + pad
-
-            btn_container.bind("<Configure>", reflow_buttons)
             refresh_all()
 
         def _build_database_and_cloud_panel(self, parent, dialog):
@@ -17101,17 +17131,26 @@ if HAS_DEPS:
                 scroll_content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
                 win_id = canvas.create_window((0, 0), window=scroll_content, anchor="nw")
                 def _on_cfg(e):
-                    canvas.itemconfigure(win_id, width=e.width)
+                    if getattr(canvas, "_last_cfg_w", None) == e.width:
+                        return
+                    canvas._last_cfg_w = e.width
+                    try:
+                        canvas.itemconfigure(win_id, width=e.width)
+                    except Exception:
+                        pass
                 canvas.bind("<Configure>", _on_cfg)
                 canvas.configure(yscrollcommand=scrollbar.set)
                 
                 def _wheel(e):
                     try:
-                        delta = int(-1 * (e.delta / 120)) if getattr(e, "delta", 0) else (1 if getattr(e, "num", 0) == 5 else -1)
-                        canvas.yview_scroll(delta, "units")
+                        delta = int(-1 * (e.delta / 120)) if platform.system() != "Darwin" else int(-1 * (getattr(e, "delta", 0) or 0))
+                        if delta:
+                            canvas.yview_scroll(delta, "units")
                     except Exception:
                         pass
                 def _bind_w(w):
+                    if platform.system() == "Darwin":
+                        return
                     try:
                         w.bind("<MouseWheel>", _wheel, add="+")
                         w.bind("<Button-4>", _wheel, add="+")
@@ -17120,8 +17159,11 @@ if HAS_DEPS:
                         pass
                     for ch in w.winfo_children():
                         _bind_w(ch)
-                dialog.after(120, lambda: _bind_w(scroll_content))
-                dialog.after(120, lambda: _bind_w(canvas))
+                if platform.system() == "Darwin":
+                    canvas.bind("<MouseWheel>", _wheel)
+                else:
+                    dialog.after(120, lambda: _bind_w(scroll_content))
+                    dialog.after(120, lambda: _bind_w(canvas))
                 
                 canvas.pack(side=LEFT, fill=BOTH, expand=True)
                 scrollbar.pack(side=RIGHT, fill=Y)
@@ -17513,6 +17555,9 @@ if HAS_DEPS:
             canvas.configure(yscrollcommand=vscroll.set)
             
             def _on_canvas_configure(e):
+                if getattr(canvas, "_last_cfg_w", None) == e.width:
+                    return
+                canvas._last_cfg_w = e.width
                 try:
                     canvas.itemconfigure(win_id, width=e.width)
                 except Exception:
@@ -17990,18 +18035,20 @@ if HAS_DEPS:
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("⚙️ Config & Database Settings Panel"))
             try:
-                self.update_idletasks()
-                w = max(860, self.winfo_width())
-                h = max(700, self.winfo_height())
-                x = self.winfo_x()
-                y = self.winfo_y()
+                sw = dialog.winfo_screenwidth()
+                sh = dialog.winfo_screenheight()
+                w = min(880, max(760, sw - 40))
+                h = min(680, max(560, sh - 80))
+                x = max(10, (sw - w) // 2)
+                y = max(30, (sh - h) // 2)
                 dialog.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
-                dialog.geometry("860x700")
-            try:
-                dialog.transient(self)
-            except Exception:
-                pass
+                dialog.geometry("860x650")
+            if platform.system() != "Darwin":
+                try:
+                    dialog.transient(self)
+                except Exception:
+                    pass
             self._safe_grab_set(dialog)
             dialog.focus_set()
             
@@ -18320,6 +18367,9 @@ if HAS_DEPS:
             comm_canvas.configure(yscrollcommand=comm_scroll.set)
 
             def _comm_canvas_width(event):
+                if getattr(comm_canvas, "_last_cfg_w", None) == event.width:
+                    return
+                comm_canvas._last_cfg_w = event.width
                 try:
                     comm_canvas.itemconfigure(comm_win, width=event.width)
                 except Exception:
@@ -18636,8 +18686,15 @@ if HAS_DEPS:
             cols_sb = tb.Scrollbar(cols_scroll_f, orient=VERTICAL, command=cols_canvas.yview)
             cols_inner = tb.Frame(cols_canvas, padding=10)
             cols_inner.bind("<Configure>", lambda e: cols_canvas.configure(scrollregion=cols_canvas.bbox("all")))
-            cols_c_win = cols_canvas.create_window((0, 0), window=cols_inner, anchor="nw")
-            cols_canvas.bind("<Configure>", lambda e: cols_canvas.itemconfigure(cols_c_win, width=e.width))
+            def _on_cols_cfg(e):
+                if getattr(cols_canvas, "_last_cfg_w", None) == e.width:
+                    return
+                cols_canvas._last_cfg_w = e.width
+                try:
+                    cols_canvas.itemconfigure(cols_c_win, width=e.width)
+                except Exception:
+                    pass
+            cols_canvas.bind("<Configure>", _on_cols_cfg)
             cols_canvas.configure(yscrollcommand=cols_sb.set)
             
             cols_sb.pack(side=RIGHT, fill=Y)
