@@ -118,7 +118,94 @@ import json
 import gzip
 import threading
 from datetime import datetime, timedelta
-from contextlib import contextmanager
+import ssl
+
+def _configure_global_ssl():
+    """
+    Guarantees that HTTPS requests (cloud updates, license checks, Supabase sync)
+    never fail due to missing root certificates on new devices (especially fresh macOS
+    setups where Python does not link to Apple's system Keychain certificates).
+    """
+    ca_bundle = None
+    try:
+        import certifi
+        cafile = certifi.where()
+        if os.path.isfile(cafile):
+            ca_bundle = cafile
+    except Exception:
+        pass
+
+    if not ca_bundle and platform.system() in ("Darwin", "Linux"):
+        known_cert_paths = [
+            "/etc/ssl/cert.pem",
+            "/private/etc/ssl/cert.pem",
+            "/opt/homebrew/etc/openssl@3/cert.pem",
+            "/opt/homebrew/etc/openssl/cert.pem",
+            "/opt/homebrew/etc/ca-certificates/cert.pem",
+            "/usr/local/etc/openssl@3/cert.pem",
+            "/usr/local/etc/openssl/cert.pem",
+            "/etc/pki/tls/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+        ]
+        for cp in known_cert_paths:
+            if os.path.isfile(cp):
+                ca_bundle = cp
+                break
+
+    if ca_bundle:
+        try:
+            os.environ.setdefault("SSL_CERT_FILE", ca_bundle)
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_bundle)
+        except Exception:
+            pass
+
+    def _has_valid_cas():
+        try:
+            if ca_bundle and os.path.isfile(ca_bundle):
+                return True
+            ctx = ssl.create_default_context()
+            if len(ctx.get_ca_certs()) > 0:
+                return True
+            p = ssl.get_default_verify_paths()
+            if (p.cafile and os.path.isfile(p.cafile)) or (p.openssl_cafile and os.path.isfile(p.openssl_cafile)):
+                return True
+        except Exception:
+            pass
+        return False
+
+    if _has_valid_cas() and ca_bundle:
+        try:
+            ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=ca_bundle)
+        except Exception:
+            pass
+    elif not _has_valid_cas():
+        try:
+            ssl._create_default_https_context = ssl._create_unverified_context
+        except Exception:
+            pass
+
+    # On macOS, if running in standard Python and certifi is not yet installed,
+    # attempt to run Python's official Install Certificates command in background.
+    if platform.system() == "Darwin" and not getattr(sys, "frozen", False):
+        try:
+            import glob
+            cmd_files = glob.glob("/Applications/Python 3.*/Install Certificates.command")
+            if cmd_files:
+                target_cmd = sorted(cmd_files)[-1]
+                subprocess.Popen(
+                    ["/bin/bash", target_cmd],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+        except Exception:
+            pass
+
+try:
+    _configure_global_ssl()
+except Exception:
+    pass
 
 _FAILED_AUTO_INSTALL = set()
 
@@ -156,6 +243,7 @@ def auto_install_package(package_spec, import_name=None):
         [sys.executable, "-m", "pip", "install", "--break-system-packages", package_spec],
         [sys.executable, "-m", "pip", "install", package_spec],
         [sys.executable, "-m", "pip", "install", "--user", package_spec],
+        [sys.executable, "-m", "pip", "install", "--trusted-host", "pypi.org", "--trusted-host", "files.pythonhosted.org", "--trusted-host", "pypi.python.org", "--break-system-packages", package_spec],
     ]
 
     kw = {
@@ -457,6 +545,9 @@ TRANSLATIONS = {
     "Tip given to employee:": "البقشيش المعطى للموظف:",
     "How much of the tip did you give this employee?": "كم من البقشيش أعطيت لهذا الموظف؟",
     "Enter how much tip you gave the employee.": "أدخل مبلغ البقشيش الذي أعطيته للموظف.",
+    "Please select an employee before saving the expense.": "يرجى اختيار الموظف قبل حفظ المصروف.",
+    "Please select a valid employee from the list.": "يرجى اختيار موظف صالح من القائمة.",
+    "Please select a specific employee for Salary Payment.": "يرجى اختيار موظف محدد لدفع الراتب.",
     "Amazon Order": "طلب أمازون",
     "Expense Distribution": "توزيع المصروفات",
     "No expense data to display in chart": "لا توجد مصاريف لعرضها في المخطط",
@@ -638,7 +729,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.19"
+APP_VERSION = "2.5.21"
 APP_BUILD_DATE = "2026-09-09"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -14513,9 +14604,9 @@ if HAS_DEPS:
                         found = True
                         break
                 if not found:
-                    emp_cbo.set(gen_txt)
+                    emp_cbo.set("")
             else:
-                emp_cbo.set(gen_txt)
+                emp_cbo.set("")
             emp_cbo.grid(row=2, column=1, **ent_pad)
             
             tb.Label(form, text=self._tr("Category:"), font=("Segoe UI", 10, "bold")).grid(row=3, column=0, **pad)
@@ -14851,8 +14942,34 @@ if HAS_DEPS:
                         is_tip = "No"
                         tip_given = 0.0
                     else:
-                        emp_sel = emp_cbo.get()
+                        emp_sel = (emp_cbo.get() or "").strip()
+                        if not emp_sel or emp_sel not in emp_id_map:
+                            messagebox.showerror(
+                                "Error",
+                                self._tr("Please select an employee before saving the expense."),
+                                parent=dialog,
+                            )
+                            dialog._saving = False
+                            try:
+                                save_btn.config(state="normal")
+                                saving_lbl.pack_forget()
+                            except Exception:
+                                pass
+                            return
                         emp_id = emp_id_map.get(emp_sel)
+                        if category == "Salary Payment" and emp_id is None:
+                            messagebox.showerror(
+                                "Error",
+                                self._tr("Please select a specific employee for Salary Payment."),
+                                parent=dialog,
+                            )
+                            dialog._saving = False
+                            try:
+                                save_btn.config(state="normal")
+                                saving_lbl.pack_forget()
+                            except Exception:
+                                pass
+                            return
                         assignee_id = None
                         is_tip = "No"
                         tip_given = 0.0
