@@ -638,7 +638,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.18"
+APP_VERSION = "2.5.19"
 APP_BUILD_DATE = "2026-09-09"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -8743,6 +8743,12 @@ if HAS_DEPS:
             self.grid_rowconfigure(0, weight=1)
             self.grid_columnconfigure(0, weight=1)
             
+            # Top-right language switch button on Login Screen
+            lang_bar = tb.Frame(self)
+            lang_bar.place(relx=1.0, rely=0.0, anchor="ne", x=-16, y=16)
+            login_lang_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
+            tb.Button(lang_bar, text=login_lang_text, bootstyle="info outline", cursor="hand2", command=self.toggle_language).pack()
+            
             frame = tb.Frame(self, padding=40)
             frame.grid(row=0, column=0)
             frame.grid_columnconfigure(1, weight=1)
@@ -9693,7 +9699,10 @@ if HAS_DEPS:
 
             def _rebuild():
                 try:
-                    self.show_main_application()
+                    if getattr(self, "current_user", None) and getattr(self, "is_logged_in", False):
+                        self.show_main_application()
+                    else:
+                        self.show_login_page()
                 finally:
                     self._rebuilding_ui = False
 
@@ -9725,35 +9734,49 @@ if HAS_DEPS:
             self.grid_rowconfigure(0, weight=0)
             self.grid_columnconfigure(0, weight=0)
             
-            # Header
+            # Header (responsive layout tailored for 13" MacBook screens)
             header = tb.Frame(self, bootstyle="primary")
             header.pack(fill=X, side=TOP)
-            tb.Label(header, text=f"💈 {APP_TITLE}", font=("Segoe UI", 18, "bold"), bootstyle="inverse-primary").pack(side=LEFT, padx=20, pady=15)
             
             right_frame = tb.Frame(header, bootstyle="primary")
-            right_frame.pack(side=RIGHT, padx=20, pady=15)
+            right_frame.pack(side=RIGHT, padx=(4, 12), pady=8)
             
-            tb.Button(right_frame, text=self._tr("📁 Employee Folders"), bootstyle="success", cursor="hand2", command=self.open_folders_window).pack(side=LEFT, padx=10)
-            tb.Button(right_frame, text=self._tr("💸 Expense Reports"), bootstyle="warning", cursor="hand2", command=self.open_expenses_window).pack(side=LEFT, padx=10)
-            tb.Button(right_frame, text=self._tr("📁 Shop Files"), bootstyle="info", cursor="hand2", command=self.open_shop_files_window).pack(side=LEFT, padx=10)
-            tb.Button(right_frame, text=self._tr("⚙️ Settings"), bootstyle="secondary", cursor="hand2", command=self.open_settings_password_prompt).pack(side=LEFT, padx=10)
-            
+            # Language button pinned to far right of right_frame (100% visible on any resolution)
+            btn_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
+            tb.Button(right_frame, text=btn_text, bootstyle="info", cursor="hand2", command=self.toggle_language).pack(side=RIGHT, padx=(4, 0))
+
             username_to_show = getattr(self, "current_user", "admin")
-            logged_in_text = f"{self._tr('Logged in as')} {username_to_show.capitalize()}"
-            self.lbl_logged_in_user = tb.Label(right_frame, text=logged_in_text, font=("Segoe UI", 10), bootstyle="inverse-primary")
-            self.lbl_logged_in_user.pack(side=LEFT, padx=10)
+            self.lbl_logged_in_user = tb.Label(
+                right_frame,
+                text=f"👤 {username_to_show.capitalize()}",
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="inverse-primary"
+            )
+            self.lbl_logged_in_user.pack(side=RIGHT, padx=(4, 6))
 
             if get_db_mode() == "supabase":
                 self.lbl_live_sync = tb.Label(
                     right_frame,
                     text="☁️ " + self._tr("Connected"),
-                    font=("Segoe UI", 9),
+                    font=("Segoe UI", 8),
                     bootstyle="inverse-primary",
                 )
-                self.lbl_live_sync.pack(side=LEFT, padx=6)
-            
-            btn_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
-            tb.Button(right_frame, text=btn_text, bootstyle="info", cursor="hand2", command=self.toggle_language).pack(side=LEFT)
+                self.lbl_live_sync.pack(side=RIGHT, padx=(2, 6))
+
+            tb.Button(right_frame, text=self._tr("⚙️ Settings"), bootstyle="secondary", cursor="hand2", command=self.open_settings_password_prompt).pack(side=RIGHT, padx=3)
+            tb.Button(right_frame, text=self._tr("📁 Shop Files"), bootstyle="info", cursor="hand2", command=self.open_shop_files_window).pack(side=RIGHT, padx=3)
+            tb.Button(right_frame, text=self._tr("💸 Expense Reports"), bootstyle="warning", cursor="hand2", command=self.open_expenses_window).pack(side=RIGHT, padx=3)
+            tb.Button(right_frame, text=self._tr("📁 Employee Folders"), bootstyle="success", cursor="hand2", command=self.open_folders_window).pack(side=RIGHT, padx=3)
+
+            # Left side title (compact and responsive for 13" MacBook)
+            app_short_title = APP_TITLE.split(" - ")[0] if " - " in APP_TITLE else APP_TITLE
+            self.lbl_main_title = tb.Label(
+                header,
+                text=f"💈 {app_short_title}",
+                font=("Segoe UI", 13, "bold"),
+                bootstyle="inverse-primary",
+            )
+            self.lbl_main_title.pack(side=LEFT, padx=(12, 4), pady=8)
             
             # Dynamic Update Banner in Main Dashboard (Appears ONLY when update is available)
             self._main_upd_banner = tb.Frame(self)
