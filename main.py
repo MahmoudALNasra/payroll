@@ -548,6 +548,8 @@ TRANSLATIONS = {
     "Please select an employee before saving the expense.": "يرجى اختيار الموظف قبل حفظ المصروف.",
     "Please select a valid employee from the list.": "يرجى اختيار موظف صالح من القائمة.",
     "Please select a specific employee for Salary Payment.": "يرجى اختيار موظف محدد لدفع الراتب.",
+    "⛶ Fullscreen": "⛶ ملء الشاشة",
+    "🗗 Exit Fullscreen": "🗗 إنهاء ملء الشاشة",
     "Amazon Order": "طلب أمازون",
     "Expense Distribution": "توزيع المصروفات",
     "No expense data to display in chart": "لا توجد مصاريف لعرضها في المخطط",
@@ -729,7 +731,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.21"
+APP_VERSION = "2.5.22"
 APP_BUILD_DATE = "2026-09-09"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -18206,14 +18208,28 @@ if HAS_DEPS:
             try:
                 sw = dialog.winfo_screenwidth()
                 sh = dialog.winfo_screenheight()
-                w = min(880, max(760, sw - 40))
-                h = min(680, max(560, sh - 80))
-                x = max(10, (sw - w) // 2)
-                y = max(30, (sh - h) // 2)
-                dialog.geometry(f"{w}x{h}+{x}+{y}")
+                # On 13" MacBook Air (1440x900 / 1280x800) and compact displays,
+                # expand to full screen so all 10 tabs and settings panels have full space:
+                if platform.system() == "Darwin" or sw <= 1600:
+                    w = max(860, sw - 16)
+                    h = max(620, sh - 55)
+                    x = max(0, (sw - w) // 2)
+                    y = 26
+                    dialog.geometry(f"{w}x{h}+{x}+{y}")
+                else:
+                    w = min(1280, max(960, sw - 120))
+                    h = min(880, max(700, sh - 140))
+                    x = max(10, (sw - w) // 2)
+                    y = max(30, (sh - h) // 2)
+                    dialog.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
-                dialog.geometry("860x650")
-            if platform.system() != "Darwin":
+                dialog.geometry("1200x800")
+            if platform.system() == "Windows":
+                try:
+                    dialog.state("zoomed")
+                except Exception:
+                    pass
+            elif platform.system() != "Darwin":
                 try:
                     dialog.transient(self)
                 except Exception:
@@ -18230,6 +18246,27 @@ if HAS_DEPS:
                 dialog.destroy()
 
             dialog.protocol("WM_DELETE_WINDOW", _close_settings)
+
+            def _toggle_fullscreen():
+                try:
+                    is_fs = bool(dialog.attributes("-fullscreen"))
+                    dialog.attributes("-fullscreen", not is_fs)
+                    btn_fs.config(
+                        text=self._tr("🗗 Exit Fullscreen") if not is_fs else self._tr("⛶ Fullscreen"),
+                        bootstyle="warning" if not is_fs else "info outline"
+                    )
+                except Exception:
+                    pass
+
+            btn_fs = tb.Button(
+                footer,
+                text=self._tr("⛶ Fullscreen"),
+                bootstyle="info outline",
+                cursor="hand2",
+                command=_toggle_fullscreen,
+            )
+            btn_fs.pack(side=LEFT, padx=(0, 10))
+            dialog.bind("<F11>", lambda e: _toggle_fullscreen())
 
             tb.Button(
                 footer,
