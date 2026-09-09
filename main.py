@@ -3204,6 +3204,35 @@ def get_central_min_required_version():
     return MIN_REQUIRED_VERSION
 
 
+def _urlopen_with_fallback(req, timeout=12):
+    """
+    Performs urllib.request.urlopen with robust fallback for macOS certificate issues.
+    macOS Python standalone builds frequently lack system certificates, causing SSL: CERTIFICATE_VERIFY_FAILED.
+    This helper tries:
+    1. Standard verified request
+    2. certifi CA bundle if available
+    3. Unverified SSL context fallback to ensure update metadata/code can always be fetched.
+    """
+    import ssl, urllib.request
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except Exception as first_err:
+        err_s = str(first_err).lower()
+        if "certificate" in err_s or "ssl" in err_s:
+            try:
+                import certifi
+                ctx = ssl.create_default_context(cafile=certifi.where())
+                return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+            except Exception:
+                pass
+            try:
+                ctx = ssl._create_unverified_context()
+                return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+            except Exception:
+                pass
+        raise first_err
+
+
 def _resolve_realtime_update_url(url, auth_token=None):
     """
     If the update URL points to a GitHub repository raw file, resolves the latest
@@ -3222,7 +3251,7 @@ def _resolve_realtime_update_url(url, auth_token=None):
         atom_url = f"https://github.com/{owner}/{repo}/commits/{branch}.atom?_cb={int(time.time())}"
         headers = {"User-Agent": "PayrollApp-Updater/2.5", "Cache-Control": "no-cache", "Pragma": "no-cache"}
         req = urllib.request.Request(atom_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _urlopen_with_fallback(req, timeout=5) as resp:
             text = resp.read().decode("utf-8", errors="ignore")
             shas = re.findall(r'/commit/([a-f0-9]{40})', text)
             if shas:
@@ -3238,7 +3267,7 @@ def _resolve_realtime_update_url(url, auth_token=None):
             if auth_token:
                 headers["Authorization"] = f"token {auth_token}"
             req = urllib.request.Request(api_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _urlopen_with_fallback(req, timeout=5) as resp:
                 import json
                 d = json.loads(resp.read().decode("utf-8"))
                 sha = d.get("sha", "")
@@ -3354,7 +3383,7 @@ def check_for_cloud_update():
         headers["Authorization"] = f"token {token}"
     req = urllib.request.Request(req_url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with _urlopen_with_fallback(req, timeout=12) as resp:
             raw_bytes = resp.read()
             remote_code = raw_bytes.decode("utf-8", errors="replace")
     except Exception as e:
