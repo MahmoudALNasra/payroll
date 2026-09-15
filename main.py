@@ -861,7 +861,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.46"
+APP_VERSION = "2.5.47"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -4897,11 +4897,10 @@ def check_for_cloud_update():
     token = get_update_auth_token()
     import time, urllib.request
 
-    # Bypass CDN cache by resolving real-time commit SHA when using GitHub
+    # Bypass CDN cache by resolving real-time commit SHA when using GitHub + always add timestamp cache-buster
     req_url, resolved_sha = _resolve_realtime_update_url(url, auth_token=token)
-    if not resolved_sha:
-        sep = "&" if "?" in req_url else "?"
-        req_url = f"{req_url}{sep}_cb={int(time.time())}"
+    sep = "&" if "?" in req_url else "?"
+    req_url = f"{req_url}{sep}_cb={int(time.time() * 1000)}"
 
     headers = {
         "User-Agent": "PayrollApp-Updater/2.5",
@@ -10453,15 +10452,8 @@ if HAS_DEPS:
                     if elapsed >= 180:  # 3 minutes of inactivity
                         self.is_logged_in = False
                         self._auto_save_all_pending_edits()
+                        self._inactivity_logged_out = True
                         self.logout()
-                        try:
-                            messagebox.showinfo(
-                                "Auto-Saved & Logged Out",
-                                "You have been safely logged out due to inactivity.\n\nAll your unsaved fields and open forms were automatically saved.",
-                                parent=self
-                            )
-                        except Exception:
-                            pass
             except Exception:
                 pass
             finally:
@@ -11215,6 +11207,8 @@ if HAS_DEPS:
                     running_ver = local_info.get("running_version") or APP_VERSION
 
                     if status == "update_available":
+                        self._update_detected_version = r_ver
+                        self._update_detected_data = data
                         def _show():
                             try:
                                 self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
@@ -11305,7 +11299,13 @@ if HAS_DEPS:
                                 pass
                         self.after(0, _show)
                     elif status == "installed_pending_restart":
+                        self._update_detected_version = r_ver
+                        self._update_detected_data = data
                         def _show_restart():
+                            try:
+                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
+                            except Exception:
+                                pass
                             try:
                                 if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                     for child in self._login_upd_badge_frame.winfo_children():
@@ -11369,6 +11369,14 @@ if HAS_DEPS:
                         self.after(0, _hide)
                 except Exception:
                     pass
+                finally:
+                    # Automatically poll every 30 seconds while sitting on the Login screen
+                    # (including after inactivity logout) so updates show automatically without closing the app!
+                    try:
+                        if self.winfo_exists() and not getattr(self, "is_logged_in", False):
+                            self.after(30000, self._check_login_updates_bg)
+                    except Exception:
+                        pass
             threading.Thread(target=_bg, daemon=True).start()
 
         def _check_main_window_updates_bg(self):
@@ -11379,6 +11387,8 @@ if HAS_DEPS:
                     r_ver = data.get("remote_version", "Latest")
                     is_forced = bool(data.get("is_forced", False))
                     if status == "update_available":
+                        self._update_detected_version = r_ver
+                        self._update_detected_data = data
                         def _show():
                             try:
                                 self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
@@ -11449,7 +11459,13 @@ if HAS_DEPS:
                                 pass
                         self.after(0, _show)
                     elif status == "installed_pending_restart":
+                        self._update_detected_version = r_ver
+                        self._update_detected_data = data
                         def _show_restart():
+                            try:
+                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
+                            except Exception:
+                                pass
                             try:
                                 if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
                                     for child in self._main_upd_banner.winfo_children():
@@ -11479,9 +11495,10 @@ if HAS_DEPS:
                 except Exception:
                     pass
                 finally:
-                    # Recurring check every 10 minutes (600,000 ms)
+                    # Recurring check every 30 seconds (30,000 ms) while logged in
                     try:
-                        self.after(600000, self._check_main_window_updates_bg)
+                        if self.winfo_exists() and getattr(self, "is_logged_in", False):
+                            self.after(30000, self._check_main_window_updates_bg)
                     except Exception:
                         pass
             threading.Thread(target=_bg, daemon=True).start()
@@ -11584,8 +11601,15 @@ if HAS_DEPS:
             self.btn_login = tb.Button(frame, text="Login", bootstyle="primary", width=25, cursor="hand2", command=self.login)
             self.btn_login.grid(row=3, column=0, columnspan=2, pady=(24, 10), ipadx=10, ipady=5)
 
-            self._login_status = tb.Label(frame, text="", font=("Segoe UI", 10), bootstyle="secondary")
+            self._login_status = tb.Label(frame, text="", font=("Segoe UI", 10), bootstyle="secondary", wraplength=380, justify=CENTER)
             self._login_status.grid(row=4, column=0, columnspan=2, pady=(0, 6))
+            if getattr(self, "_inactivity_logged_out", False):
+                self._inactivity_logged_out = False
+                self._login_status.config(
+                    text="⚠️ You were safely logged out due to inactivity.\nAll your unsaved fields and open forms were automatically saved.",
+                    bootstyle="warning",
+                )
+
             self._login_progress = tb.Progressbar(frame, mode="determinate", length=280, bootstyle="success-striped")
             self._login_progress.grid(row=5, column=0, columnspan=2, pady=(0, 10))
             self._login_progress.grid_remove()
@@ -11595,8 +11619,16 @@ if HAS_DEPS:
             self._login_upd_badge_frame.grid(row=6, column=0, columnspan=2, pady=(10, 0))
             self._login_upd_badge_frame.grid_remove()
             self._check_login_updates_bg()
-            if getattr(self, "_db_error_update_needed", False):
-                self.ensure_bottom_yellow_update_bar(force_show=True)
+            if (
+                getattr(self, "_db_error_update_needed", False)
+                or getattr(self, "_update_detected_version", None)
+                or getattr(self, "_cached_bottom_remote_ver", None)
+            ):
+                self.ensure_bottom_yellow_update_bar(
+                    force_show=True,
+                    remote_version=getattr(self, "_update_detected_version", None) or getattr(self, "_cached_bottom_remote_ver", None),
+                    update_data=getattr(self, "_update_detected_data", None) or getattr(self, "_cached_bottom_update_data", None),
+                )
 
             # Engine version & status indicator
             try:
@@ -13208,8 +13240,16 @@ if HAS_DEPS:
             self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
             self._main_upd_banner.pack_forget()
             self._check_main_window_updates_bg()
-            if getattr(self, "_db_error_update_needed", False):
-                self.ensure_bottom_yellow_update_bar(force_show=True)
+            if (
+                getattr(self, "_db_error_update_needed", False)
+                or getattr(self, "_update_detected_version", None)
+                or getattr(self, "_cached_bottom_remote_ver", None)
+            ):
+                self.ensure_bottom_yellow_update_bar(
+                    force_show=True,
+                    remote_version=getattr(self, "_update_detected_version", None) or getattr(self, "_cached_bottom_remote_ver", None),
+                    update_data=getattr(self, "_update_detected_data", None) or getattr(self, "_cached_bottom_update_data", None),
+                )
 
             self.notebook = tb.Notebook(self, bootstyle="info")
             self.notebook.pack(fill=BOTH, expand=True, padx=20, pady=20)
