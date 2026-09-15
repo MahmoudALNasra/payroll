@@ -861,7 +861,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.45"
+APP_VERSION = "2.5.46"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -11767,6 +11767,14 @@ if HAS_DEPS:
                 return
             if not hasattr(self, "_active_modal_popups"):
                 self._active_modal_popups = []
+            # Demote previous modals' -topmost so child modal popup always stays cleanly on top
+            for prev_w in list(self._active_modal_popups):
+                if prev_w is not win and self._widget_alive(prev_w):
+                    try:
+                        if platform.system() != "Darwin":
+                            prev_w.attributes("-topmost", False)
+                    except Exception:
+                        pass
             if win not in self._active_modal_popups:
                 self._active_modal_popups.append(win)
             try:
@@ -11810,7 +11818,7 @@ if HAS_DEPS:
                 if w is None or parent is None:
                     return False
                 try:
-                    if w.winfo_toplevel() == parent:
+                    if hasattr(w, "winfo_toplevel") and w.winfo_toplevel() == parent:
                         return True
                 except Exception:
                     pass
@@ -11885,12 +11893,24 @@ if HAS_DEPS:
                         pass
             except Exception:
                 pass
-            try:
-                win.grab_set()
-                win.lift()
-                win.focus_force()
-            except Exception:
-                pass
+
+            def _do_grab(attempt=0):
+                if not self._widget_alive(win):
+                    return
+                try:
+                    win.update_idletasks()
+                    win.deiconify()
+                    win.lift()
+                    win.focus_force()
+                    win.grab_set()
+                except Exception:
+                    if attempt < 5:
+                        try:
+                            win.after(35, lambda: _do_grab(attempt + 1))
+                        except Exception:
+                            pass
+
+            _do_grab(0)
 
         def _safe_grab_release(self, win):
             try:
@@ -11907,6 +11927,7 @@ if HAS_DEPS:
                     if self._widget_alive(prev_top):
                         try:
                             if platform.system() != "Darwin":
+                                prev_top.attributes("-topmost", True)
                                 prev_top.grab_set()
                             prev_top.lift()
                             prev_top.focus_force()
@@ -12264,28 +12285,82 @@ if HAS_DEPS:
             except Exception:
                 return "#0f172a"
 
-        def apply_calendar_column_colors(self):
+        def apply_calendar_column_colors(self, live_override=None):
             """Immediately apply saved per-column background colors to the Shop Earnings table columns."""
-            colors = get_calendar_column_colors()
+            colors = dict(get_calendar_column_colors())
+            if live_override and isinstance(live_override, dict):
+                colors.update(live_override)
+            elif getattr(self, "_live_calendar_col_colors", None):
+                colors.update(self._live_calendar_col_colors)
+
+            def _style_column_treeview(tv, col_key, hex_val):
+                if not self._widget_alive(tv):
+                    return
+                safe_slug = "".join(c if c.isalnum() else "_" for c in str(col_key))
+                style_name = f"calcol_{safe_slug}.Treeview"
+                heading_style = f"{style_name}.Heading"
+                if hex_val:
+                    fg_col = self._contrast_text_for_hex(hex_val)
+                    try:
+                        self.style.configure(
+                            style_name,
+                            background=hex_val,
+                            fieldbackground=hex_val,
+                            foreground=fg_col,
+                            rowheight=34,
+                            font=("Segoe UI", 10),
+                        )
+                        self.style.map(
+                            style_name,
+                            background=[("selected", "#0284c7"), ("!selected", hex_val)],
+                            foreground=[("selected", "#ffffff"), ("!selected", fg_col)],
+                            fieldbackground=[("!disabled", hex_val)],
+                        )
+                        self.style.configure(
+                            heading_style,
+                            background=hex_val,
+                            foreground=fg_col,
+                            font=("Segoe UI", 11, "bold"),
+                            padding=6,
+                        )
+                        self.style.map(
+                            heading_style,
+                            background=[("active", hex_val), ("!disabled", hex_val)],
+                            foreground=[("active", fg_col), ("!disabled", fg_col)],
+                        )
+                        tv.configure(style=style_name)
+                    except Exception:
+                        pass
+                    try:
+                        tv.tag_configure("col_bg", background=hex_val, foreground=fg_col)
+                        for iid in tv.get_children():
+                            if iid == "totals_row":
+                                continue
+                            cur_tags = list(tv.item(iid, "tags") or ())
+                            if "col_bg" not in cur_tags:
+                                cur_tags.insert(0, "col_bg")
+                                tv.item(iid, tags=tuple(cur_tags))
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        tv.configure(style="primary.Treeview")
+                    except Exception:
+                        pass
+                    try:
+                        tv.tag_configure("col_bg", background="", foreground="")
+                    except Exception:
+                        pass
+
             # 1. Apply to frozen 'Name' column if present
             tf = getattr(self, "tree_frozen", None)
             if self._widget_alive(tf):
-                name_hex = colors.get("Name", "")
-                if name_hex:
-                    tf.tag_configure("col_bg", background=name_hex, foreground=self._contrast_text_for_hex(name_hex))
-                else:
-                    tf.tag_configure("col_bg", background="", foreground="")
+                _style_column_treeview(tf, "Name", colors.get("Name", ""))
 
             # 2. Apply to each synchronized column Treeview
             col_trees = getattr(self, "cal_col_trees", None) or {}
             for col_key, tv in col_trees.items():
-                if not self._widget_alive(tv):
-                    continue
-                hex_col = colors.get(col_key, "")
-                if hex_col:
-                    tv.tag_configure("col_bg", background=hex_col, foreground=self._contrast_text_for_hex(hex_col))
-                else:
-                    tv.tag_configure("col_bg", background="", foreground="")
+                _style_column_treeview(tv, col_key, colors.get(col_key, ""))
 
         def open_calendar_columns_dialog(self, parent=None):
             """Dialog to customize which columns are displayed and specify per-column colors in the Shop Earnings table."""
@@ -12294,9 +12369,9 @@ if HAS_DEPS:
             dialog.title(self._tr("⚙️ Customize Table Columns & Colors"))
             dialog.geometry("680x660")
             dialog.transient(parent)
-            self._safe_grab_set(dialog)
-            dialog.focus_set()
-            
+
+            self._live_calendar_col_colors = dict(get_calendar_column_colors())
+
             def _close_col_dialog():
                 active_p = getattr(self, "_active_col_color_picker", None)
                 if self._widget_alive(active_p):
@@ -12306,8 +12381,12 @@ if HAS_DEPS:
                     except Exception:
                         pass
                     self._active_col_color_picker = None
+                self._live_calendar_col_colors = None
                 self._safe_grab_release(dialog)
-                dialog.destroy()
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
 
             dialog.protocol("WM_DELETE_WINDOW", _close_col_dialog)
 
@@ -12388,22 +12467,29 @@ if HAS_DEPS:
                         activeforeground="#0f172a",
                     )
 
-            def _set_col_color(col_key, new_hex):
-                color_vars[col_key] = new_hex or ""
-                _update_color_btn_appearance(col_key)
-                # Immediately persist and apply to the table so the column color changes live!
-                current_map = get_calendar_column_colors()
-                if new_hex:
-                    current_map[col_key] = new_hex
+            def _set_col_color(col_key, new_hex, persist=True):
+                clean_hex = (new_hex or "").strip()
+                color_vars[col_key] = clean_hex
+                if self._live_calendar_col_colors is None:
+                    self._live_calendar_col_colors = dict(get_calendar_column_colors())
+                if clean_hex:
+                    self._live_calendar_col_colors[col_key] = clean_hex
                 else:
-                    current_map.pop(col_key, None)
-                save_calendar_column_colors(current_map)
-                self.apply_calendar_column_colors()
+                    self._live_calendar_col_colors.pop(col_key, None)
+                _update_color_btn_appearance(col_key)
+                if persist:
+                    current_map = get_calendar_column_colors()
+                    if clean_hex:
+                        current_map[col_key] = clean_hex
+                    else:
+                        current_map.pop(col_key, None)
+                    save_calendar_column_colors(current_map)
+                self.apply_calendar_column_colors(live_override=self._live_calendar_col_colors)
 
             def _open_color_picker_for_column(col_key, anchor_btn):
                 import colorsys
 
-                # 1. Close any existing small color picker window first (prevent over-populating small windows)
+                # 1. Close any existing small color picker window first
                 existing = getattr(self, "_active_col_color_picker", None)
                 if self._widget_alive(existing):
                     try:
@@ -12415,8 +12501,10 @@ if HAS_DEPS:
 
                 original_hex = color_vars.get(col_key, "")
 
-                # Release grab on bigger dialog first so small window receives 100% of mouse/keyboard input
+                # Temporarily demote parent dialog grab/topmost so small color picker receives all mouse events
                 try:
+                    if platform.system() != "Darwin":
+                        dialog.attributes("-topmost", False)
                     dialog.grab_release()
                 except Exception:
                     pass
@@ -12426,19 +12514,19 @@ if HAS_DEPS:
                 pop.title(f"🎨 {self._tr('Edit Colors (Paint Palette)')} — {self._tr(col_key)}")
                 pop.transient(dialog)
                 pop.resizable(False, False)
-                pop.geometry("590x445")
+                pop.geometry("620x485")
                 try:
-                    bx = max(40, dialog.winfo_rootx() + 45)
-                    by = max(40, dialog.winfo_rooty() + 50)
-                    pop.geometry(f"590x445+{bx}+{by}")
+                    bx = max(40, dialog.winfo_rootx() + 35)
+                    by = max(40, dialog.winfo_rooty() + 40)
+                    pop.geometry(f"620x485+{bx}+{by}")
                 except Exception:
                     pass
 
                 def _close_picker(apply_hex=None, revert=False):
                     if revert:
-                        _set_col_color(col_key, original_hex)
+                        _set_col_color(col_key, original_hex, persist=True)
                     elif apply_hex is not None:
-                        _set_col_color(col_key, apply_hex)
+                        _set_col_color(col_key, apply_hex, persist=True)
                     try:
                         self._safe_grab_release(pop)
                     except Exception:
@@ -12459,8 +12547,6 @@ if HAS_DEPS:
                             pass
 
                 pop.protocol("WM_DELETE_WINDOW", lambda: _close_picker(revert=True))
-                self._safe_grab_set(pop)
-                pop.focus_force()
 
                 # Parse starting RGB / HLS values
                 start_hex = original_hex if (original_hex and original_hex.startswith("#") and len(original_hex) == 7) else "#dcfce7"
@@ -12482,38 +12568,196 @@ if HAS_DEPS:
                     "updating": False,
                 }
 
+                # Define all callbacks BEFORE constructing widgets so Spinbox/Scale/Button callbacks never fail!
+                W_SPEC, H_SPEC = 185, 145
+                W_LUM = 26
+
+                def _redraw_luminance_bar():
+                    if not lum_canvas.winfo_exists():
+                        return
+                    h_v, s_v = state["h"], state["s"]
+                    l_rows = []
+                    for y_i in range(H_SPEC):
+                        lum_v = 1.0 - (y_i / float(H_SPEC - 1))
+                        rr, gg, bb = colorsys.hls_to_rgb(h_v, lum_v, s_v)
+                        c_hex = f"#{int(rr*255):02x}{int(gg*255):02x}{int(bb*255):02x}"
+                        l_rows.append("{" + " ".join([c_hex] * W_LUM) + "}")
+                    lum_img.put(" ".join(l_rows), to=(0, 0))
+
+                def _update_visual_markers_and_preview(live_apply=True, persist=False):
+                    if not spec_canvas.winfo_exists():
+                        return
+                    cx = max(0, min(W_SPEC - 1, int(state["h"] * (W_SPEC - 1))))
+                    cy = max(0, min(H_SPEC - 1, int((1.0 - state["s"]) * (H_SPEC - 1))))
+                    spec_canvas.coords(cross_outer, cx - 5, cy - 5, cx + 5, cy + 5)
+                    spec_canvas.coords(cross_inner, cx - 4, cy - 4, cx + 4, cy + 4)
+
+                    ly = max(0, min(H_SPEC - 1, int((1.0 - state["l"]) * (H_SPEC - 1))))
+                    lum_canvas.coords(lum_marker, 0, ly - 4, W_LUM - 1, ly - 4, W_LUM // 2, ly + 4)
+
+                    curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
+                    fg_c = self._contrast_text_for_hex(curr_hex)
+                    preview_box.configure(bg=curr_hex, fg=fg_c, text=curr_hex.upper())
+                    if not state["updating"]:
+                        state["updating"] = True
+                        try:
+                            hex_var.set(curr_hex.upper())
+                        finally:
+                            state["updating"] = False
+                    if live_apply:
+                        _set_col_color(col_key, curr_hex, persist=persist)
+
+                def _sync_sliders_from_state():
+                    r_scale.set(state["r"])
+                    g_scale.set(state["g"])
+                    b_scale.set(state["b"])
+                    r_spin_var.set(str(state["r"]))
+                    g_spin_var.set(str(state["g"]))
+                    b_spin_var.set(str(state["b"]))
+                    curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
+                    hex_var.set(curr_hex.upper())
+
+                def _on_spec_drag(event, persist=False):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        x = max(0, min(W_SPEC - 1, event.x))
+                        y = max(0, min(H_SPEC - 1, event.y))
+                        state["h"] = x / float(W_SPEC - 1)
+                        state["s"] = 1.0 - (y / float(H_SPEC - 1))
+                        if state["l"] < 0.12 or state["l"] > 0.94:
+                            state["l"] = 0.78
+                        rr, gg, bb = colorsys.hls_to_rgb(state["h"], state["l"], state["s"])
+                        state["r"], state["g"], state["b"] = int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))
+                        _sync_sliders_from_state()
+                        _redraw_luminance_bar()
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True, persist=persist)
+
+                def _on_lum_drag(event, persist=False):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        y = max(0, min(H_SPEC - 1, event.y))
+                        state["l"] = 1.0 - (y / float(H_SPEC - 1))
+                        rr, gg, bb = colorsys.hls_to_rgb(state["h"], state["l"], state["s"])
+                        state["r"], state["g"], state["b"] = int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))
+                        _sync_sliders_from_state()
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True, persist=persist)
+
+                def _on_rgb_slider_changed(*_args, persist=False):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        r_v = max(0, min(255, int(float(r_scale.get() or 0))))
+                        g_v = max(0, min(255, int(float(g_scale.get() or 0))))
+                        b_v = max(0, min(255, int(float(b_scale.get() or 0))))
+                        state["r"], state["g"], state["b"] = r_v, g_v, b_v
+                        r_spin_var.set(str(r_v))
+                        g_spin_var.set(str(g_v))
+                        b_spin_var.set(str(b_v))
+                        h_v, l_v, s_v = colorsys.rgb_to_hls(r_v / 255.0, g_v / 255.0, b_v / 255.0)
+                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
+                        _redraw_luminance_bar()
+                        curr_hex = f"#{r_v:02x}{g_v:02x}{b_v:02x}"
+                        hex_var.set(curr_hex.upper())
+                    except Exception:
+                        pass
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True, persist=persist)
+
+                def _on_spinbox_changed(*_args):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        r_v = max(0, min(255, int(r_spin_var.get() or 0)))
+                        g_v = max(0, min(255, int(g_spin_var.get() or 0)))
+                        b_v = max(0, min(255, int(b_spin_var.get() or 0)))
+                        state["r"], state["g"], state["b"] = r_v, g_v, b_v
+                        r_scale.set(r_v)
+                        g_scale.set(g_v)
+                        b_scale.set(b_v)
+                        h_v, l_v, s_v = colorsys.rgb_to_hls(r_v / 255.0, g_v / 255.0, b_v / 255.0)
+                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
+                        _redraw_luminance_bar()
+                        curr_hex = f"#{r_v:02x}{g_v:02x}{b_v:02x}"
+                        hex_var.set(curr_hex.upper())
+                    except Exception:
+                        pass
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True, persist=True)
+
+                def _load_hex_into_palette(hx_str, persist=True):
+                    if not hx_str or not isinstance(hx_str, str):
+                        return
+                    h_clean = hx_str.strip()
+                    if not h_clean.startswith("#"):
+                        h_clean = "#" + h_clean
+                    if len(h_clean) != 7:
+                        return
+                    try:
+                        rv = int(h_clean[1:3], 16)
+                        gv = int(h_clean[3:5], 16)
+                        bv = int(h_clean[5:7], 16)
+                    except Exception:
+                        return
+                    state["updating"] = True
+                    try:
+                        state["r"], state["g"], state["b"] = rv, gv, bv
+                        h_v, l_v, s_v = colorsys.rgb_to_hls(rv / 255.0, gv / 255.0, bv / 255.0)
+                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
+                        _sync_sliders_from_state()
+                        _redraw_luminance_bar()
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True, persist=persist)
+
+                # Construct UI layout inside pop
                 outer = tb.Frame(pop, padding=14)
                 outer.pack(fill=BOTH, expand=True)
 
-                # Top Basic Preset Swatches Bar (1-click quick presets)
-                preset_lf = tb.Labelframe(outer, text=self._tr("Basic / Preset Colors (Click to select)"), padding=(8, 4), bootstyle="info")
-                preset_lf.pack(fill=X, pady=(0, 8))
+                # 1. Top Basic / Preset Swatches Grid (2 rows x 6 columns so it NEVER overflows to the side)
+                preset_lf = tb.Labelframe(outer, text=self._tr("Basic / Preset Colors (Click any color)"), padding=(8, 6), bootstyle="info")
+                preset_lf.pack(fill=X, pady=(0, 10))
+                preset_grid = tb.Frame(preset_lf)
+                preset_grid.pack(fill=X, expand=True)
+                for c_i in range(6):
+                    preset_grid.grid_columnconfigure(c_i, weight=1)
+
                 for idx, (p_name, p_hex) in enumerate(PRESET_PALETTE):
+                    r_idx, c_idx = divmod(idx, 6)
                     fg_c = self._contrast_text_for_hex(p_hex)
                     sw = tk.Button(
-                        preset_lf,
+                        preset_grid,
                         text=p_name,
                         bg=p_hex,
                         fg=fg_c,
                         activebackground=p_hex,
                         activeforeground=fg_c,
                         font=("Segoe UI", 8, "bold"),
-                        width=6,
                         relief="groove",
                         bd=1,
+                        pady=4,
                         cursor="hand2",
                     )
-                    sw.pack(side=LEFT, padx=2, pady=2, expand=True, fill=X)
-                    sw.configure(command=lambda hx=p_hex: _load_hex_into_palette(hx))
+                    sw.grid(row=r_idx, column=c_idx, padx=3, pady=3, sticky="ew")
+                    sw.configure(command=lambda hx=p_hex: _load_hex_into_palette(hx, persist=True))
 
-                # Middle Paint Interactive Area: 2D Rainbow Spectrum + Luminance Slider + RGB Controls
+                # 2. Middle Paint Interactive Area: 2D Rainbow Spectrum + Luminance Slider + RGB Controls
                 mid_f = tb.Frame(outer)
                 mid_f.pack(fill=BOTH, expand=True, pady=4)
 
-                # 1. Left: 2D Rainbow Spectrum Canvas (Hue X-axis, Saturation Y-axis)
-                W_SPEC, H_SPEC = 175, 135
-                spec_frame = tb.Labelframe(mid_f, text=self._tr("Drag Color Spectrum"), padding=6, bootstyle="primary")
-                spec_frame.pack(side=LEFT, fill=Y, padx=(0, 8))
+                spec_frame = tb.Labelframe(mid_f, text=self._tr("Drag Color Spectrum & Brightness"), padding=8, bootstyle="primary")
+                spec_frame.pack(side=LEFT, fill=Y, padx=(0, 10))
 
                 spec_row = tb.Frame(spec_frame)
                 spec_row.pack()
@@ -12521,7 +12765,6 @@ if HAS_DEPS:
                 spec_canvas = tk.Canvas(spec_row, width=W_SPEC, height=H_SPEC, highlightthickness=1, highlightbackground="#94a3b8", cursor="crosshair")
                 spec_canvas.pack(side=LEFT)
 
-                # Build or reuse cached 2D rainbow spectrum image string
                 if not hasattr(self, "_cached_paint_spectrum_str"):
                     rows_str = []
                     for y_i in range(H_SPEC):
@@ -12539,28 +12782,15 @@ if HAS_DEPS:
                 spec_canvas.create_image(0, 0, image=spec_img, anchor="nw")
                 spec_canvas._img_ref = spec_img
 
-                # Crosshair marker on 2D spectrum
                 cross_outer = spec_canvas.create_oval(0, 0, 10, 10, outline="#000000", width=2)
                 cross_inner = spec_canvas.create_oval(1, 1, 9, 9, outline="#ffffff", width=1)
 
-                # 2. Vertical Luminance (Brightness) Bar next to spectrum
-                W_LUM = 24
                 lum_canvas = tk.Canvas(spec_row, width=W_LUM, height=H_SPEC, highlightthickness=1, highlightbackground="#94a3b8", cursor="sb_v_double_arrow")
                 lum_canvas.pack(side=LEFT, padx=(8, 0))
                 lum_img = tk.PhotoImage(width=W_LUM, height=H_SPEC)
                 lum_canvas.create_image(0, 0, image=lum_img, anchor="nw")
                 lum_canvas._img_ref = lum_img
                 lum_marker = lum_canvas.create_polygon(0, 0, W_LUM, 0, W_LUM // 2, 6, fill="#0f172a", outline="#ffffff")
-
-                def _redraw_luminance_bar():
-                    h_v, s_v = state["h"], state["s"]
-                    l_rows = []
-                    for y_i in range(H_SPEC):
-                        lum_v = 1.0 - (y_i / float(H_SPEC - 1))
-                        rr, gg, bb = colorsys.hls_to_rgb(h_v, lum_v, s_v)
-                        c_hex = f"#{int(rr*255):02x}{int(gg*255):02x}{int(bb*255):02x}"
-                        l_rows.append("{" + " ".join([c_hex] * W_LUM) + "}")
-                    lum_img.put(" ".join(l_rows), to=(0, 0))
 
                 # 3. Right Panel: Preview Swatch + RGB Sliders & Hex Code
                 rgb_frame = tb.Labelframe(mid_f, text=self._tr("RGB & Live Preview"), padding=10, bootstyle="secondary")
@@ -12572,7 +12802,7 @@ if HAS_DEPS:
                     preview_top,
                     text=start_hex.upper(),
                     font=("Segoe UI", 11, "bold"),
-                    width=14,
+                    width=13,
                     height=2,
                     relief="solid",
                     bd=1,
@@ -12585,171 +12815,58 @@ if HAS_DEPS:
                 hex_var = tk.StringVar(value=start_hex.upper())
                 hex_entry = tb.Entry(hex_f, textvariable=hex_var, width=11, font=("Consolas", 10, "bold"))
                 hex_entry.pack(anchor=W, pady=(2, 0))
+                hex_entry.bind("<Return>", lambda e: _load_hex_into_palette(hex_var.get(), persist=True))
+                hex_entry.bind("<FocusOut>", lambda e: _load_hex_into_palette(hex_var.get(), persist=True))
 
-                r_var = tk.IntVar(value=init_r)
-                g_var = tk.IntVar(value=init_g)
-                b_var = tk.IntVar(value=init_b)
+                r_spin_var = tk.StringVar(value=str(init_r))
+                g_spin_var = tk.StringVar(value=str(init_g))
+                b_spin_var = tk.StringVar(value=str(init_b))
 
-                def _make_rgb_slider_row(parent_f, label_txt, var_obj, accent_hex):
+                def _build_rgb_row(parent_f, label_txt, init_val, spin_v, accent_hex):
                     rf = tb.Frame(parent_f)
                     rf.pack(fill=X, pady=3)
-                    tb.Label(rf, text=label_txt, width=7, font=("Segoe UI", 9, "bold")).pack(side=LEFT)
+                    tb.Label(rf, text=label_txt, width=8, font=("Segoe UI", 9, "bold")).pack(side=LEFT)
                     sc = tk.Scale(
                         rf,
                         from_=0,
                         to=255,
                         orient=HORIZONTAL,
-                        variable=var_obj,
                         showvalue=False,
                         highlightthickness=0,
                         bd=0,
                         troughcolor="#e2e8f0",
                         activebackground=accent_hex,
-                        length=145,
-                        command=lambda _val: _on_rgb_slider_changed(),
+                        length=135,
+                        command=lambda _val: _on_rgb_slider_changed(persist=False),
                     )
+                    sc.set(init_val)
                     sc.pack(side=LEFT, fill=X, expand=True, padx=4)
+                    sc.bind("<ButtonRelease-1>", lambda e: _on_rgb_slider_changed(persist=True))
                     sp = tb.Spinbox(
                         rf,
                         from_=0,
                         to=255,
-                        textvariable=var_obj,
+                        textvariable=spin_v,
                         width=5,
                         font=("Segoe UI", 9),
-                        command=_on_rgb_slider_changed,
+                        command=_on_spinbox_changed,
                     )
                     sp.pack(side=RIGHT)
-                    sp.bind("<Return>", lambda e: _on_rgb_slider_changed())
-                    sp.bind("<FocusOut>", lambda e: _on_rgb_slider_changed())
+                    sp.bind("<Return>", _on_spinbox_changed)
+                    sp.bind("<FocusOut>", _on_spinbox_changed)
+                    return sc
 
-                _make_rgb_slider_row(rgb_frame, "Red (R):", r_var, "#ef4444")
-                _make_rgb_slider_row(rgb_frame, "Green (G):", g_var, "#22c55e")
-                _make_rgb_slider_row(rgb_frame, "Blue (B):", b_var, "#3b82f6")
+                r_scale = _build_rgb_row(rgb_frame, "Red (R):", init_r, r_spin_var, "#ef4444")
+                g_scale = _build_rgb_row(rgb_frame, "Green (G):", init_g, g_spin_var, "#22c55e")
+                b_scale = _build_rgb_row(rgb_frame, "Blue (B):", init_b, b_spin_var, "#3b82f6")
 
-                def _update_visual_markers_and_preview(live_apply=True):
-                    # Update crosshair on 2D spectrum
-                    cx = max(0, min(W_SPEC - 1, int(state["h"] * (W_SPEC - 1))))
-                    cy = max(0, min(H_SPEC - 1, int((1.0 - state["s"]) * (H_SPEC - 1))))
-                    spec_canvas.coords(cross_outer, cx - 5, cy - 5, cx + 5, cy + 5)
-                    spec_canvas.coords(cross_inner, cx - 4, cy - 4, cx + 4, cy + 4)
+                spec_canvas.bind("<Button-1>", lambda e: _on_spec_drag(e, persist=False))
+                spec_canvas.bind("<B1-Motion>", lambda e: _on_spec_drag(e, persist=False))
+                spec_canvas.bind("<ButtonRelease-1>", lambda e: _on_spec_drag(e, persist=True))
 
-                    # Update arrow marker on Luminance bar
-                    ly = max(0, min(H_SPEC - 1, int((1.0 - state["l"]) * (H_SPEC - 1))))
-                    lum_canvas.coords(lum_marker, 0, ly - 4, W_LUM - 1, ly - 4, W_LUM // 2, ly + 4)
-
-                    curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
-                    fg_c = self._contrast_text_for_hex(curr_hex)
-                    preview_box.configure(bg=curr_hex, fg=fg_c, text=curr_hex.upper())
-                    if not state["updating"]:
-                        state["updating"] = True
-                        try:
-                            hex_var.set(curr_hex.upper())
-                        finally:
-                            state["updating"] = False
-                    if live_apply:
-                        _set_col_color(col_key, curr_hex)
-
-                def _on_spec_drag(event):
-                    if state["updating"]:
-                        return
-                    state["updating"] = True
-                    try:
-                        x = max(0, min(W_SPEC - 1, event.x))
-                        y = max(0, min(H_SPEC - 1, event.y))
-                        state["h"] = x / float(W_SPEC - 1)
-                        state["s"] = 1.0 - (y / float(H_SPEC - 1))
-                        # If luminance was near 0 or 1, bring to a pleasant visible range when dragging spectrum
-                        if state["l"] < 0.12 or state["l"] > 0.94:
-                            state["l"] = 0.78
-                        rr, gg, bb = colorsys.hls_to_rgb(state["h"], state["l"], state["s"])
-                        state["r"], state["g"], state["b"] = int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))
-                        r_var.set(state["r"])
-                        g_var.set(state["g"])
-                        b_var.set(state["b"])
-                        _redraw_luminance_bar()
-                        curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
-                        hex_var.set(curr_hex.upper())
-                    finally:
-                        state["updating"] = False
-                    _update_visual_markers_and_preview(live_apply=True)
-
-                def _on_lum_drag(event):
-                    if state["updating"]:
-                        return
-                    state["updating"] = True
-                    try:
-                        y = max(0, min(H_SPEC - 1, event.y))
-                        state["l"] = 1.0 - (y / float(H_SPEC - 1))
-                        rr, gg, bb = colorsys.hls_to_rgb(state["h"], state["l"], state["s"])
-                        state["r"], state["g"], state["b"] = int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))
-                        r_var.set(state["r"])
-                        g_var.set(state["g"])
-                        b_var.set(state["b"])
-                        curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
-                        hex_var.set(curr_hex.upper())
-                    finally:
-                        state["updating"] = False
-                    _update_visual_markers_and_preview(live_apply=True)
-
-                def _on_rgb_slider_changed(*_args):
-                    if state["updating"]:
-                        return
-                    state["updating"] = True
-                    try:
-                        r_v = max(0, min(255, int(r_var.get() or 0)))
-                        g_v = max(0, min(255, int(g_var.get() or 0)))
-                        b_v = max(0, min(255, int(b_var.get() or 0)))
-                        state["r"], state["g"], state["b"] = r_v, g_v, b_v
-                        h_v, l_v, s_v = colorsys.rgb_to_hls(r_v / 255.0, g_v / 255.0, b_v / 255.0)
-                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
-                        _redraw_luminance_bar()
-                        curr_hex = f"#{r_v:02x}{g_v:02x}{b_v:02x}"
-                        hex_var.set(curr_hex.upper())
-                    except Exception:
-                        pass
-                    finally:
-                        state["updating"] = False
-                    _update_visual_markers_and_preview(live_apply=True)
-
-                def _load_hex_into_palette(hx_str):
-                    if not hx_str or not isinstance(hx_str, str):
-                        return
-                    h_clean = hx_str.strip()
-                    if not h_clean.startswith("#"):
-                        h_clean = "#" + h_clean
-                    if len(h_clean) != 7:
-                        return
-                    try:
-                        rv = int(h_clean[1:3], 16)
-                        gv = int(h_clean[3:5], 16)
-                        bv = int(h_clean[5:7], 16)
-                    except Exception:
-                        return
-                    state["updating"] = True
-                    try:
-                        state["r"], state["g"], state["b"] = rv, gv, bv
-                        r_var.set(rv)
-                        g_var.set(gv)
-                        b_var.set(bv)
-                        h_v, l_v, s_v = colorsys.rgb_to_hls(rv / 255.0, gv / 255.0, bv / 255.0)
-                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
-                        hex_var.set(h_clean.upper())
-                        _redraw_luminance_bar()
-                    finally:
-                        state["updating"] = False
-                    _update_visual_markers_and_preview(live_apply=True)
-
-                hex_entry.bind("<Return>", lambda e: _load_hex_into_palette(hex_var.get()))
-                hex_entry.bind("<FocusOut>", lambda e: _load_hex_into_palette(hex_var.get()))
-
-                spec_canvas.bind("<Button-1>", _on_spec_drag)
-                spec_canvas.bind("<B1-Motion>", _on_spec_drag)
-                lum_canvas.bind("<Button-1>", _on_lum_drag)
-                lum_canvas.bind("<B1-Motion>", _on_lum_drag)
-
-                # Initial render
-                _redraw_luminance_bar()
-                _update_visual_markers_and_preview(live_apply=False)
+                lum_canvas.bind("<Button-1>", lambda e: _on_lum_drag(e, persist=False))
+                lum_canvas.bind("<B1-Motion>", lambda e: _on_lum_drag(e, persist=False))
+                lum_canvas.bind("<ButtonRelease-1>", lambda e: _on_lum_drag(e, persist=True))
 
                 # Bottom Action Buttons
                 bot_f = tb.Frame(outer, padding=(0, 10, 0, 0))
@@ -12778,6 +12895,12 @@ if HAS_DEPS:
                     cursor="hand2",
                     command=lambda: _close_picker(revert=True),
                 ).pack(side=RIGHT)
+
+                # Initial render & modal grab AFTER all widgets are built and mapped
+                _redraw_luminance_bar()
+                _update_visual_markers_and_preview(live_apply=False)
+                pop.update_idletasks()
+                self._safe_grab_set(pop)
 
             for col_key, desc in ALL_CALENDAR_COLUMNS:
                 col_tr = self._tr(col_key)
@@ -12822,7 +12945,7 @@ if HAS_DEPS:
                     bootstyle="secondary-outline",
                     width=9,
                     cursor="hand2",
-                    command=lambda ck=col_key: _set_col_color(ck, ""),
+                    command=lambda ck=col_key: _set_col_color(ck, "", persist=True),
                 )
                 def_btn.pack(side=LEFT)
             
@@ -12836,9 +12959,9 @@ if HAS_DEPS:
                         new_hidden.add(col_key)
                         new_hidden.add(self._tr(col_key))
                 save_calendar_hidden_columns(new_hidden)
-                # Ensure colors are saved
                 clean_colors = {k: v for k, v in color_vars.items() if v}
                 save_calendar_column_colors(clean_colors)
+                self._live_calendar_col_colors = None
                 self.refresh_calendar_column_visibility()
                 self.apply_calendar_column_colors()
                 _close_col_dialog()
@@ -12857,12 +12980,16 @@ if HAS_DEPS:
                 if "Written Up" in check_vars:
                     check_vars["Written Up"].set(False)
                 for ck in list(color_vars.keys()):
-                    _set_col_color(ck, "")
+                    _set_col_color(ck, "", persist=True)
 
             tb.Button(btn_f, text=self._tr("Save & Apply"), bootstyle="success", cursor="hand2", command=_save_and_apply).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Select All"), bootstyle="secondary-outline", cursor="hand2", command=lambda: _select_all_cols(True)).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=_reset_all_to_default).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Cancel"), bootstyle="secondary", cursor="hand2", command=_close_col_dialog).pack(side=RIGHT, padx=5)
+
+            dialog.update_idletasks()
+            self._safe_grab_set(dialog)
+            dialog.focus_set()
 
         def refresh_calendar_column_visibility(self):
             """Apply current hidden columns and column widths to the Shop Earnings table."""
