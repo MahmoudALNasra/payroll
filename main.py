@@ -846,7 +846,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.23"
+APP_VERSION = "2.5.24"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1873,6 +1873,132 @@ def _clean_supabase_config(config):
     cfg["supabase_database"] = database
     return cfg
 
+def _extract_supabase_ref(host, user):
+    ref = None
+    h = str(host or "").strip().lower()
+    u = str(user or "").strip()
+    if "." in u and u.startswith("postgres."):
+        ref = u.split(".", 1)[1].strip()
+    if not ref and "pooler.supabase.com" not in h and ".supabase.co" in h:
+        clean_h = h.replace("https://", "").replace("http://", "").replace("db.", "").strip()
+        ref = clean_h.split(".supabase.co")[0].strip()
+    return ref
+
+def _connect_supabase_with_auto_pooler(host, port, user, password, database, timeout=12):
+    """
+    Connects to Supabase via pg8000 with automatic IPv4 pooler & port 6543 fallback.
+    If port 5432 is blocked by the user's ISP/Wi-Fi or host is IPv6-only (db.*.supabase.co),
+    automatically tests port 6543 and candidate AWS pooler regions in parallel.
+    Returns (conn, active_host, active_port, active_user).
+    """
+    import pg8000.dbapi, threading
+    ref = _extract_supabase_ref(host, user)
+    port_int = int(port or 5432)
+
+    primary_attempts = [(host, port_int, user)]
+    if "pooler.supabase.com" in str(host).lower() and port_int == 5432:
+        primary_attempts.append((host, 6543, user))
+    elif "pooler.supabase.com" in str(host).lower() and port_int == 6543:
+        primary_attempts.append((host, 5432, user))
+
+    first_err = None
+    for c_host, c_port, c_user in primary_attempts:
+        try:
+            t_out = min(timeout, 5) if (len(primary_attempts) > 1 or ref) else timeout
+            conn = pg8000.dbapi.connect(
+                host=c_host,
+                port=c_port,
+                user=c_user,
+                password=password,
+                database=database,
+                timeout=t_out,
+            )
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            return conn, c_host, c_port, c_user
+        except Exception as e:
+            if first_err is None:
+                first_err = e
+            msg = str(e).lower()
+            if "password authentication failed" in msg:
+                raise e
+
+    if ref:
+        candidate_regions = [
+            "us-east-2", "us-east-1", "us-west-1", "us-west-2",
+            "ca-central-1", "eu-central-1", "eu-central-2",
+            "eu-west-1", "eu-west-2", "eu-west-3", "eu-north-1",
+            "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
+            "ap-northeast-2", "ap-south-1", "sa-east-1"
+        ]
+        pooler_user = f"postgres.{ref}"
+        found = {"conn": None, "host": None, "port": None, "user": None, "auth_err": None}
+        lock = threading.Lock()
+        done_evt = threading.Event()
+
+        def _probe(p_host, p_port):
+            if done_evt.is_set():
+                return
+            try:
+                c = pg8000.dbapi.connect(
+                    host=p_host,
+                    port=p_port,
+                    user=pooler_user,
+                    password=password,
+                    database=database,
+                    timeout=5,
+                )
+                try:
+                    c.commit()
+                except Exception:
+                    pass
+                with lock:
+                    if found["conn"] is None:
+                        found["conn"] = c
+                        found["host"] = p_host
+                        found["port"] = p_port
+                        found["user"] = pooler_user
+                        done_evt.set()
+                    else:
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
+            except Exception as pe:
+                p_msg = str(pe).lower()
+                if "password authentication failed" in p_msg or "scram" in p_msg:
+                    with lock:
+                        found["auth_err"] = pe
+                        done_evt.set()
+
+        for p_port in (6543, 5432):
+            for reg in candidate_regions:
+                p_host = f"aws-0-{reg}.pooler.supabase.com"
+                t = threading.Thread(target=_probe, args=(p_host, p_port), daemon=True)
+                t.start()
+
+        done_evt.wait(timeout=6.0)
+        if found["conn"] is not None:
+            try:
+                cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as f:
+                        cur_cfg = json.load(f)
+                    cur_cfg["supabase_host"] = found["host"]
+                    cur_cfg["supabase_port"] = str(found["port"])
+                    cur_cfg["supabase_user"] = found["user"]
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(cur_cfg, f, indent=4)
+            except Exception:
+                pass
+            return found["conn"], found["host"], found["port"], found["user"]
+        if found["auth_err"] is not None:
+            raise found["auth_err"]
+
+    raise first_err
+
 def _open_supabase_pg_conn(timeout=15):
     try:
         import pg8000.dbapi
@@ -1890,74 +2016,8 @@ def _open_supabase_pg_conn(timeout=15):
     user = config.get("supabase_user", "postgres")
     password = config.get("supabase_password")
     database = config.get("supabase_database", "postgres")
-
-    try:
-        conn = pg8000.dbapi.connect(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
-            database=database,
-            timeout=timeout,
-        )
-        try:
-            conn.commit()
-        except Exception:
-            pass
-        return conn
-    except Exception as first_err:
-        err_msg = str(first_err).lower()
-        is_timeout_or_network = any(k in err_msg for k in ["timeout", "handshake", "timed out", "source_address is none", "connection refused", "network unreachable", "10060", "10061"])
-
-        # Extract project reference
-        ref = None
-        if host:
-            clean_h = host.replace("db.", "").strip()
-            if ".supabase.co" in clean_h:
-                ref = clean_h.split(".supabase.co")[0].strip()
-        if not ref and user and "." in user:
-            ref = user.split(".", 1)[1].strip()
-
-        if is_timeout_or_network and ref:
-            # Try connection pooler (IPv4 compatible) across candidate regions
-            candidate_regions = ["us-east-2", "us-east-1", "us-west-1", "us-west-2", "eu-central-1", "eu-west-1", "ap-southeast-1"]
-            pooler_user = f"postgres.{ref}"
-            for reg in candidate_regions:
-                pooler_host = f"aws-0-{reg}.pooler.supabase.com"
-                for pooler_port in [6543, 5432]:
-                    try:
-                        conn = pg8000.dbapi.connect(
-                            host=pooler_host,
-                            port=pooler_port,
-                            user=pooler_user,
-                            password=password,
-                            database=database,
-                            timeout=min(timeout, 8),
-                        )
-                        try:
-                            conn.commit()
-                        except Exception:
-                            pass
-                        # Auto-update local config with working IPv4 pooler
-                        try:
-                            cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
-                            if os.path.exists(cfg_path):
-                                with open(cfg_path, "r", encoding="utf-8") as f:
-                                    cur_cfg = json.load(f)
-                                cur_cfg["supabase_host"] = pooler_host
-                                cur_cfg["supabase_port"] = str(pooler_port)
-                                cur_cfg["supabase_user"] = pooler_user
-                                with open(cfg_path, "w", encoding="utf-8") as f:
-                                    json.dump(cur_cfg, f, indent=4)
-                        except Exception:
-                            pass
-                        return conn
-                    except Exception as pooler_err:
-                        p_msg = str(pooler_err).lower()
-                        if "password authentication failed" in p_msg:
-                            raise pooler_err
-                        continue
-        raise first_err
+    conn, _, _, _ = _connect_supabase_with_auto_pooler(host, port, user, password, database, timeout=timeout)
+    return conn
 
 def get_shared_supabase_conn(force_reconnect=False, timeout=15):
     """Reuse one Postgres connection for the whole app session, auto-reconnecting if dead."""
@@ -17582,17 +17642,24 @@ if HAS_DEPS:
                         messagebox.showerror("Error", "pg8000 missing. Run: pip install pg8000", parent=dialog)
                         return
                 try:
-                    conn = pg8000.dbapi.connect(
+                    conn, active_host, active_port, active_user = _connect_supabase_with_auto_pooler(
                         host=host,
                         port=int(port),
                         user=username,
                         password=password,
                         database=database,
-                        timeout=10
+                        timeout=12
                     )
                     cursor = conn.cursor()
                     cursor.execute("SELECT 1")
                     conn.close()
+                    # Update variables with working auto-discovered IPv4 pooler parameters
+                    host = active_host
+                    port = active_port
+                    username = active_user
+                    db_host_var.set(host)
+                    db_port_var.set(str(port))
+                    db_user_var.set(username)
                 except Exception as e:
                     messagebox.showerror("Connection Failed", f"Could not connect: {e}", parent=dialog)
                     return
@@ -17611,7 +17678,7 @@ if HAS_DEPS:
                     with open(config_file, "w", encoding="utf-8") as f:
                         json.dump(new_config, f, indent=4)
                     refresh_storage_meter()
-                    messagebox.showinfo("Success", "Supabase configuration verified and saved!\n\nPlease restart the app to activate Supabase mode.", parent=dialog)
+                    messagebox.showinfo("Success", f"Supabase configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nPlease restart the app to activate Supabase mode.", parent=dialog)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to save configuration: {e}", parent=dialog)
 
