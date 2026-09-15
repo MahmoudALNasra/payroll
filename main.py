@@ -498,6 +498,13 @@ HORIZONTAL = tk.HORIZONTAL
 
 # --- TRANSLATIONS ---
 TRANSLATIONS = {
+    "Theme:": "المظهر:",
+    "☀️ Light Theme": "☀️ مظهر فاتح",
+    "🌙 Dark Theme": "🌙 مظهر داكن",
+    "☀️ Light Mode": "☀️ الوضع الفاتح",
+    "🌙 Dark Mode": "🌙 الوضع الداكن",
+    "☀️ Light": "☀️ فاتح",
+    "🌙 Dark": "🌙 داكن",
     "Cycle": "الدورة",
     "Cycle:": "الدورة:",
     "Cycles": "دورات",
@@ -861,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.47"
+APP_VERSION = "2.5.48"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1086,6 +1093,23 @@ def save_ui_column_preferences(prefs):
             json.dump(prefs, f, indent=2)
     except Exception:
         pass
+
+
+def get_saved_app_theme_mode():
+    """Returns saved theme mode ('light' or 'dark'). Defaults to 'light'."""
+    prefs = load_ui_column_preferences()
+    mode = str(prefs.get("app_theme_mode", "light")).strip().lower()
+    return "dark" if mode == "dark" else "light"
+
+
+def save_app_theme_mode(mode):
+    """Persists theme mode ('light' or 'dark') to UI preferences."""
+    clean_mode = "dark" if str(mode).strip().lower() == "dark" else "light"
+    prefs = load_ui_column_preferences()
+    prefs["app_theme_mode"] = clean_mode
+    save_ui_column_preferences(prefs)
+    return clean_mode
+
 
 def get_saved_column_widths(table_key):
     prefs = load_ui_column_preferences()
@@ -9696,7 +9720,9 @@ if HAS_DEPS:
                 self.tk = SafeTkProxy(self.tk)
             except Exception:
                 pass
-            self.style = tb.Style(theme=APP_THEME)
+            self.theme_mode = get_saved_app_theme_mode()
+            init_theme = "superhero" if self.theme_mode == "dark" else "cosmo"
+            self.style = tb.Style(theme=init_theme)
             self.title(APP_TITLE)
             self._install_db_error_interceptors()
             
@@ -9735,16 +9761,7 @@ if HAS_DEPS:
                 except Exception:
                     pass
 
-            self.style.configure('Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('primary.Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('secondary.Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('warning.Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('info.Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('success.Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('danger.Treeview', rowheight=34, font=('Segoe UI', 10))
-            self.style.configure('Treeview.Heading', font=('Segoe UI', 11, 'bold'), padding=6)
-            self.style.configure('TButton', font=('Segoe UI', 11, 'bold'))
-            self.style.configure('TNotebook.Tab', font=('Segoe UI', 12, 'bold'), padding=[15, 10])
+            self._apply_custom_widget_styles()
 
             # Initialize Vagaro Sync Variables
             self.sync_employees_var = tk.BooleanVar(value=True)
@@ -10120,15 +10137,21 @@ if HAS_DEPS:
             import threading
 
             def work():
+                def _safe_after(cb):
+                    try:
+                        self.after(0, cb)
+                    except Exception:
+                        pass
+
                 err = None
                 try:
-                    self.after(0, lambda: self._set_startup_status("Connecting to secure database…"))
+                    _safe_after(lambda: self._set_startup_status("Connecting to secure database…"))
                     self.unlock_database_silently()
-                    self.after(0, lambda: self._set_startup_status("Preparing workspace…"))
+                    _safe_after(lambda: self._set_startup_status("Preparing workspace…"))
                     init_db(defer_heavy_migrations=True)
                 except Exception as e:
                     err = e
-                self.after(0, lambda: self._finish_startup_bootstrap(err))
+                _safe_after(lambda: self._finish_startup_bootstrap(err))
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -11508,11 +11531,20 @@ if HAS_DEPS:
             self.grid_rowconfigure(0, weight=1)
             self.grid_columnconfigure(0, weight=1)
             
-            # Top-right language switch button on Login Screen
+            # Top-right language & theme switch buttons on Login Screen
             lang_bar = tb.Frame(self)
             lang_bar.place(relx=1.0, rely=0.0, anchor="ne", x=-16, y=16)
+            cur_mode = getattr(self, "theme_mode", get_saved_app_theme_mode())
+            top_theme_text = self._tr("☀️ Light Mode") if cur_mode == "dark" else self._tr("🌙 Dark Mode")
+            tb.Button(
+                lang_bar,
+                text=top_theme_text,
+                bootstyle="secondary outline",
+                cursor="hand2",
+                command=self.toggle_app_theme,
+            ).pack(side=LEFT, padx=(0, 8))
             login_lang_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
-            tb.Button(lang_bar, text=login_lang_text, bootstyle="info outline", cursor="hand2", command=self.toggle_language).pack()
+            tb.Button(lang_bar, text=login_lang_text, bootstyle="info outline", cursor="hand2", command=self.toggle_language).pack(side=LEFT)
             
             frame = tb.Frame(self, padding=40)
             frame.grid(row=0, column=0)
@@ -11597,12 +11629,34 @@ if HAS_DEPS:
                     
             eye_btn = tb.Button(pw_frame, text="Show", bootstyle="secondary outline", cursor="hand2", width=5, command=toggle_password_visibility)
             eye_btn.pack(side=LEFT, padx=(6, 0))
+
+            # Explicit Light / Dark Theme Selector row before logging in
+            tb.Label(frame, text=self._tr("Theme:"), font=("Segoe UI", 11)).grid(row=3, column=0, pady=10, padx=(0, 12), sticky=E)
+            theme_frame = tb.Frame(frame)
+            theme_frame.grid(row=3, column=1, pady=10, sticky=EW)
+            is_dark = (cur_mode == "dark")
+            self.btn_theme_light = tb.Button(
+                theme_frame,
+                text=self._tr("☀️ Light Theme"),
+                bootstyle="secondary outline" if is_dark else "primary",
+                cursor="hand2",
+                command=lambda: self.set_app_theme_mode("light"),
+            )
+            self.btn_theme_light.pack(side=LEFT, fill=X, expand=True, padx=(0, 6))
+            self.btn_theme_dark = tb.Button(
+                theme_frame,
+                text=self._tr("🌙 Dark Theme"),
+                bootstyle="primary" if is_dark else "secondary outline",
+                cursor="hand2",
+                command=lambda: self.set_app_theme_mode("dark"),
+            )
+            self.btn_theme_dark.pack(side=LEFT, fill=X, expand=True)
             
             self.btn_login = tb.Button(frame, text="Login", bootstyle="primary", width=25, cursor="hand2", command=self.login)
-            self.btn_login.grid(row=3, column=0, columnspan=2, pady=(24, 10), ipadx=10, ipady=5)
+            self.btn_login.grid(row=4, column=0, columnspan=2, pady=(24, 10), ipadx=10, ipady=5)
 
             self._login_status = tb.Label(frame, text="", font=("Segoe UI", 10), bootstyle="secondary", wraplength=380, justify=CENTER)
-            self._login_status.grid(row=4, column=0, columnspan=2, pady=(0, 6))
+            self._login_status.grid(row=5, column=0, columnspan=2, pady=(0, 6))
             if getattr(self, "_inactivity_logged_out", False):
                 self._inactivity_logged_out = False
                 self._login_status.config(
@@ -11611,12 +11665,12 @@ if HAS_DEPS:
                 )
 
             self._login_progress = tb.Progressbar(frame, mode="determinate", length=280, bootstyle="success-striped")
-            self._login_progress.grid(row=5, column=0, columnspan=2, pady=(0, 10))
+            self._login_progress.grid(row=6, column=0, columnspan=2, pady=(0, 10))
             self._login_progress.grid_remove()
 
             # Automatic Update Notification Banner on Login Screen (Appears ONLY when update is available)
             self._login_upd_badge_frame = tb.Frame(frame)
-            self._login_upd_badge_frame.grid(row=6, column=0, columnspan=2, pady=(10, 0))
+            self._login_upd_badge_frame.grid(row=7, column=0, columnspan=2, pady=(10, 0))
             self._login_upd_badge_frame.grid_remove()
             self._check_login_updates_bg()
             if (
@@ -11635,7 +11689,7 @@ if HAS_DEPS:
                 ver_info = get_active_code_info()
                 ver_mode = " [Safe Mode Fallback]" if ver_info.get("is_safe_mode") else (" [Cloud Dynamic Engine]" if ver_info.get("is_dynamic") else " [Built-in Engine]")
                 ver_text = f"v{ver_info.get('version', APP_VERSION)}{ver_mode}"
-                tb.Label(frame, text=ver_text, font=("Segoe UI", 8), bootstyle="secondary").grid(row=7, column=0, columnspan=2, pady=(10, 0))
+                tb.Label(frame, text=ver_text, font=("Segoe UI", 8), bootstyle="secondary").grid(row=8, column=0, columnspan=2, pady=(10, 0))
             except Exception:
                 pass
 
@@ -13153,6 +13207,56 @@ if HAS_DEPS:
                 return text
             return TRANSLATIONS.get(text, text)
             
+        def _apply_custom_widget_styles(self):
+            try:
+                self.style.configure('Treeview', rowheight=34, font=('Segoe UI', 10))
+                for st in ('primary', 'secondary', 'warning', 'info', 'success', 'danger'):
+                    self.style.configure(f'{st}.Treeview', rowheight=34, font=('Segoe UI', 10))
+                self.style.configure('Treeview.Heading', font=('Segoe UI', 11, 'bold'), padding=6)
+                self.style.configure('TButton', font=('Segoe UI', 11, 'bold'))
+                self.style.configure('TNotebook.Tab', font=('Segoe UI', 12, 'bold'), padding=[15, 10])
+            except Exception:
+                pass
+
+        def set_app_theme_mode(self, mode):
+            if getattr(self, "_rebuilding_ui", False):
+                return
+            clean_mode = save_app_theme_mode(mode)
+            self.theme_mode = clean_mode
+            target_theme = "superhero" if clean_mode == "dark" else "cosmo"
+            try:
+                self.style.theme_use(target_theme)
+            except Exception:
+                pass
+            self._apply_custom_widget_styles()
+            self._rebuilding_ui = True
+
+            def _rebuild():
+                try:
+                    if getattr(self, "current_user", None) and getattr(self, "is_logged_in", False):
+                        try:
+                            self.apply_calendar_column_colors()
+                        except Exception:
+                            pass
+                        self.show_main_application()
+                    else:
+                        self.show_login_page()
+                finally:
+                    self._rebuilding_ui = False
+
+            try:
+                self.after(60, _rebuild)
+            except Exception:
+                try:
+                    _rebuild()
+                except Exception:
+                    self._rebuilding_ui = False
+
+        def toggle_app_theme(self):
+            cur = getattr(self, "theme_mode", get_saved_app_theme_mode())
+            next_m = "dark" if cur == "light" else "light"
+            self.set_app_theme_mode(next_m)
+
         def toggle_language(self):
             if getattr(self, "_rebuilding_ui", False):
                 return
@@ -13207,6 +13311,17 @@ if HAS_DEPS:
             # Language button pinned to far right of right_frame (100% visible on any resolution)
             btn_text = "🌐 العربية" if getattr(self, 'lang', 'en') == 'en' else "🌐 English"
             tb.Button(right_frame, text=btn_text, bootstyle="info", cursor="hand2", command=self.toggle_language).pack(side=RIGHT, padx=(4, 0))
+
+            # Quick Theme switch button in main header next to language
+            cur_mode = getattr(self, "theme_mode", get_saved_app_theme_mode())
+            theme_btn_txt = self._tr("☀️ Light") if cur_mode == "dark" else self._tr("🌙 Dark")
+            tb.Button(
+                right_frame,
+                text=theme_btn_txt,
+                bootstyle="secondary",
+                cursor="hand2",
+                command=self.toggle_app_theme,
+            ).pack(side=RIGHT, padx=(4, 0))
 
             username_to_show = getattr(self, "current_user", "admin")
             self.lbl_logged_in_user = tb.Label(
