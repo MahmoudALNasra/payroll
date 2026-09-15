@@ -119,6 +119,13 @@ import gzip
 import threading
 from datetime import datetime, timedelta
 import ssl
+import socket
+import re
+import struct
+import random
+import urllib.request
+import urllib.error
+import http.client
 
 def _configure_global_ssl():
     """
@@ -854,7 +861,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.32"
+APP_VERSION = "2.5.34"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1985,7 +1992,7 @@ def _query_dns_udp_ipv4(domain, qtype=1, dns_ip="8.8.8.8", timeout=0.8):
     """Pure IPv4 RFC 1035 UDP DNS query directly to a public IPv4 DNS server (zero getaddrinfo/IPv6).
     Supports qtype=1 (A record -> IPv4 list) and qtype=28 (AAAA record -> IPv6 list).
     """
-    import struct, random
+    import struct, random, socket
     sock = None
     try:
         tid = random.randint(1, 65534)
@@ -2054,9 +2061,9 @@ def _query_dns_udp_ipv4(domain, qtype=1, dns_ip="8.8.8.8", timeout=0.8):
 
 def _query_doh_ipv4_literal(domain, qtype="A", dns_ip="8.8.8.8", host_header="dns.google", path="/resolve", timeout=1.5):
     """Pure IPv4 HTTPS DoH query directly to literal IP 8.8.8.8:443 or 1.1.1.1:443 using http.client.HTTPResponse
-    so chunked transfer encoding and gzip/headers are parsed natively without urllib or IPv6.
+    with a browser User-Agent header so Cloudflare/Google never reject the request.
     """
-    import http.client
+    import http.client, socket, ssl, json
     sock = None
     try:
         raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2069,22 +2076,24 @@ def _query_doh_ipv4_literal(domain, qtype="A", dns_ip="8.8.8.8", host_header="dn
         req_str = (
             f"GET {path}?name={domain}&type={qtype} HTTP/1.1\r\n"
             f"Host: {host_header}\r\n"
+            "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\n"
             "Accept: application/dns-json\r\n"
             "Connection: close\r\n\r\n"
         )
         sock.sendall(req_str.encode("ascii"))
         resp = http.client.HTTPResponse(sock)
         resp.begin()
-        body = resp.read().decode("utf-8", errors="ignore")
-        data = json.loads(body)
-        results = []
-        target_type = 28 if str(qtype).upper() == "AAAA" else 1
-        for ans in data.get("Answer", []) or []:
-            if ans.get("type") == target_type:
-                val = str(ans.get("data", "")).strip().lower()
-                if val and val not in results:
-                    results.append(val)
-        return data.get("Status"), results
+        if resp.status == 200:
+            body = resp.read().decode("utf-8", errors="ignore")
+            data = json.loads(body)
+            results = []
+            target_type = 28 if str(qtype).upper() == "AAAA" else 1
+            for ans in data.get("Answer", []) or []:
+                if ans.get("type") == target_type:
+                    val = str(ans.get("data", "")).strip().lower()
+                    if val and val not in results:
+                        results.append(val)
+            return data.get("Status"), results
     except Exception:
         pass
     finally:
@@ -2096,13 +2105,63 @@ def _query_doh_ipv4_literal(domain, qtype="A", dns_ip="8.8.8.8", host_header="dn
     return None, []
 
 
-def _resolve_ipv4_addresses(host, port):
-    """Resolve hostname strictly to IPv4 (AF_INET) addresses with 100% IPv6 immunity.
-    1. Checks fast in-memory cache.
-    2. Tries throttled local OS DNS (getaddrinfo with AF_INET).
-    3. Tries pure IPv4 UDP DNS directly to 8.8.8.8:53 and 1.1.1.1:53 (no getaddrinfo, no IPv6).
-    4. Tries pure IPv4 HTTPS DoH directly to 8.8.8.8:443 and 1.1.1.1:443 using HTTPResponse.
+def _resolve_via_system_cli(host, qtype="A"):
+    """Resolves hostname using native macOS/Linux system resolver tools (/usr/bin/dscacheutil, dig, nslookup).
+    Works reliably even inside frozen PyInstaller .app bundles when Python's internal getaddrinfo fails.
     """
+    import subprocess, re
+    results = []
+    cmds = []
+    if str(qtype).upper() == "A":
+        if platform.system() == "Darwin":
+            cmds.append(["/usr/bin/dscacheutil", "-q", "host", "-a", "name", host])
+        cmds.extend([
+            ["/usr/bin/dig", "+short", host, "A"],
+            ["/usr/bin/nslookup", host, "8.8.8.8"],
+            ["/usr/bin/nslookup", host],
+        ])
+        for cmd in cmds:
+            try:
+                out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=1.5).decode("utf-8", errors="ignore")
+                for m in re.finditer(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b", out):
+                    ip = m.group(0)
+                    if not ip.startswith(("127.", "0.", "255.")) and ip not in ("8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9"):
+                        if ip not in results:
+                            results.append(ip)
+                if results:
+                    return results
+            except Exception:
+                pass
+    elif str(qtype).upper() == "AAAA":
+        cmds.extend([
+            ["/usr/bin/dig", "+short", host, "AAAA"],
+            ["/usr/bin/nslookup", "-query=AAAA", host, "8.8.8.8"],
+        ])
+        for cmd in cmds:
+            try:
+                out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=1.5).decode("utf-8", errors="ignore")
+                for line in out.splitlines():
+                    line = line.strip().lower()
+                    if ":" in line and not line.startswith(";") and "server" not in line and "address" not in line:
+                        token = line.split()[-1]
+                        if ":" in token and token not in results:
+                            results.append(token)
+                if results:
+                    return results
+            except Exception:
+                pass
+    return results
+
+
+def _resolve_ipv4_addresses(host, port):
+    """Resolve hostname to IPv4 (AF_INET) addresses using 5 multi-layered fallbacks:
+    1. Fast in-memory cache.
+    2. OS getaddrinfo (family=0 / AF_UNSPEC so macOS mDNSResponder never blocks on AF_INET-only queries) + gethostbyname_ex.
+    3. Native macOS/Linux system CLI resolvers (/usr/bin/dscacheutil, /usr/bin/dig, /usr/bin/nslookup).
+    4. Pure IPv4 UDP DNS directly to 8.8.8.8:53 and 1.1.1.1:53.
+    5. Pure IPv4 HTTPS DoH directly to 8.8.8.8:443 and 1.1.1.1:443 with User-Agent header.
+    """
+    import socket
     h = str(host or "").strip().lower()
     if not h:
         return []
@@ -2118,19 +2177,39 @@ def _resolve_ipv4_addresses(host, port):
 
     ipv4_list = []
     with _DNS_QUERY_SEM:
-        try:
-            infos = socket.getaddrinfo(h, int(port), socket.AF_INET, socket.SOCK_STREAM)
-            for info in infos:
-                ip = info[4][0]
-                if ip and ip not in ipv4_list:
-                    ipv4_list.append(ip)
-        except Exception:
-            pass
+        # Try family=0 (AF_UNSPEC) first so macOS mDNSResponder returns cached dual-stack records
+        for fam in (0, socket.AF_INET):
+            try:
+                infos = socket.getaddrinfo(h, int(port), fam, socket.SOCK_STREAM)
+                for info in infos:
+                    if info[0] == socket.AF_INET:
+                        ip = info[4][0]
+                        if ip and ip not in ipv4_list:
+                            ipv4_list.append(ip)
+                if ipv4_list:
+                    break
+            except Exception:
+                pass
+        if not ipv4_list:
+            try:
+                _, _, ips = socket.gethostbyname_ex(h)
+                for ip in ips:
+                    if ip and ip not in ipv4_list:
+                        ipv4_list.append(ip)
+            except Exception:
+                pass
 
     if ipv4_list:
         with _IPV4_DNS_LOCK:
             _IPV4_DNS_CACHE[h] = list(ipv4_list)
         return ipv4_list
+
+    # Try native macOS / system CLI tools (dscacheutil / dig / nslookup)
+    cli_ips = _resolve_via_system_cli(h, qtype="A")
+    if cli_ips:
+        with _IPV4_DNS_LOCK:
+            _IPV4_DNS_CACHE[h] = list(cli_ips)
+        return cli_ips
 
     # Pure IPv4 UDP DNS fallback to Google (8.8.8.8) and Cloudflare (1.1.1.1)
     for dns_server in ("8.8.8.8", "1.1.1.1", "9.9.9.9"):
@@ -2139,7 +2218,7 @@ def _resolve_ipv4_addresses(host, port):
             with _IPV4_DNS_LOCK:
                 _IPV4_DNS_CACHE[h] = list(ips)
             return ips
-        if rcode == 3:  # NXDOMAIN (domain definitely does not exist)
+        if rcode == 3:  # NXDOMAIN
             with _IPV4_DNS_LOCK:
                 _IPV4_DNS_CACHE[h] = []
             return []
@@ -2154,7 +2233,7 @@ def _resolve_ipv4_addresses(host, port):
             with _IPV4_DNS_LOCK:
                 _IPV4_DNS_CACHE[h] = list(ips)
             return ips
-        if status in (0, 3):  # Authoritative answer received confirming 0 A records
+        if status in (0, 3):
             break
 
     with _IPV4_DNS_LOCK:
@@ -2198,30 +2277,58 @@ def _ensure_universal_scram_client():
 
 
 def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
-    """Connects to PostgreSQL using an explicit IPv4 (AF_INET) TCP socket, unverified SSL context,
-    and Universal SCRAM-SHA-256 ('n,,' GS2 header) compatible with both Supavisor poolers and direct Postgres.
+    """Connects to PostgreSQL using dual-stack (IPv4 priority + IPv6/NAT64 automatic fallback) sockets,
+    unverified SSL context, and Universal SCRAM-SHA-256 ('n,,' GS2 header).
     """
-    import pg8000.dbapi
+    import pg8000.dbapi, socket, ssl
 
     _ensure_universal_scram_client()
 
+    # Build prioritized list of (family, sockaddr) connection targets:
+    # 1. All resolved IPv4 addresses (AF_INET)
+    # 2. Any OS getaddrinfo targets including IPv6 / NAT64 (AF_INET6) when macOS IPv6 is Automatic
+    targets = []
+    seen_addrs = set()
+
     ipv4_addrs = _resolve_ipv4_addresses(host, port)
-    if not ipv4_addrs:
-        raise OSError(f"Host '{host}' has no IPv4 address (IPv6-only endpoint).")
+    for ip in ipv4_addrs:
+        key = (socket.AF_INET, ip, int(port))
+        if key not in seen_addrs:
+            seen_addrs.add(key)
+            targets.append((socket.AF_INET, (ip, int(port))))
+
+    try:
+        infos = socket.getaddrinfo(host, int(port), 0, socket.SOCK_STREAM)
+        # Add any AF_INET first, then AF_INET6
+        for fam_filter in (socket.AF_INET, socket.AF_INET6):
+            for info in infos:
+                fam, _, _, _, sockaddr = info
+                if fam == fam_filter:
+                    addr_str = sockaddr[0]
+                    key = (fam, addr_str, int(port))
+                    if key not in seen_addrs:
+                        seen_addrs.add(key)
+                        targets.append((fam, sockaddr))
+    except Exception:
+        pass
 
     last_err = None
     sock = None
-    for ip in ipv4_addrs:
+
+    for fam, sockaddr in targets:
         s = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
+            s = socket.socket(fam, socket.SOCK_STREAM)
+            # Use slightly shorter timeout for IPv6 fallback if IPv4 already failed
+            t_val = timeout if fam == socket.AF_INET else min(timeout, 2.5)
+            s.settimeout(t_val)
             try:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception:
                 pass
-            s.connect((ip, int(port)))
+            s.connect(sockaddr)
+            s.settimeout(timeout)
             sock = s
             break
         except Exception as e:
@@ -2232,9 +2339,22 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
                 except Exception:
                     pass
 
+    # Final fallback: standard Python socket.create_connection
     if sock is None:
-        err_detail = str(last_err) if last_err else "TCP handshake failed"
-        raise OSError(f"IPv4 connection to {host} ({ipv4_addrs[0]}:{port}) failed: {err_detail}")
+        try:
+            sock = socket.create_connection((host, int(port)), timeout=timeout)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+        except Exception as e:
+            if last_err is None:
+                last_err = e
+
+    if sock is None:
+        err_detail = str(last_err) if last_err else f"DNS/TCP unreachable for {host}:{port}"
+        raise OSError(f"Connection to {host}:{port} failed: {err_detail}")
 
     try:
         ssl_ctx = ssl._create_unverified_context()
@@ -2268,6 +2388,7 @@ def _detect_project_region_exact(ref):
        and matches the AWS EC2 IPv6 /32 prefix (e.g. 2600:1f18 -> us-east-1, 2600:1f16 -> us-east-2).
     2. Falls back to checking Cloudflare cf-ray header over pure IPv4.
     """
+    import socket, ssl
     if not ref:
         return None
 
@@ -2293,11 +2414,24 @@ def _detect_project_region_exact(ref):
 
     db_host = f"db.{ref}.supabase.co"
     ipv6_list = []
-    for dns_srv in ("8.8.8.8", "1.1.1.1"):
-        _, res = _query_dns_udp_ipv4(db_host, qtype=28, dns_ip=dns_srv, timeout=0.6)
-        if res:
-            ipv6_list.extend(res)
-            break
+    try:
+        infos6 = socket.getaddrinfo(db_host, 5432, socket.AF_INET6, socket.SOCK_STREAM)
+        for info in infos6:
+            ip6 = str(info[4][0]).lower()
+            if ip6 and ip6 not in ipv6_list:
+                ipv6_list.append(ip6)
+    except Exception:
+        pass
+    if not ipv6_list:
+        cli_ip6 = _resolve_via_system_cli(db_host, qtype="AAAA")
+        if cli_ip6:
+            ipv6_list.extend(cli_ip6)
+    if not ipv6_list:
+        for dns_srv in ("8.8.8.8", "1.1.1.1"):
+            _, res = _query_dns_udp_ipv4(db_host, qtype=28, dns_ip=dns_srv, timeout=0.6)
+            if res:
+                ipv6_list.extend(res)
+                break
     if not ipv6_list:
         _, res = _query_doh_ipv4_literal(db_host, qtype="AAAA", dns_ip="8.8.8.8", host_header="dns.google", path="/resolve", timeout=1.2)
         if res:
@@ -2363,12 +2497,26 @@ def _detect_project_region_exact(ref):
     return None
 
 
+def _is_tenant_not_found_error(err_msg):
+    """Detects Supavisor 'tenant not found' errors across both legacy ('Tenant or user not found')
+    and modern ('(ENOTFOUND) tenant/user ... not found') formats.
+    """
+    m = str(err_msg or "").lower()
+    return (
+        "tenant or user not found" in m
+        or "tenant/user" in m
+        or ("enotfound" in m and "not found" in m)
+        or "tenant not found" in m
+    )
+
+
 def _connect_supabase_with_auto_pooler(host, port, user, password, database, timeout=12):
     """
-    Connects to PostgreSQL Cloud DB via pg8000 using pure IPv4 (AF_INET) sockets.
+    Connects to PostgreSQL Cloud DB via pg8000 using dual-stack (IPv4 priority + IPv6/NAT64 fallback) sockets.
     - If direct host (e.g. db.<ref>.supabase.co) is IPv6-only on macOS DHCP WiFi, skips direct host
       immediately and auto-discovers the active IPv4 Pooler endpoint on port 6543 across all regions.
-    - Never masks pooler connection results with misleading IPv6 errors.
+    - If a wrong-region pooler host (e.g. aws-0-us-east-1) is entered, detects '(ENOTFOUND) tenant/user'
+      and automatically switches to the project's true AWS region (e.g. aws-0-us-east-2).
     Returns (conn, active_host, active_port, active_user).
     """
     import pg8000.dbapi, threading
@@ -2388,8 +2536,8 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
     first_err = None
     initial_reachable = 0
 
-    # Only try direct host if it actually resolves to IPv4 (or if we have no ref to discover a pooler)
-    if host_ipv4s or not ref:
+    # Always try the entered host first if it resolves to IPv4, is a pooler host, or has no ref
+    if host_ipv4s or not ref or "pooler" in str(host).lower():
         u_primary = f"postgres.{ref}" if ("pooler" in str(host).lower() and user == "postgres" and ref) else user
         # Always test port 6543 first for Cloud DB / pooler hosts so we don't hang on blocked port 5432
         is_cloud_host = "supabase" in str(host).lower() or "pooler" in str(host).lower()
@@ -2416,22 +2564,23 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                     pass
                 return conn, host, c_port, u_primary
             except Exception as e:
-                if first_err is None:
-                    first_err = e
                 msg = str(e).lower()
                 if "password authentication failed" in msg:
                     raise RuntimeError(
                         f"Connected to DB host {host}:{c_port}, but password authentication failed. Please verify your DB password."
                     ) from e
-                if "tenant or user not found" in msg:
+                if _is_tenant_not_found_error(e):
                     initial_reachable += 1
                     if not ref:
                         raise RuntimeError(
                             f"Connected to pooler {host}:{c_port}, but 'Tenant or user not found'.\n"
                             "When using a pooler host, your DB User must include your Project ID: postgres.YOUR_PROJECT_ID"
                         ) from e
-                    # Wrong region pooler host! Stop testing port 5432 on this host and scan other regions immediately!
+                    # Wrong region pooler host! Clear first_err, stop testing this host, and scan other regions immediately!
+                    first_err = None
                     break
+                if first_err is None:
+                    first_err = e
 
     if ref:
         all_regions = [
@@ -2504,10 +2653,10 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                                 f"Discovered IPv4 Cloud DB Pooler ({p_host}:{p_port}), but Password Authentication Failed for user '{pooler_user}'. Please verify your DB password."
                             )
                             done_evt.set()
-                    elif "tenant or user not found" in p_msg:
+                    elif _is_tenant_not_found_error(pe):
                         with lock:
                             found["reachable_count"] += 1
-                    elif p_host.startswith("aws-0-") or "has no ipv4 address" not in p_msg:
+                    else:
                         with lock:
                             if found["other_err"] is None:
                                 found["other_err"] = f"{p_host}:{p_port} -> {pe}"
@@ -2550,6 +2699,32 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                 t = threading.Thread(target=_probe, args=(item, 2.5), daemon=True)
                 t.start()
             done_evt.wait(timeout=3.5)
+
+        # Phase 3: Final dual-stack fallback to direct host db.<ref>.supabase.co:5432 (supports IPv6/NAT64 networks)
+        if found["conn"] is None and found["auth_err"] is None:
+            direct_host = f"db.{ref}.supabase.co"
+            try:
+                c_direct = _pg8000_connect_ipv4(
+                    host=direct_host,
+                    port=5432,
+                    user="postgres",
+                    password=password,
+                    database=database,
+                    timeout=3.5,
+                )
+                try:
+                    c_direct.commit()
+                except Exception:
+                    pass
+                found["conn"] = c_direct
+                found["host"] = direct_host
+                found["port"] = 5432
+                found["user"] = "postgres"
+            except Exception as de:
+                if "password authentication failed" in str(de).lower():
+                    found["auth_err"] = RuntimeError(
+                        f"Connected to Direct DB ({direct_host}:5432), but Password Authentication Failed. Please verify your DB password."
+                    )
 
         if found["conn"] is not None:
             try:
