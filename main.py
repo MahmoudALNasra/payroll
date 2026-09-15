@@ -861,7 +861,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.43"
+APP_VERSION = "2.5.45"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1797,10 +1797,18 @@ class PostgresCursorProxy:
                                         self.conn.rollback()
                                     except Exception:
                                         pass
-                                if _is_connectivity_error(inner_e):
-                                    pass
+                                if is_db_compatibility_or_schema_error(inner_e):
+                                    try:
+                                        trigger_db_update_required_popup(inner_e)
+                                    except Exception:
+                                        pass
                                 raise inner_e
                     else:
+                        if is_db_compatibility_or_schema_error(inner_e):
+                            try:
+                                trigger_db_update_required_popup(inner_e)
+                            except Exception:
+                                pass
                         raise
             finally:
                 pass
@@ -1815,6 +1823,11 @@ class PostgresCursorProxy:
                 except Exception:
                     pass
             except Exception as inner_e:
+                if is_db_compatibility_or_schema_error(inner_e):
+                    try:
+                        trigger_db_update_required_popup(inner_e)
+                    except Exception:
+                        pass
                 raise
         if needs_savepoint:
             self._description = None
@@ -9588,17 +9601,105 @@ def _init_db_schema(cursor, seed=True):
         _seed_defaults_if_empty(cursor)
 
 
+GLOBAL_APP_INSTANCE = None
+_LAST_DB_UPDATE_POPUP_TIME = 0.0
+
+
+def is_db_compatibility_or_schema_error(err, title=""):
+    """Detect database errors caused by schema/column/table mismatches or outdated app versions."""
+    if err is None and not title:
+        return False
+    cls_name = type(err).__name__.lower() if err is not None else ""
+    msg = f"{title} {err}".lower()
+
+    # Pure network/socket errors should not trigger DB update required popup unless schema keywords exist
+    pure_net_markers = (
+        "failed to connect",
+        "could not connect",
+        "connection refused",
+        "connection reset",
+        "network is unreachable",
+        "server closed the connection",
+        "connection is closed",
+        "timed out",
+        "timeout",
+        "getaddrinfo",
+        "name or service not known",
+    )
+    schema_explicit_markers = (
+        "no such column",
+        "has no column named",
+        "does not exist",
+        "no such table",
+        "undefinedcolumn",
+        "undefinedtable",
+        "datatype mismatch",
+        "violates not-null constraint",
+        "null value in column",
+        "syntax error",
+        "table_info",
+    )
+    if any(m in msg for m in schema_explicit_markers):
+        return True
+    if any(n in msg for n in pure_net_markers):
+        return False
+
+    db_cls_markers = (
+        "operationalerror",
+        "programmingerror",
+        "databaseerror",
+        "integrityerror",
+        "undefinedcolumn",
+        "undefinedtable",
+        "datatypemismatch",
+        "internalerror",
+        "dataerror",
+    )
+    if any(m in cls_name for m in db_cls_markers):
+        return True
+
+    db_text_markers = (
+        "database error",
+        "db error",
+        "column ",
+        "relation ",
+        "schema",
+        "operationalerror",
+        "programmingerror",
+    )
+    return any(m in msg for m in db_text_markers)
+
+
+def trigger_db_update_required_popup(err=None, title="", parent=None):
+    """Thread-safe trigger to show the Update Required popup and Bottom Yellow Update Button."""
+    global _LAST_DB_UPDATE_POPUP_TIME
+    import time as _t
+    now = _t.time()
+    if now - _LAST_DB_UPDATE_POPUP_TIME < 2.0:
+        return
+    _LAST_DB_UPDATE_POPUP_TIME = now
+    app_inst = GLOBAL_APP_INSTANCE
+    if app_inst is not None:
+        try:
+            app_inst.after(0, lambda: app_inst.show_db_update_required_popup(error_details=err, title=title, parent=parent))
+        except Exception:
+            pass
+
+
 if HAS_DEPS:
     
     class PayrollApp(tk.Tk):
         def __init__(self):
+            global GLOBAL_APP_INSTANCE
             super().__init__()
+            GLOBAL_APP_INSTANCE = self
             try:
                 self.tk = SafeTkProxy(self.tk)
             except Exception:
                 pass
             self.style = tb.Style(theme=APP_THEME)
             self.title(APP_TITLE)
+            self._install_db_error_interceptors()
             
             # Start zoomed/maximized automatically (ideal for 13" MacBook keeping dock and top menu bar visible)
             if platform.system() == "Darwin":
@@ -10529,8 +10630,415 @@ if HAS_DEPS:
             finally:
                 self.hide_busy()
 
+        def _install_db_error_interceptors(self):
+            """Intercept messagebox.showerror calls and unhandled Tkinter callback errors for DB compatibility issues."""
+            if getattr(messagebox, "_db_interceptor_installed", False):
+                return
+            orig_showerror = messagebox.showerror
+
+            def _wrapped_showerror(title, message, **kwargs):
+                try:
+                    if is_db_compatibility_or_schema_error(message, title):
+                        app = GLOBAL_APP_INSTANCE or self
+                        if app is not None:
+                            parent = kwargs.get("parent", app)
+                            app.after(
+                                10,
+                                lambda: app.show_db_update_required_popup(
+                                    error_details=f"{title}: {message}",
+                                    title=str(title or "Database Error"),
+                                    parent=parent,
+                                ),
+                            )
+                            return "ok"
+                except Exception:
+                    pass
+                return orig_showerror(title, message, **kwargs)
+
+            messagebox.showerror = _wrapped_showerror
+            messagebox._db_interceptor_installed = True
+
+        def report_callback_exception(self, exc, val, tb_obj):
+            """Tkinter hook for unhandled exceptions in widget callbacks."""
+            import traceback as _tb
+            detail = "".join(_tb.format_exception(exc, val, tb_obj))
+            if is_db_compatibility_or_schema_error(val) or is_db_compatibility_or_schema_error(detail):
+                self.show_db_update_required_popup(
+                    error_details=detail,
+                    title="Database Error — Update Required",
+                    parent=self,
+                )
+            else:
+                self.show_app_error("Application Error", val, parent=self)
+
+        def _run_yellow_button_update(self, btn_widget=None, status_label=None, parent_win=None):
+            """Downloads and installs the latest app update when the user clicks the Yellow Update Button."""
+            target_parent = parent_win if (parent_win and parent_win.winfo_exists()) else self
+            if btn_widget and btn_widget.winfo_exists():
+                try:
+                    btn_widget.config(
+                        text="⏳ Connecting to internet & downloading update... Please wait...",
+                        state="disabled",
+                    )
+                except Exception:
+                    pass
+            if status_label and status_label.winfo_exists():
+                try:
+                    status_label.config(
+                        text="🌐 Checking internet connection & downloading latest update from cloud server...",
+                        fg="#b45309",
+                    )
+                except Exception:
+                    pass
+
+            def _worker():
+                try:
+                    status, data = check_for_cloud_update()
+                    r_ver = data.get("remote_version") or "Latest"
+                    remote_code = data.get("remote_code")
+                    remote_hash = data.get("remote_hash")
+
+                    if status == "error" or not remote_code:
+                        err_msg = data.get("error") or "Unable to reach update server."
+                        def _on_net_fail():
+                            if btn_widget and btn_widget.winfo_exists():
+                                try:
+                                    btn_widget.config(
+                                        text="✨ YELLOW UPDATE BUTTON: Click Here to Update Now (Internet Required) ✨",
+                                        state="normal",
+                                    )
+                                except Exception:
+                                    pass
+                            if status_label and status_label.winfo_exists():
+                                try:
+                                    status_label.config(
+                                        text="⚠️ No internet connection detected. Connect to the internet and click the Yellow Update Button again.",
+                                        fg="#dc2626",
+                                    )
+                                except Exception:
+                                    pass
+                            messagebox.showwarning(
+                                "Internet Connection Required 🌐",
+                                "Could not download the update because the update server could not be reached.\n\n"
+                                "⚠️ Remember: You need an active INTERNET CONNECTION for the update to happen.\n\n"
+                                f"Details: {err_msg}\n\n"
+                                "Please check your internet connection and click the Yellow Update Button at the bottom again.",
+                                parent=target_parent,
+                            )
+                        self.after(0, _on_net_fail)
+                        return
+
+                    ok, msg = install_cloud_update(remote_code, remote_hash)
+
+                    def _on_done():
+                        if ok:
+                            if btn_widget and btn_widget.winfo_exists():
+                                try:
+                                    btn_widget.config(
+                                        text=f"✅ Update v{r_ver} Installed! Click Here to Restart App Now",
+                                        state="normal",
+                                        command=restart_app,
+                                    )
+                                except Exception:
+                                    pass
+                            if status_label and status_label.winfo_exists():
+                                try:
+                                    status_label.config(
+                                        text=f"✅ Update v{r_ver} installed successfully! Restarting application...",
+                                        fg="#15803d",
+                                    )
+                                except Exception:
+                                    pass
+                            ans = messagebox.askyesno(
+                                "Update Installed Successfully 🎉",
+                                f"Update v{r_ver} has been downloaded and installed!\n\n"
+                                "The application needs to restart to apply the database fixes.\n\n"
+                                "• Click [Yes] to restart automatically now.",
+                                parent=target_parent,
+                            )
+                            if ans:
+                                restart_app()
+                        else:
+                            if btn_widget and btn_widget.winfo_exists():
+                                try:
+                                    btn_widget.config(
+                                        text="✨ YELLOW UPDATE BUTTON: Retry Update Now (Internet Required) ✨",
+                                        state="normal",
+                                    )
+                                except Exception:
+                                    pass
+                            messagebox.showerror(
+                                "Update Installation Failed",
+                                f"Could not install update:\n{msg}\n\nPlease ensure you have internet access and write permissions.",
+                                parent=target_parent,
+                            )
+                    self.after(0, _on_done)
+                except Exception as exc:
+                    def _on_exc():
+                        if btn_widget and btn_widget.winfo_exists():
+                            try:
+                                btn_widget.config(
+                                    text="✨ YELLOW UPDATE BUTTON: Retry Update Now (Internet Required) ✨",
+                                    state="normal",
+                                )
+                            except Exception:
+                                pass
+                        messagebox.showwarning(
+                            "Internet Connection Required 🌐",
+                            f"Update failed: {exc}\n\nPlease ensure you have an active internet connection and try again.",
+                            parent=target_parent,
+                        )
+                    self.after(0, _on_exc)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def ensure_bottom_yellow_update_bar(self, force_show=False, remote_version=None, update_data=None):
+            """Ensures a high-visibility Yellow Update Button bar is anchored at the very bottom of the window."""
+            try:
+                if update_data:
+                    self._cached_bottom_update_data = update_data
+                if remote_version:
+                    self._cached_bottom_remote_ver = remote_version
+
+                if not hasattr(self, "_bottom_upd_banner") or not self._bottom_upd_banner.winfo_exists():
+                    self._bottom_upd_banner = tk.Frame(
+                        self,
+                        bg="#fde047",
+                        highlightbackground="#ca8a04",
+                        highlightthickness=2,
+                        bd=0,
+                    )
+
+                banner = self._bottom_upd_banner
+                for child in banner.winfo_children():
+                    child.destroy()
+
+                r_ver = remote_version or getattr(self, "_cached_bottom_remote_ver", None) or "Latest"
+
+                inner = tk.Frame(banner, bg="#fde047", padx=12, pady=6)
+                inner.pack(fill=X, expand=True)
+
+                info_lbl = tk.Label(
+                    inner,
+                    text="🌐 Internet connection required for update  •  ",
+                    font=("Segoe UI", 9, "bold"),
+                    bg="#fde047",
+                    fg="#713f12",
+                )
+                info_lbl.pack(side=LEFT, padx=(4, 4))
+
+                yellow_btn = tk.Button(
+                    inner,
+                    text=f"✨ YELLOW UPDATE BUTTON: Click Here to Download & Install Update ({r_ver}) Now ✨",
+                    font=("Segoe UI", 10, "bold"),
+                    bg="#facc15",
+                    fg="#0f172a",
+                    activebackground="#eab308",
+                    activeforeground="#000000",
+                    relief="raised",
+                    bd=2,
+                    padx=16,
+                    pady=4,
+                    cursor="hand2",
+                )
+                yellow_btn.config(
+                    command=lambda b=yellow_btn: self._run_yellow_button_update(btn_widget=b, parent_win=self)
+                )
+                yellow_btn.pack(side=LEFT, fill=X, expand=True, padx=6)
+
+                if force_show or getattr(self, "_db_error_update_needed", False):
+                    self._db_error_update_needed = True
+                    banner.place(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0)
+                    banner.lift()
+
+                    # Also start a gentle background poll if we don't have remote_version yet
+                    if not getattr(self, "_bottom_bar_polling", False):
+                        self._bottom_bar_polling = True
+                        def _poll_until_ready():
+                            if not getattr(self, "_db_error_update_needed", False):
+                                self._bottom_bar_polling = False
+                                return
+                            def _bg_check():
+                                try:
+                                    st, dt = check_for_cloud_update()
+                                    rv = dt.get("remote_version")
+                                    if rv and st in ("update_available", "up_to_date", "installed_pending_restart"):
+                                        self._cached_bottom_remote_ver = rv
+                                        self._cached_bottom_update_data = dt
+                                        def _upd_ui():
+                                            if yellow_btn.winfo_exists():
+                                                yellow_btn.config(
+                                                    text=f"✨ YELLOW UPDATE BUTTON READY (v{rv}): Click Here to Install Update Now! ✨",
+                                                    bg="#facc15",
+                                                )
+                                            if info_lbl.winfo_exists():
+                                                info_lbl.config(
+                                                    text="✅ Update Ready (Internet Connected)  •  ",
+                                                    fg="#15803d",
+                                                )
+                                        self.after(0, _upd_ui)
+                                except Exception:
+                                    pass
+                                finally:
+                                    if getattr(self, "_db_error_update_needed", False):
+                                        try:
+                                            self.after(8000, _poll_until_ready)
+                                        except Exception:
+                                            pass
+                            threading.Thread(target=_bg_check, daemon=True).start()
+                        self.after(500, _poll_until_ready)
+            except Exception:
+                pass
+
+        def show_db_update_required_popup(self, error_details=None, title="", parent=None):
+            """Pops out a dedicated modal window informing the user they need to update due to missed updates / DB error."""
+            try:
+                self._db_error_update_needed = True
+                self.ensure_bottom_yellow_update_bar(force_show=True)
+            except Exception:
+                pass
+
+            # Avoid stacking multiple identical DB update popups simultaneously
+            if getattr(self, "_active_db_update_popup", None) is not None:
+                try:
+                    if self._active_db_update_popup.winfo_exists():
+                        self._active_db_update_popup.lift()
+                        self._active_db_update_popup.focus_force()
+                        return
+                except Exception:
+                    pass
+
+            parent_win = parent if (parent and hasattr(parent, "winfo_exists") and parent.winfo_exists()) else self
+            win = tb.Toplevel(parent_win)
+            self._active_db_update_popup = win
+            win.title("⚠️ Update Required — Missed Updates / Database Issue")
+            win.geometry("600x470")
+            win.minsize(540, 430)
+            win.transient(parent_win)
+            _safe_grab_set(win)
+
+            def _close_popup():
+                self._active_db_update_popup = None
+                try:
+                    self.ensure_bottom_yellow_update_bar(force_show=True)
+                except Exception:
+                    pass
+                _safe_grab_release(win, parent_win)
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+            win.protocol("WM_DELETE_WINDOW", _close_popup)
+
+            # Top warning header banner
+            top_banner = tk.Frame(win, bg="#fef08a", bd=1, relief="solid", padx=16, pady=12)
+            top_banner.pack(fill=X, padx=16, pady=(16, 10))
+
+            tk.Label(
+                top_banner,
+                text="⚠️ YOU NEED TO UPDATE THE APPLICATION",
+                font=("Segoe UI", 13, "bold"),
+                bg="#fef08a",
+                fg="#854d0e",
+            ).pack(anchor=W)
+
+            tk.Label(
+                top_banner,
+                text="Database Error Detected Because Updates Were Missed",
+                font=("Segoe UI", 10, "bold"),
+                bg="#fef08a",
+                fg="#a16207",
+            ).pack(anchor=W, pady=(2, 0))
+
+            # Main instructions card
+            body_card = tb.Labelframe(win, text=" What You Need To Do ", padding=14, bootstyle="warning")
+            body_card.pack(fill=X, padx=16, pady=6)
+
+            msg_text = (
+                "1. You encountered a database error because your app missed several updates and needs to be updated.\n\n"
+                "2. ⏳ Please WAIT FOR THE YELLOW UPDATE BUTTON ON THE BOTTOM of the window to show up, then click it to install the latest update.\n\n"
+                "3. 🌐 INTERNET CONNECTION REQUIRED: Please make sure you are connected to the internet — you need an active internet connection for the update to download and happen."
+            )
+            tb.Label(
+                body_card,
+                text=msg_text,
+                font=("Segoe UI", 10),
+                wraplength=530,
+                justify=LEFT,
+            ).pack(anchor=W)
+
+            # Live Yellow Update Button inside the popup window as well
+            action_frame = tk.Frame(win, bg="#fde047", bd=2, relief="ridge", padx=12, pady=10)
+            action_frame.pack(fill=X, padx=16, pady=(10, 6))
+
+            popup_status_lbl = tk.Label(
+                action_frame,
+                text="👇 The Yellow Update Button is now active at the bottom of the app (and below):",
+                font=("Segoe UI", 9, "bold"),
+                bg="#fde047",
+                fg="#713f12",
+            )
+            popup_status_lbl.pack(anchor=W, pady=(0, 6))
+
+            popup_yellow_btn = tk.Button(
+                action_frame,
+                text="✨ YELLOW UPDATE BUTTON: Click Here to Update App Now (Requires Internet) ✨",
+                font=("Segoe UI", 10, "bold"),
+                bg="#facc15",
+                fg="#0f172a",
+                activebackground="#eab308",
+                activeforeground="#000000",
+                relief="raised",
+                bd=2,
+                padx=14,
+                pady=8,
+                cursor="hand2",
+            )
+            popup_yellow_btn.config(
+                command=lambda: self._run_yellow_button_update(
+                    btn_widget=popup_yellow_btn,
+                    status_label=popup_status_lbl,
+                    parent_win=win,
+                )
+            )
+            popup_yellow_btn.pack(fill=X)
+
+            # Optional technical details / Close button row
+            bottom_row = tb.Frame(win)
+            bottom_row.pack(fill=X, padx=16, pady=(10, 14))
+
+            if error_details:
+                def _toggle_details():
+                    if details_box.winfo_ismapped():
+                        details_box.pack_forget()
+                        btn_tech.config(text="Show Technical Error")
+                    else:
+                        details_box.pack(fill=BOTH, expand=True, padx=16, pady=(0, 8), before=bottom_row)
+                        btn_tech.config(text="Hide Technical Error")
+
+                details_box = tk.Text(win, height=4, wrap="word", font=("Consolas", 8))
+                details_box.insert("1.0", str(error_details))
+                details_box.config(state="disabled")
+                btn_tech = tb.Button(bottom_row, text="Show Technical Error", bootstyle="secondary outline", command=_toggle_details)
+                btn_tech.pack(side=LEFT)
+
+            tb.Button(
+                bottom_row,
+                text="Got It — Wait for / Click Yellow Update Button at Bottom",
+                bootstyle="warning",
+                cursor="hand2",
+                command=_close_popup,
+            ).pack(side=RIGHT)
+
         def show_app_error(self, title, error, parent=None):
             """Error popup with optional Save-to-file for support/debugging."""
+            if is_db_compatibility_or_schema_error(error, title):
+                return self.show_db_update_required_popup(
+                    error_details=error,
+                    title=title or "Database Error",
+                    parent=parent,
+                )
             import traceback as _tb
             parent = parent or self
             if isinstance(error, BaseException):
@@ -10544,10 +11052,7 @@ if HAS_DEPS:
             win.title(title or "Error")
             win.geometry("520x360")
             win.transient(parent)
-            try:
-                win.grab_set()
-            except Exception:
-                pass
+            _safe_grab_set(win)
 
             tb.Label(win, text=title or "Error", font=("Segoe UI", 14, "bold"), bootstyle="danger").pack(
                 anchor=W, padx=16, pady=(14, 6)
@@ -10712,6 +11217,10 @@ if HAS_DEPS:
                     if status == "update_available":
                         def _show():
                             try:
+                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
+                            except Exception:
+                                pass
+                            try:
                                 if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
                                     for child in self._login_upd_badge_frame.winfo_children():
                                         child.destroy()
@@ -10871,6 +11380,10 @@ if HAS_DEPS:
                     is_forced = bool(data.get("is_forced", False))
                     if status == "update_available":
                         def _show():
+                            try:
+                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
+                            except Exception:
+                                pass
                             try:
                                 if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
                                     for child in self._main_upd_banner.winfo_children():
@@ -11082,6 +11595,8 @@ if HAS_DEPS:
             self._login_upd_badge_frame.grid(row=6, column=0, columnspan=2, pady=(10, 0))
             self._login_upd_badge_frame.grid_remove()
             self._check_login_updates_bg()
+            if getattr(self, "_db_error_update_needed", False):
+                self.ensure_bottom_yellow_update_bar(force_show=True)
 
             # Engine version & status indicator
             try:
@@ -11265,14 +11780,17 @@ if HAS_DEPS:
                 if getattr(e, "widget", None) is win:
                     if hasattr(self, "_active_modal_popups") and win in self._active_modal_popups:
                         self._active_modal_popups.remove(win)
+                    if hasattr(self, "_active_modal_popups"):
+                        self._active_modal_popups = [p for p in self._active_modal_popups if self._widget_alive(p)]
                     if hasattr(self, "_active_modal_popups") and self._active_modal_popups:
                         next_top = self._active_modal_popups[-1]
                         if self._widget_alive(next_top):
                             try:
                                 if platform.system() != "Darwin":
+                                    next_top.grab_set()
                                     next_top.attributes("-topmost", True)
                                 next_top.lift()
-                                next_top.focus_set()
+                                next_top.focus_force()
                             except Exception:
                                 pass
 
@@ -11291,6 +11809,11 @@ if HAS_DEPS:
             def _is_descendant_of(w, parent):
                 if w is None or parent is None:
                     return False
+                try:
+                    if w.winfo_toplevel() == parent:
+                        return True
+                except Exception:
+                    pass
                 w_str = str(w)
                 p_str = str(parent)
                 if w_str == p_str or w_str.startswith(p_str + ".") or (p_str in w_str):
@@ -11349,22 +11872,23 @@ if HAS_DEPS:
                 self._register_modal_popup(win)
 
         def _safe_grab_set(self, win):
-            """Modal grab without nested grabs. Skip entirely on macOS Aqua Tk."""
+            """Modal grab with hierarchical handoff from big window to small window."""
             if win is None or platform.system() == "Darwin":
                 return
             self._register_modal_popup(win)
             try:
                 current = win.grab_current()
-                if current is not None:
+                if current is not None and str(current) != str(win):
                     try:
-                        if str(current) != str(win):
-                            return
+                        current.grab_release()
                     except Exception:
-                        return
+                        pass
             except Exception:
                 pass
             try:
                 win.grab_set()
+                win.lift()
+                win.focus_force()
             except Exception:
                 pass
 
@@ -11376,6 +11900,18 @@ if HAS_DEPS:
                 pass
             if hasattr(self, "_active_modal_popups") and win in self._active_modal_popups:
                 self._active_modal_popups.remove(win)
+            if hasattr(self, "_active_modal_popups"):
+                self._active_modal_popups = [p for p in self._active_modal_popups if self._widget_alive(p)]
+                if self._active_modal_popups:
+                    prev_top = self._active_modal_popups[-1]
+                    if self._widget_alive(prev_top):
+                        try:
+                            if platform.system() != "Darwin":
+                                prev_top.grab_set()
+                            prev_top.lift()
+                            prev_top.focus_force()
+                        except Exception:
+                            pass
 
         def _envelope_ui_open(self):
             if getattr(self, "_envelope_opening", False):
@@ -11762,6 +12298,14 @@ if HAS_DEPS:
             dialog.focus_set()
             
             def _close_col_dialog():
+                active_p = getattr(self, "_active_col_color_picker", None)
+                if self._widget_alive(active_p):
+                    try:
+                        self._safe_grab_release(active_p)
+                        active_p.destroy()
+                    except Exception:
+                        pass
+                    self._active_col_color_picker = None
                 self._safe_grab_release(dialog)
                 dialog.destroy()
 
@@ -11857,74 +12401,382 @@ if HAS_DEPS:
                 self.apply_calendar_column_colors()
 
             def _open_color_picker_for_column(col_key, anchor_btn):
-                pop = tb.Toplevel(dialog)
-                pop.title(f"{self._tr('Choose Color')}: {self._tr(col_key)}")
-                pop.transient(dialog)
-                pop.resizable(False, False)
+                import colorsys
+
+                # 1. Close any existing small color picker window first (prevent over-populating small windows)
+                existing = getattr(self, "_active_col_color_picker", None)
+                if self._widget_alive(existing):
+                    try:
+                        self._safe_grab_release(existing)
+                        existing.destroy()
+                    except Exception:
+                        pass
+                    self._active_col_color_picker = None
+
+                original_hex = color_vars.get(col_key, "")
+
+                # Release grab on bigger dialog first so small window receives 100% of mouse/keyboard input
                 try:
-                    bx = anchor_btn.winfo_rootx()
-                    by = anchor_btn.winfo_rooty() + anchor_btn.winfo_height() + 4
-                    pop.geometry(f"+{max(20, bx - 120)}+{max(20, by)}")
+                    dialog.grab_release()
                 except Exception:
                     pass
+
+                pop = tb.Toplevel(dialog)
+                self._active_col_color_picker = pop
+                pop.title(f"🎨 {self._tr('Edit Colors (Paint Palette)')} — {self._tr(col_key)}")
+                pop.transient(dialog)
+                pop.resizable(False, False)
+                pop.geometry("590x445")
+                try:
+                    bx = max(40, dialog.winfo_rootx() + 45)
+                    by = max(40, dialog.winfo_rooty() + 50)
+                    pop.geometry(f"590x445+{bx}+{by}")
+                except Exception:
+                    pass
+
+                def _close_picker(apply_hex=None, revert=False):
+                    if revert:
+                        _set_col_color(col_key, original_hex)
+                    elif apply_hex is not None:
+                        _set_col_color(col_key, apply_hex)
+                    try:
+                        self._safe_grab_release(pop)
+                    except Exception:
+                        pass
+                    try:
+                        if pop.winfo_exists():
+                            pop.destroy()
+                    except Exception:
+                        pass
+                    self._active_col_color_picker = None
+                    # Restore grab and focus back to the bigger Columns dialog
+                    if self._widget_alive(dialog):
+                        try:
+                            self._safe_grab_set(dialog)
+                            dialog.lift()
+                            dialog.focus_force()
+                        except Exception:
+                            pass
+
+                pop.protocol("WM_DELETE_WINDOW", lambda: _close_picker(revert=True))
                 self._safe_grab_set(pop)
-                pop.focus_set()
+                pop.focus_force()
 
-                p_frame = tb.Frame(pop, padding=14)
-                p_frame.pack(fill=BOTH, expand=True)
-                tb.Label(
-                    p_frame,
-                    text=f"{self._tr('Select Column Color for')} '{self._tr(col_key)}'",
-                    font=("Segoe UI", 10, "bold"),
-                ).pack(anchor=W, pady=(0, 8))
+                # Parse starting RGB / HLS values
+                start_hex = original_hex if (original_hex and original_hex.startswith("#") and len(original_hex) == 7) else "#dcfce7"
+                try:
+                    init_r = int(start_hex[1:3], 16)
+                    init_g = int(start_hex[3:5], 16)
+                    init_b = int(start_hex[5:7], 16)
+                except Exception:
+                    init_r, init_g, init_b = 220, 252, 231
+                init_h, init_l, init_s = colorsys.rgb_to_hls(init_r / 255.0, init_g / 255.0, init_b / 255.0)
 
-                grid_f = tb.Frame(p_frame)
-                grid_f.pack(fill=X, pady=(0, 10))
+                state = {
+                    "h": init_h,
+                    "l": init_l,
+                    "s": init_s,
+                    "r": init_r,
+                    "g": init_g,
+                    "b": init_b,
+                    "updating": False,
+                }
+
+                outer = tb.Frame(pop, padding=14)
+                outer.pack(fill=BOTH, expand=True)
+
+                # Top Basic Preset Swatches Bar (1-click quick presets)
+                preset_lf = tb.Labelframe(outer, text=self._tr("Basic / Preset Colors (Click to select)"), padding=(8, 4), bootstyle="info")
+                preset_lf.pack(fill=X, pady=(0, 8))
                 for idx, (p_name, p_hex) in enumerate(PRESET_PALETTE):
-                    r_i, c_i = divmod(idx, 4)
                     fg_c = self._contrast_text_for_hex(p_hex)
-                    sw_btn = tk.Button(
-                        grid_f,
+                    sw = tk.Button(
+                        preset_lf,
                         text=p_name,
                         bg=p_hex,
                         fg=fg_c,
                         activebackground=p_hex,
                         activeforeground=fg_c,
-                        font=("Segoe UI", 9, "bold"),
-                        width=10,
+                        font=("Segoe UI", 8, "bold"),
+                        width=6,
                         relief="groove",
                         bd=1,
                         cursor="hand2",
-                        command=lambda hx=p_hex: (_set_col_color(col_key, hx), self._safe_grab_release(pop), pop.destroy()),
                     )
-                    sw_btn.grid(row=r_i, column=c_i, padx=3, pady=3)
+                    sw.pack(side=LEFT, padx=2, pady=2, expand=True, fill=X)
+                    sw.configure(command=lambda hx=p_hex: _load_hex_into_palette(hx))
 
-                bot_f = tb.Frame(p_frame)
-                bot_f.pack(fill=X, pady=(4, 0))
+                # Middle Paint Interactive Area: 2D Rainbow Spectrum + Luminance Slider + RGB Controls
+                mid_f = tb.Frame(outer)
+                mid_f.pack(fill=BOTH, expand=True, pady=4)
 
-                def _pick_custom():
-                    from tkinter import colorchooser
-                    init_c = color_vars.get(col_key) or "#dcfce7"
-                    rgb, hex_val = colorchooser.askcolor(color=init_c, title=f"{self._tr('Choose Color for')} {self._tr(col_key)}", parent=pop)
-                    if hex_val:
-                        _set_col_color(col_key, hex_val)
-                        self._safe_grab_release(pop)
-                        pop.destroy()
+                # 1. Left: 2D Rainbow Spectrum Canvas (Hue X-axis, Saturation Y-axis)
+                W_SPEC, H_SPEC = 175, 135
+                spec_frame = tb.Labelframe(mid_f, text=self._tr("Drag Color Spectrum"), padding=6, bootstyle="primary")
+                spec_frame.pack(side=LEFT, fill=Y, padx=(0, 8))
 
-                tb.Button(bot_f, text=self._tr("🎨 Custom Color..."), bootstyle="primary-outline", cursor="hand2", command=_pick_custom).pack(side=LEFT)
+                spec_row = tb.Frame(spec_frame)
+                spec_row.pack()
+
+                spec_canvas = tk.Canvas(spec_row, width=W_SPEC, height=H_SPEC, highlightthickness=1, highlightbackground="#94a3b8", cursor="crosshair")
+                spec_canvas.pack(side=LEFT)
+
+                # Build or reuse cached 2D rainbow spectrum image string
+                if not hasattr(self, "_cached_paint_spectrum_str"):
+                    rows_str = []
+                    for y_i in range(H_SPEC):
+                        sat_v = 1.0 - (y_i / float(H_SPEC - 1))
+                        r_cols = []
+                        for x_i in range(W_SPEC):
+                            hue_v = x_i / float(W_SPEC - 1)
+                            rr, gg, bb = colorsys.hls_to_rgb(hue_v, 0.5, sat_v)
+                            r_cols.append(f"#{int(rr*255):02x}{int(gg*255):02x}{int(bb*255):02x}")
+                        rows_str.append("{" + " ".join(r_cols) + "}")
+                    self._cached_paint_spectrum_str = " ".join(rows_str)
+
+                spec_img = tk.PhotoImage(width=W_SPEC, height=H_SPEC)
+                spec_img.put(self._cached_paint_spectrum_str, to=(0, 0))
+                spec_canvas.create_image(0, 0, image=spec_img, anchor="nw")
+                spec_canvas._img_ref = spec_img
+
+                # Crosshair marker on 2D spectrum
+                cross_outer = spec_canvas.create_oval(0, 0, 10, 10, outline="#000000", width=2)
+                cross_inner = spec_canvas.create_oval(1, 1, 9, 9, outline="#ffffff", width=1)
+
+                # 2. Vertical Luminance (Brightness) Bar next to spectrum
+                W_LUM = 24
+                lum_canvas = tk.Canvas(spec_row, width=W_LUM, height=H_SPEC, highlightthickness=1, highlightbackground="#94a3b8", cursor="sb_v_double_arrow")
+                lum_canvas.pack(side=LEFT, padx=(8, 0))
+                lum_img = tk.PhotoImage(width=W_LUM, height=H_SPEC)
+                lum_canvas.create_image(0, 0, image=lum_img, anchor="nw")
+                lum_canvas._img_ref = lum_img
+                lum_marker = lum_canvas.create_polygon(0, 0, W_LUM, 0, W_LUM // 2, 6, fill="#0f172a", outline="#ffffff")
+
+                def _redraw_luminance_bar():
+                    h_v, s_v = state["h"], state["s"]
+                    l_rows = []
+                    for y_i in range(H_SPEC):
+                        lum_v = 1.0 - (y_i / float(H_SPEC - 1))
+                        rr, gg, bb = colorsys.hls_to_rgb(h_v, lum_v, s_v)
+                        c_hex = f"#{int(rr*255):02x}{int(gg*255):02x}{int(bb*255):02x}"
+                        l_rows.append("{" + " ".join([c_hex] * W_LUM) + "}")
+                    lum_img.put(" ".join(l_rows), to=(0, 0))
+
+                # 3. Right Panel: Preview Swatch + RGB Sliders & Hex Code
+                rgb_frame = tb.Labelframe(mid_f, text=self._tr("RGB & Live Preview"), padding=10, bootstyle="secondary")
+                rgb_frame.pack(side=LEFT, fill=BOTH, expand=True)
+
+                preview_top = tb.Frame(rgb_frame)
+                preview_top.pack(fill=X, pady=(0, 8))
+                preview_box = tk.Label(
+                    preview_top,
+                    text=start_hex.upper(),
+                    font=("Segoe UI", 11, "bold"),
+                    width=14,
+                    height=2,
+                    relief="solid",
+                    bd=1,
+                )
+                preview_box.pack(side=LEFT, padx=(0, 10))
+
+                hex_f = tb.Frame(preview_top)
+                hex_f.pack(side=LEFT, fill=X, expand=True)
+                tb.Label(hex_f, text="Hex (#RRGGBB):", font=("Segoe UI", 9, "bold")).pack(anchor=W)
+                hex_var = tk.StringVar(value=start_hex.upper())
+                hex_entry = tb.Entry(hex_f, textvariable=hex_var, width=11, font=("Consolas", 10, "bold"))
+                hex_entry.pack(anchor=W, pady=(2, 0))
+
+                r_var = tk.IntVar(value=init_r)
+                g_var = tk.IntVar(value=init_g)
+                b_var = tk.IntVar(value=init_b)
+
+                def _make_rgb_slider_row(parent_f, label_txt, var_obj, accent_hex):
+                    rf = tb.Frame(parent_f)
+                    rf.pack(fill=X, pady=3)
+                    tb.Label(rf, text=label_txt, width=7, font=("Segoe UI", 9, "bold")).pack(side=LEFT)
+                    sc = tk.Scale(
+                        rf,
+                        from_=0,
+                        to=255,
+                        orient=HORIZONTAL,
+                        variable=var_obj,
+                        showvalue=False,
+                        highlightthickness=0,
+                        bd=0,
+                        troughcolor="#e2e8f0",
+                        activebackground=accent_hex,
+                        length=145,
+                        command=lambda _val: _on_rgb_slider_changed(),
+                    )
+                    sc.pack(side=LEFT, fill=X, expand=True, padx=4)
+                    sp = tb.Spinbox(
+                        rf,
+                        from_=0,
+                        to=255,
+                        textvariable=var_obj,
+                        width=5,
+                        font=("Segoe UI", 9),
+                        command=_on_rgb_slider_changed,
+                    )
+                    sp.pack(side=RIGHT)
+                    sp.bind("<Return>", lambda e: _on_rgb_slider_changed())
+                    sp.bind("<FocusOut>", lambda e: _on_rgb_slider_changed())
+
+                _make_rgb_slider_row(rgb_frame, "Red (R):", r_var, "#ef4444")
+                _make_rgb_slider_row(rgb_frame, "Green (G):", g_var, "#22c55e")
+                _make_rgb_slider_row(rgb_frame, "Blue (B):", b_var, "#3b82f6")
+
+                def _update_visual_markers_and_preview(live_apply=True):
+                    # Update crosshair on 2D spectrum
+                    cx = max(0, min(W_SPEC - 1, int(state["h"] * (W_SPEC - 1))))
+                    cy = max(0, min(H_SPEC - 1, int((1.0 - state["s"]) * (H_SPEC - 1))))
+                    spec_canvas.coords(cross_outer, cx - 5, cy - 5, cx + 5, cy + 5)
+                    spec_canvas.coords(cross_inner, cx - 4, cy - 4, cx + 4, cy + 4)
+
+                    # Update arrow marker on Luminance bar
+                    ly = max(0, min(H_SPEC - 1, int((1.0 - state["l"]) * (H_SPEC - 1))))
+                    lum_canvas.coords(lum_marker, 0, ly - 4, W_LUM - 1, ly - 4, W_LUM // 2, ly + 4)
+
+                    curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
+                    fg_c = self._contrast_text_for_hex(curr_hex)
+                    preview_box.configure(bg=curr_hex, fg=fg_c, text=curr_hex.upper())
+                    if not state["updating"]:
+                        state["updating"] = True
+                        try:
+                            hex_var.set(curr_hex.upper())
+                        finally:
+                            state["updating"] = False
+                    if live_apply:
+                        _set_col_color(col_key, curr_hex)
+
+                def _on_spec_drag(event):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        x = max(0, min(W_SPEC - 1, event.x))
+                        y = max(0, min(H_SPEC - 1, event.y))
+                        state["h"] = x / float(W_SPEC - 1)
+                        state["s"] = 1.0 - (y / float(H_SPEC - 1))
+                        # If luminance was near 0 or 1, bring to a pleasant visible range when dragging spectrum
+                        if state["l"] < 0.12 or state["l"] > 0.94:
+                            state["l"] = 0.78
+                        rr, gg, bb = colorsys.hls_to_rgb(state["h"], state["l"], state["s"])
+                        state["r"], state["g"], state["b"] = int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))
+                        r_var.set(state["r"])
+                        g_var.set(state["g"])
+                        b_var.set(state["b"])
+                        _redraw_luminance_bar()
+                        curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
+                        hex_var.set(curr_hex.upper())
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True)
+
+                def _on_lum_drag(event):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        y = max(0, min(H_SPEC - 1, event.y))
+                        state["l"] = 1.0 - (y / float(H_SPEC - 1))
+                        rr, gg, bb = colorsys.hls_to_rgb(state["h"], state["l"], state["s"])
+                        state["r"], state["g"], state["b"] = int(round(rr * 255)), int(round(gg * 255)), int(round(bb * 255))
+                        r_var.set(state["r"])
+                        g_var.set(state["g"])
+                        b_var.set(state["b"])
+                        curr_hex = f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"
+                        hex_var.set(curr_hex.upper())
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True)
+
+                def _on_rgb_slider_changed(*_args):
+                    if state["updating"]:
+                        return
+                    state["updating"] = True
+                    try:
+                        r_v = max(0, min(255, int(r_var.get() or 0)))
+                        g_v = max(0, min(255, int(g_var.get() or 0)))
+                        b_v = max(0, min(255, int(b_var.get() or 0)))
+                        state["r"], state["g"], state["b"] = r_v, g_v, b_v
+                        h_v, l_v, s_v = colorsys.rgb_to_hls(r_v / 255.0, g_v / 255.0, b_v / 255.0)
+                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
+                        _redraw_luminance_bar()
+                        curr_hex = f"#{r_v:02x}{g_v:02x}{b_v:02x}"
+                        hex_var.set(curr_hex.upper())
+                    except Exception:
+                        pass
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True)
+
+                def _load_hex_into_palette(hx_str):
+                    if not hx_str or not isinstance(hx_str, str):
+                        return
+                    h_clean = hx_str.strip()
+                    if not h_clean.startswith("#"):
+                        h_clean = "#" + h_clean
+                    if len(h_clean) != 7:
+                        return
+                    try:
+                        rv = int(h_clean[1:3], 16)
+                        gv = int(h_clean[3:5], 16)
+                        bv = int(h_clean[5:7], 16)
+                    except Exception:
+                        return
+                    state["updating"] = True
+                    try:
+                        state["r"], state["g"], state["b"] = rv, gv, bv
+                        r_var.set(rv)
+                        g_var.set(gv)
+                        b_var.set(bv)
+                        h_v, l_v, s_v = colorsys.rgb_to_hls(rv / 255.0, gv / 255.0, bv / 255.0)
+                        state["h"], state["l"], state["s"] = h_v, l_v, s_v
+                        hex_var.set(h_clean.upper())
+                        _redraw_luminance_bar()
+                    finally:
+                        state["updating"] = False
+                    _update_visual_markers_and_preview(live_apply=True)
+
+                hex_entry.bind("<Return>", lambda e: _load_hex_into_palette(hex_var.get()))
+                hex_entry.bind("<FocusOut>", lambda e: _load_hex_into_palette(hex_var.get()))
+
+                spec_canvas.bind("<Button-1>", _on_spec_drag)
+                spec_canvas.bind("<B1-Motion>", _on_spec_drag)
+                lum_canvas.bind("<Button-1>", _on_lum_drag)
+                lum_canvas.bind("<B1-Motion>", _on_lum_drag)
+
+                # Initial render
+                _redraw_luminance_bar()
+                _update_visual_markers_and_preview(live_apply=False)
+
+                # Bottom Action Buttons
+                bot_f = tb.Frame(outer, padding=(0, 10, 0, 0))
+                bot_f.pack(fill=X, side=BOTTOM)
+
                 tb.Button(
                     bot_f,
-                    text=self._tr("↺ Default"),
-                    bootstyle="secondary-outline",
+                    text=self._tr("✔ OK / Apply Color"),
+                    bootstyle="success",
                     cursor="hand2",
-                    command=lambda: (_set_col_color(col_key, ""), self._safe_grab_release(pop), pop.destroy()),
-                ).pack(side=LEFT, padx=6)
+                    command=lambda: _close_picker(apply_hex=f"#{state['r']:02x}{state['g']:02x}{state['b']:02x}"),
+                ).pack(side=LEFT, padx=(0, 6))
+
                 tb.Button(
                     bot_f,
-                    text=self._tr("Close"),
+                    text=self._tr("↺ Default Color"),
+                    bootstyle="warning-outline",
+                    cursor="hand2",
+                    command=lambda: _close_picker(apply_hex=""),
+                ).pack(side=LEFT, padx=6)
+
+                tb.Button(
+                    bot_f,
+                    text=self._tr("Cancel"),
                     bootstyle="secondary",
                     cursor="hand2",
-                    command=lambda: (self._safe_grab_release(pop), pop.destroy()),
+                    command=lambda: _close_picker(revert=True),
                 ).pack(side=RIGHT)
 
             for col_key, desc in ALL_CALENDAR_COLUMNS:
@@ -12229,6 +13081,8 @@ if HAS_DEPS:
             self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
             self._main_upd_banner.pack_forget()
             self._check_main_window_updates_bg()
+            if getattr(self, "_db_error_update_needed", False):
+                self.ensure_bottom_yellow_update_bar(force_show=True)
 
             self.notebook = tb.Notebook(self, bootstyle="info")
             self.notebook.pack(fill=BOTH, expand=True, padx=20, pady=20)
