@@ -207,74 +207,189 @@ try:
 except Exception:
     pass
 
+def _get_vendor_dir():
+    if platform.system() == "Windows":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "PayrollProData", "vendor")
+    elif platform.system() == "Darwin":
+        d = os.path.expanduser("~/Library/Application Support/PayrollProData/vendor")
+    else:
+        d = os.path.expanduser("~/.payrollprodata/vendor")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+def _setup_extra_sys_paths():
+    """
+    Ensures that both frozen PyInstaller apps and standalone scripts can discover:
+    1. The persistent local vendor folder (PayrollProData/vendor)
+    2. Standard user and system site-packages (Homebrew, python.org, ~/.local, AppData)
+    so packages installed via pip/pip3 in Terminal are immediately visible to the app.
+    """
+    try:
+        import glob
+        v_dir = _get_vendor_dir()
+        if v_dir and v_dir not in sys.path:
+            sys.path.insert(0, v_dir)
+        home = os.path.expanduser("~")
+        candidates = []
+        candidates.extend(glob.glob(os.path.join(home, "Library", "Python", "3.*", "lib", "python", "site-packages")))
+        candidates.extend(glob.glob(os.path.join(home, ".local", "lib", "python3.*", "site-packages")))
+        if platform.system() == "Windows":
+            appdata = os.environ.get("APPDATA") or home
+            candidates.extend(glob.glob(os.path.join(appdata, "Python", "Python3*", "site-packages")))
+            localappdata = os.environ.get("LOCALAPPDATA") or home
+            candidates.extend(glob.glob(os.path.join(localappdata, "Programs", "Python", "Python3*", "Lib", "site-packages")))
+        candidates.extend(glob.glob("/opt/homebrew/lib/python3.*/site-packages"))
+        candidates.extend(glob.glob("/usr/local/lib/python3.*/site-packages"))
+        candidates.extend(glob.glob("/Library/Frameworks/Python.framework/Versions/3.*/lib/python3.*/site-packages"))
+        for p in candidates:
+            if os.path.isdir(p) and p not in sys.path:
+                sys.path.append(p)
+    except Exception:
+        pass
+
+try:
+    _setup_extra_sys_paths()
+except Exception:
+    pass
+
+def _download_and_extract_wheel(pkg_name, target_dir):
+    """
+    Downloads a pure-Python wheel (.whl) directly from PyPI over HTTPS and extracts it
+    into target_dir using standard library zipfile. Works inside frozen PyInstaller binaries
+    without requiring pip or spawning any terminal windows.
+    """
+    import urllib.request, zipfile, io
+    url = f"https://pypi.org/pypi/{pkg_name}/json"
+    req = urllib.request.Request(url, headers={"User-Agent": "PayrollApp-Installer/2.5"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+    urls = data.get("urls", [])
+    wheel_url = None
+    for u in urls:
+        if u.get("packagetype") == "bdist_wheel" and "py3-none-any" in u.get("filename", ""):
+            wheel_url = u.get("url")
+            break
+    if not wheel_url:
+        for u in urls:
+            if u.get("packagetype") == "bdist_wheel":
+                wheel_url = u.get("url")
+                break
+    if not wheel_url:
+        return False
+
+    req_w = urllib.request.Request(wheel_url, headers={"User-Agent": "PayrollApp-Installer/2.5"})
+    try:
+        with urllib.request.urlopen(req_w, timeout=15) as resp:
+            whl_bytes = resp.read()
+    except Exception:
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req_w, timeout=15, context=ctx) as resp:
+            whl_bytes = resp.read()
+
+    with zipfile.ZipFile(io.BytesIO(whl_bytes)) as zf:
+        zf.extractall(target_dir)
+    return True
+
 _FAILED_AUTO_INSTALL = set()
 
 def auto_install_package(package_spec, import_name=None):
     """
     Ensures a Python package is installed and importable.
-    If running inside a compiled standalone app (frozen PyInstaller/app bundle), returns immediately
-    without spawning any subprocesses or terminals.
+    Works seamlessly in both source mode and frozen PyInstaller apps by:
+    1. Discovering system/user site-packages and local PayrollProData/vendor
+    2. Directly downloading & extracting pure-Python wheels (.whl) from PyPI without pip
+    3. Falling back to background pip installation into vendor folder without opening terminals
     """
     global _FAILED_AUTO_INSTALL
+    _setup_extra_sys_paths()
     mod_name = import_name or package_spec.split("==")[0].split(">=")[0].replace("-", "_")
     try:
+        import importlib
+        importlib.invalidate_caches()
         __import__(mod_name)
         return True
     except ImportError:
         pass
 
-    # Never attempt pip inside a compiled binary (prevents rogue terminals)
-    if getattr(sys, "frozen", False):
-        return False
-
     if package_spec in _FAILED_AUTO_INSTALL:
         return False
 
+    vendor_dir = _get_vendor_dir()
+
+    # 1. Pure-Python Wheel Direct Downloader (works inside frozen .app/.exe without pip or Python installed)
+    pure_chains = {
+        "pg8000": ["six", "python-dateutil", "asn1crypto", "scramp", "pg8000"],
+        "scramp": ["asn1crypto", "scramp"],
+        "certifi": ["certifi"],
+    }
+    chain = pure_chains.get(mod_name, [package_spec.split("==")[0].split(">=")[0]])
     try:
-        import site
-        if hasattr(site, "getusersitepackages"):
-            usp = site.getusersitepackages()
-            if usp and usp not in sys.path:
-                sys.path.insert(0, usp)
+        for pkg in chain:
+            _download_and_extract_wheel(pkg, vendor_dir)
+        import importlib
+        importlib.invalidate_caches()
+        __import__(mod_name)
+        return True
     except Exception:
         pass
 
-    pip_cmds = [
-        [sys.executable, "-m", "pip", "install", "--break-system-packages", package_spec],
-        [sys.executable, "-m", "pip", "install", package_spec],
-        [sys.executable, "-m", "pip", "install", "--user", package_spec],
-        [sys.executable, "-m", "pip", "install", "--trusted-host", "pypi.org", "--trusted-host", "files.pythonhosted.org", "--trusted-host", "pypi.python.org", "--break-system-packages", package_spec],
-    ]
+    # 2. Subprocess pip fallback (using system Python if frozen so we never re-launch the GUI binary)
+    py_candidates = []
+    if not getattr(sys, "frozen", False):
+        py_candidates.append(sys.executable)
+    else:
+        for p in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3", shutil.which("python3"), shutil.which("python")]:
+            if p and os.path.isfile(p) and p not in py_candidates:
+                py_candidates.append(p)
 
     kw = {
         "check": True,
         "capture_output": True,
-        "timeout": 20,
+        "timeout": 25,
         "stdin": subprocess.DEVNULL,
     }
     if platform.system() == "Windows":
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
-    for cmd in pip_cmds:
-        try:
-            subprocess.run(cmd, **kw)
+    for py_bin in py_candidates:
+        pip_cmds = [
+            [py_bin, "-m", "pip", "install", "--target", vendor_dir, "--trusted-host", "pypi.org", "--trusted-host", "files.pythonhosted.org", "--break-system-packages", package_spec],
+            [py_bin, "-m", "pip", "install", "--target", vendor_dir, "--trusted-host", "pypi.org", "--trusted-host", "files.pythonhosted.org", package_spec],
+            [py_bin, "-m", "pip", "install", "--break-system-packages", package_spec],
+            [py_bin, "-m", "pip", "install", "--user", package_spec],
+        ]
+        for cmd in pip_cmds:
             try:
-                import site
-                if hasattr(site, "getusersitepackages"):
-                    usp = site.getusersitepackages()
-                    if usp and usp not in sys.path:
-                        sys.path.insert(0, usp)
+                subprocess.run(cmd, **kw)
+                _setup_extra_sys_paths()
+                import importlib
+                importlib.invalidate_caches()
+                __import__(mod_name)
+                return True
             except Exception:
-                pass
-            import importlib
-            importlib.invalidate_caches()
-            __import__(mod_name)
-            return True
-        except Exception:
-            continue
+                continue
 
     _FAILED_AUTO_INSTALL.add(package_spec)
     return False
+
+# Top-level import hints so PyInstaller automatically bundles pg8000 and its dependencies
+try:
+    import pg8000
+    import pg8000.dbapi
+    import scramp
+    import asn1crypto
+except Exception:
+    pass
 
 
 def ensure_all_dependencies():
@@ -731,8 +846,8 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.22"
-APP_BUILD_DATE = "2026-09-09"
+APP_VERSION = "2.5.23"
+APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
 
