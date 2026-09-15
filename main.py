@@ -861,7 +861,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.41"
+APP_VERSION = "2.5.42"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -3001,6 +3001,16 @@ def save_local_daily_snapshot():
         if os.path.exists(CLOUD_CACHE_FILE):
             import shutil
             shutil.copy2(CLOUD_CACHE_FILE, daily_backup_file)
+            try:
+                perm_dir = get_permanent_backups_dir()
+                shutil.copy2(CLOUD_CACHE_FILE, os.path.join(perm_dir, f"backup_daily_{today_str}.enc"))
+            except Exception:
+                pass
+
+        try:
+            ensure_daily_auto_backup()
+        except Exception:
+            pass
 
         # Keep latest 60 daily backups on disk
         existing = sorted(
@@ -3511,6 +3521,10 @@ def log_user_action(
     table_l = str(table or "").lower()
     if table_l in _ACTION_LOG_SKIP_TABLES:
         return
+    try:
+        _record_action_for_auto_backup(action)
+    except Exception:
+        pass
     row = dict(row or {})
     summary = extra_summary or _friendly_user_action(action, table, row, record_id)
     details = ""
@@ -3734,66 +3748,215 @@ def get_local_backups_dir():
     return d
 
 
+def get_permanent_backups_dir():
+    """Permanent backup vault in the user's home folder (or app root vault fallback) that is NEVER deleted even if sync is wiped, data is deleted, or PC is detached."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.environ.get("PAYROLL_PERMANENT_BACKUPS_DIR"),
+        os.path.join(os.path.expanduser("~"), ".payroll_app_permanent_backups"),
+        os.path.join(get_default_app_dir(), "Permanent_Backups_Vault"),
+        os.path.join(script_dir, "Permanent_Backups_Vault"),
+    ]
+    for cand in candidates:
+        if not cand:
+            continue
+        try:
+            os.makedirs(cand, exist_ok=True)
+            test_f = os.path.join(cand, ".write_test")
+            with open(test_f, "w") as f:
+                f.write("ok")
+            os.remove(test_f)
+            return cand
+        except Exception:
+            continue
+    d = os.path.join(script_dir, "Permanent_Backups_Vault")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+_ACTION_COUNT_SINCE_LAST_BACKUP = 0
+_LAST_ACTION_COUNT_TS = 0.0
+_ACTION_BACKUP_LOCK = threading.Lock()
+_UI_ACTION_COUNTER_VAR = None
+
+
+def _format_backup_slot_label(slot_or_key, is_local=False):
+    s = str(slot_or_key or "").lower()
+    if "daily" in s:
+        base = "📅 Daily Auto-Backup"
+    elif "auto30" in s or "30_actions" in s:
+        base = "⚡ 30+ Actions Auto-Backup"
+    elif "pre_detach" in s:
+        base = "🔌 Pre-Detach Backup"
+    elif "pre_restore" in s:
+        base = "🛡️ Pre-Restore Safety Backup"
+    elif "_am" in s or s == "am":
+        base = "🌅 Morning (AM)"
+    elif "_pm" in s or s == "pm":
+        base = "🌇 Afternoon (PM)"
+    else:
+        base = "💾 Manual Backup"
+    prefix = "💻 Permanent Local — " if is_local else "☁️ Cloud DB — "
+    return prefix + base
+
+
+def _record_action_for_auto_backup(action_name="action"):
+    """Increment the user action counter and trigger an immediate backup when 30+ actions occur."""
+    global _ACTION_COUNT_SINCE_LAST_BACKUP, _LAST_ACTION_COUNT_TS
+    act_l = str(action_name or "").lower()
+    if act_l in ("backup", "backup_download", "backup_load_file", "login", "logout"):
+        return
+    now_ts = time.time()
+    trigger_backup = False
+    with _ACTION_BACKUP_LOCK:
+        if now_ts - _LAST_ACTION_COUNT_TS < 0.25:
+            return
+        _LAST_ACTION_COUNT_TS = now_ts
+        _ACTION_COUNT_SINCE_LAST_BACKUP += 1
+        curr_cnt = _ACTION_COUNT_SINCE_LAST_BACKUP
+        if _ACTION_COUNT_SINCE_LAST_BACKUP >= 30:
+            _ACTION_COUNT_SINCE_LAST_BACKUP = 0
+            curr_cnt = 0
+            trigger_backup = True
+    try:
+        if _UI_ACTION_COUNTER_VAR is not None:
+            _UI_ACTION_COUNTER_VAR.set(f"{curr_cnt} / 30 actions until next auto-backup")
+    except Exception:
+        pass
+    if trigger_backup:
+        def _bg_30_backup():
+            try:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                create_cloud_backup(
+                    slot_key=f"auto30_{ts}",
+                    slot="30_actions",
+                    backup_date=today_str,
+                    kind="auto30",
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_bg_30_backup, daemon=True).start()
+
+
+def ensure_daily_auto_backup():
+    """Ensure a permanent daily backup exists for today (YYYY-MM-DD)."""
+    try:
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        perm_dir = get_permanent_backups_dir()
+        daily_slot_key = f"daily_{today_str}"
+        expected_file = os.path.join(perm_dir, f"snapshot_{daily_slot_key}.json.gz")
+        if os.path.isfile(expected_file) and os.path.getsize(expected_file) > 0:
+            return True, daily_slot_key
+        def _bg_daily():
+            try:
+                create_cloud_backup(
+                    slot_key=daily_slot_key,
+                    slot="daily",
+                    backup_date=today_str,
+                    kind="daily",
+                )
+            except Exception:
+                pass
+        threading.Thread(target=_bg_daily, daemon=True).start()
+        return True, daily_slot_key
+    except Exception as e:
+        return False, str(e)
+
+
 def create_local_backup(slot_key=None, slot=None, backup_date=None):
-    """Saves an encrypted snapshot backup on this machine's local disk."""
+    """Saves an encrypted snapshot backup to both Local_Backups AND the permanent user home backup vault."""
     try:
         b_dir = get_local_backups_dir()
+        perm_dir = get_permanent_backups_dir()
         if not slot_key:
             backup_date, slot, slot_key = current_cloud_backup_slot()
-        
+
+        import shutil
         # 1. Copy encrypted database if available
         enc_file = os.path.join(get_default_app_dir(), "payroll_data.enc")
         if os.path.isfile(enc_file):
-            import shutil
-            dest_enc = os.path.join(b_dir, f"backup_{slot_key}.enc")
-            try:
-                shutil.copy2(enc_file, dest_enc)
-            except Exception:
-                pass
+            for target_dir in (b_dir, perm_dir):
+                try:
+                    shutil.copy2(enc_file, os.path.join(target_dir, f"backup_{slot_key}.enc"))
+                except Exception:
+                    pass
 
-        # 2. Save encrypted JSON snapshot
+        # 2. Save encrypted JSON snapshot to both local and permanent directories
         try:
             payload, size = _build_cloud_backup_payload()
-            json_file = os.path.join(b_dir, f"snapshot_{slot_key}.json.gz")
-            with open(json_file, "w", encoding="utf-8") as f:
-                f.write(payload)
+            for target_dir in (b_dir, perm_dir):
+                try:
+                    json_file = os.path.join(target_dir, f"snapshot_{slot_key}.json.gz")
+                    with open(json_file, "w", encoding="utf-8") as f:
+                        f.write(payload)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-        # Rotate: keep newest 40 local backups
+        # Rotate app Local_Backups: keep newest 60
         try:
             files = sorted(
                 [os.path.join(b_dir, f) for f in os.listdir(b_dir) if f.startswith("backup_") or f.startswith("snapshot_")],
                 key=os.path.getmtime,
             )
-            if len(files) > 40:
-                for old_f in files[:-40]:
+            if len(files) > 60:
+                for old_f in files[:-60]:
                     try:
                         os.remove(old_f)
                     except Exception:
                         pass
         except Exception:
             pass
+
+        # Rotate permanent vault: keep newest 200 so backups are never lost
+        try:
+            pfiles = sorted(
+                [os.path.join(perm_dir, f) for f in os.listdir(perm_dir) if f.startswith("backup_") or f.startswith("snapshot_")],
+                key=os.path.getmtime,
+            )
+            if len(pfiles) > 200:
+                for old_f in pfiles[:-200]:
+                    try:
+                        os.remove(old_f)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         return True, slot_key
     except Exception as e:
         return False, str(e)
 
 
 def create_cloud_backup(slot_key=None, slot=None, backup_date=None, kind="auto"):
-    """Save a snapshot locally on this PC AND upload it to Supabase cloud_backups."""
+    """Save a snapshot locally on this PC (permanent + local) AND upload it to Supabase cloud_backups."""
     if not slot_key:
         backup_date, slot, slot_key = current_cloud_backup_slot()
         if kind == "manual":
             slot_key = f"manual_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             slot = "manual"
             backup_date = datetime.now().strftime("%Y-%m-%d")
+        elif kind == "auto30":
+            slot_key = f"auto30_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            slot = "30_actions"
+            backup_date = datetime.now().strftime("%Y-%m-%d")
+        elif kind == "daily":
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            slot_key = f"daily_{today_str}"
+            slot = "daily"
+            backup_date = today_str
 
-    # Step 1: ALWAYS create local backup on this PC
+    # Step 1: ALWAYS create local + permanent backup on this PC
     ok_local, msg_local = create_local_backup(slot_key=slot_key, slot=slot, backup_date=backup_date)
 
     # Step 2: Upload to Supabase if connected
     if get_db_mode() != "supabase" or is_supabase_offline():
-        return ok_local, f"Saved locally on this device ({msg_local})"
+        return ok_local, f"Saved permanently on this device ({msg_local})"
 
     try:
         payload, size_bytes = _build_cloud_backup_payload()
@@ -3831,7 +3994,7 @@ def create_cloud_backup(slot_key=None, slot=None, backup_date=None, kind="auto")
         except Exception:
             pass
         pg.commit()
-        label = "morning" if slot == "am" else "afternoon" if slot == "pm" else "manual"
+        label = "daily" if slot == "daily" else "30+ actions" if slot == "30_actions" else "morning" if slot == "am" else "afternoon" if slot == "pm" else "manual"
         try:
             log_user_action(
                 "backup",
@@ -3842,12 +4005,16 @@ def create_cloud_backup(slot_key=None, slot=None, backup_date=None, kind="auto")
             pass
         return True, slot_key
     except Exception as e:
-        return ok_local, f"Saved locally on this device. Cloud sync: {e}"
+        return ok_local, f"Saved permanently on this device. Cloud sync: {e}"
 
 
 def maybe_run_scheduled_cloud_backup():
-    """Daily morning/afternoon backup for each device linked to DB: saves local + cloud."""
+    """Daily morning/afternoon + daily backup check for each device linked to DB: saves local + permanent + cloud."""
     global _LAST_BACKUP_SLOT
+    try:
+        ensure_daily_auto_backup()
+    except Exception:
+        pass
     backup_date, slot, slot_key = current_cloud_backup_slot()
     device_key = f"{slot_key}_{get_device_identifier()}"
     if _LAST_BACKUP_SLOT == device_key:
@@ -3860,38 +4027,53 @@ def maybe_run_scheduled_cloud_backup():
     return ok, msg
 
 
-def list_local_backups(limit=30):
-    """List backups saved locally on this machine."""
-    b_dir = get_local_backups_dir()
-    if not os.path.exists(b_dir):
-        return []
+def list_local_backups(limit=60):
+    """List backups saved in both the permanent home backup vault and Local_Backups."""
+    search_dirs = [get_permanent_backups_dir(), get_local_backups_dir()]
     items = []
     seen = set()
-    for f in os.listdir(b_dir):
-        if (f.startswith("backup_") or f.startswith("snapshot_")) and (f.endswith(".enc") or f.endswith(".json.gz")):
-            base_key = f.replace("backup_", "").replace("snapshot_", "").replace(".enc", "").replace(".json.gz", "")
-            if base_key in seen:
-                continue
-            seen.add(base_key)
-            full_p = os.path.join(b_dir, f)
-            mtime = os.path.getmtime(full_p)
-            dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-            sz = os.path.getsize(full_p)
-            slot = "AM" if "_am" in base_key.lower() else ("PM" if "_pm" in base_key.lower() else "Manual")
-            items.append({
-                "slot_key": f"local::{base_key}",
-                "backup_date": dt_str.split()[0],
-                "slot": f"💻 Local ({slot})",
-                "created_at": dt_str,
-                "created_by": f"This PC ({get_device_identifier()})",
-                "size_bytes": sz,
-                "is_local": True
-            })
+    for d_path in search_dirs:
+        if not os.path.exists(d_path):
+            continue
+        try:
+            dir_files = os.listdir(d_path)
+        except Exception:
+            continue
+        for f in dir_files:
+            if (f.startswith("backup_") or f.startswith("snapshot_") or f.startswith("pre_detach_")) and (
+                f.endswith(".enc") or f.endswith(".json.gz") or f.endswith(".db")
+            ):
+                base_key = (
+                    f.replace("backup_", "")
+                    .replace("snapshot_", "")
+                    .replace(".enc", "")
+                    .replace(".json.gz", "")
+                    .replace(".db", "")
+                )
+                if base_key in seen:
+                    continue
+                seen.add(base_key)
+                full_p = os.path.join(d_path, f)
+                try:
+                    mtime = os.path.getmtime(full_p)
+                    dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+                    sz = os.path.getsize(full_p)
+                except Exception:
+                    continue
+                items.append({
+                    "slot_key": f"local::{base_key}",
+                    "backup_date": dt_str.split()[0],
+                    "slot": _format_backup_slot_label(base_key, is_local=True),
+                    "created_at": dt_str,
+                    "created_by": f"This PC ({get_device_identifier()})",
+                    "size_bytes": sz,
+                    "is_local": True,
+                })
     items.sort(key=lambda x: x["created_at"], reverse=True)
     return items[:limit]
 
 
-def list_cloud_backups(limit=40):
+def list_cloud_backups(limit=60):
     """List cloud backups from Supabase."""
     if get_db_mode() != "supabase" or is_supabase_offline():
         return []
@@ -3910,17 +4092,17 @@ def list_cloud_backups(limit=40):
         )
         rows = []
         for r in cur.fetchall() or []:
-            slot_name = r[2] or ""
-            slot_label = "AM" if slot_name == "am" else ("PM" if slot_name == "pm" else "Manual")
+            s_key = r[0] or ""
+            s_name = r[2] or s_key
             rows.append(
                 {
-                    "slot_key": r[0],
+                    "slot_key": s_key,
                     "backup_date": r[1],
-                    "slot": f"☁️ Cloud ({slot_label})",
+                    "slot": _format_backup_slot_label(s_name or s_key, is_local=False),
                     "created_at": r[3],
                     "created_by": plain_label(r[4]),
                     "size_bytes": r[5],
-                    "is_local": False
+                    "is_local": False,
                 }
             )
         return rows
@@ -3928,26 +4110,24 @@ def list_cloud_backups(limit=40):
         return []
 
 
-def list_all_backups(limit=50):
-    """Combines cloud backups and local device backups into a single chronological list."""
-    cloud_list = list_cloud_backups(limit=limit)
+def list_all_backups(limit=80):
+    """Combines permanent local device backups and cloud backups into a chronological list."""
     local_list = list_local_backups(limit=limit)
-    combined = cloud_list + local_list
+    cloud_list = list_cloud_backups(limit=limit)
+    combined = local_list + cloud_list
     combined.sort(key=lambda x: x.get("created_at") or "", reverse=True)
     return combined[:limit]
 
 
-def restore_snapshot_dict(snapshot, source_name="backup"):
-    """Restores database tables from a decoded snapshot dictionary."""
-    tables = (snapshot or {}).get("tables") or {}
-    if not tables:
-        return False, "No tables found in snapshot."
-    path = ensure_offline_cache_open()
-    lite = _original_sqlite3_connect(path, timeout=30)
+def _restore_tables_into_sqlite(sqlite_path, tables):
+    """Helper to restore snapshot tables into a specific SQLite file."""
+    if not sqlite_path or sqlite_path == SUPABASE_DB_SENTINEL:
+        return
+    conn = _original_sqlite3_connect(sqlite_path, timeout=30)
     try:
-        lite.execute("PRAGMA busy_timeout=8000")
-        lcur = lite.cursor()
-        _init_offline_schema(lcur)
+        conn.execute("PRAGMA busy_timeout=8000")
+        cur = conn.cursor()
+        _init_offline_schema(cur)
         for tbl, pack in tables.items():
             if str(tbl).lower() in ("offline_sync_queue", "sqlite_sequence"):
                 continue
@@ -3955,12 +4135,12 @@ def restore_snapshot_dict(snapshot, source_name="backup"):
             rows = list((pack or {}).get("rows") or [])
             if not cols:
                 continue
-            lcur.execute(f"PRAGMA table_info({tbl})")
-            local_cols = [r[1] for r in (lcur.fetchall() or []) if r and r[1]]
+            cur.execute(f"PRAGMA table_info({tbl})")
+            local_cols = [r[1] for r in (cur.fetchall() or []) if r and r[1]]
             use_cols = [c for c in cols if c in local_cols]
             if not use_cols:
                 continue
-            lcur.execute(f"DELETE FROM {tbl}")
+            cur.execute(f"DELETE FROM {tbl}")
             placeholders = ", ".join(["?"] * len(use_cols))
             col_list = ", ".join(use_cols)
             for rec in rows:
@@ -3970,23 +4150,77 @@ def restore_snapshot_dict(snapshot, source_name="backup"):
                     if isinstance(val, dict) and "__bytes__" in val:
                         val = base64.b64decode(val["__bytes__"])
                     vals.append(val)
-                lcur.execute(
+                cur.execute(
                     f"INSERT INTO {tbl} ({col_list}) VALUES ({placeholders})",
                     vals,
                 )
-        lite.commit()
+        conn.commit()
     finally:
-        lite.close()
+        conn.close()
+
+
+def restore_snapshot_dict(snapshot, source_name="backup"):
+    """Restores database tables from a decoded snapshot dictionary into Local SQLite cache, active DB, and Cloud DB."""
+    tables = (snapshot or {}).get("tables") or {}
+    if not tables:
+        return False, "No tables found in snapshot."
+
+    # 1. Restore into offline cache SQLite DB
+    path = ensure_offline_cache_open()
+    _restore_tables_into_sqlite(path, tables)
+
+    # 2. If in Local Mode (or TEMP_DB_PATH is separate), also restore into TEMP_DB_PATH and encrypt to disk
+    if TEMP_DB_PATH and TEMP_DB_PATH != SUPABASE_DB_SENTINEL and TEMP_DB_PATH != path:
+        try:
+            _restore_tables_into_sqlite(str(TEMP_DB_PATH), tables)
+            save_database()
+        except Exception:
+            pass
+
     try:
         _persist_offline_cache()
     except Exception:
         pass
+
+    # 3. If in Supabase mode and online, sync restored tables to Cloud DB
     if get_db_mode() == "supabase" and not is_supabase_offline():
         try:
-            backfill_local_rows_missing_from_cloud()
-            flush_offline_queue_to_cloud()
+            pg = get_shared_supabase_conn()
+            pg_cur = pg.cursor()
+            for tbl, pack in tables.items():
+                tbl_l = str(tbl).lower()
+                if tbl_l in ("offline_sync_queue", "sqlite_sequence", "user_action_log"):
+                    continue
+                rows = list((pack or {}).get("rows") or [])
+                restored_ids = set()
+                for rec in rows:
+                    if not isinstance(rec, dict):
+                        continue
+                    clean_rec = {}
+                    for k, v in rec.items():
+                        if isinstance(v, dict) and "__bytes__" in v:
+                            v = base64.b64decode(v["__bytes__"])
+                        clean_rec[k] = v
+                    if clean_rec.get("id") is not None:
+                        restored_ids.add(clean_rec["id"])
+                    try:
+                        _cloud_upsert_row(pg_cur, tbl_l, clean_rec)
+                    except Exception:
+                        pass
+                # If main data table, remove rows in cloud that were deleted in this snapshot
+                if tbl_l in ("payroll_records", "employees", "expenses", "cash_envelopes"):
+                    try:
+                        pg_cur.execute(f"SELECT id FROM {tbl_l}")
+                        cloud_ids = [r[0] for r in (pg_cur.fetchall() or []) if r and r[0] is not None]
+                        for cid in cloud_ids:
+                            if cid not in restored_ids:
+                                pg_cur.execute(f"DELETE FROM {tbl_l} WHERE id = ?", (cid,))
+                    except Exception:
+                        pass
+            pg.commit()
         except Exception:
             pass
+
     try:
         log_user_action("backup", extra_summary=f"Restored backup from {source_name}")
     except Exception:
@@ -3994,35 +4228,75 @@ def restore_snapshot_dict(snapshot, source_name="backup"):
     return True, "ok"
 
 
+def _find_local_backup_file(raw_key):
+    """Searches both permanent and local backup directories for a matching snapshot, .enc, or .db file."""
+    search_dirs = [get_permanent_backups_dir(), get_local_backups_dir()]
+    for d in search_dirs:
+        if not os.path.exists(d):
+            continue
+        for prefix in ("snapshot_", "backup_", "pre_detach_backup_", "pre_detach_cloud_cache_", ""):
+            for ext in (".json.gz", ".enc", ".db"):
+                cand = os.path.join(d, f"{prefix}{raw_key}{ext}")
+                if os.path.isfile(cand):
+                    return cand
+    return None
+
+
 def restore_cloud_backup(slot_key):
-    """Restores data from either a local device snapshot or a Supabase cloud backup."""
-    if str(slot_key).startswith("local::"):
-        raw_key = str(slot_key)[7:]
-        b_dir = get_local_backups_dir()
-        json_file = os.path.join(b_dir, f"snapshot_{raw_key}.json.gz")
-        payload = None
-        if os.path.isfile(json_file):
-            with open(json_file, "r", encoding="utf-8") as f:
-                payload = f.read()
-        if not payload:
-            enc_file = os.path.join(b_dir, f"backup_{raw_key}.enc")
-            if os.path.isfile(enc_file):
+    """Restores data from either a permanent local snapshot, local encrypted/db file, or Supabase cloud backup."""
+    is_local_key = str(slot_key).startswith("local::")
+    raw_key = str(slot_key)[7:] if is_local_key else str(slot_key)
+
+    # Always check local/permanent disk files first if local:: OR if cloud is offline/unavailable
+    local_file = _find_local_backup_file(raw_key)
+    payload = None
+
+    if is_local_key or get_db_mode() != "supabase" or is_supabase_offline():
+        if local_file:
+            if local_file.endswith(".json.gz"):
+                with open(local_file, "r", encoding="utf-8") as f:
+                    payload = f.read()
+            elif local_file.endswith(".enc"):
                 active_enc = os.path.join(get_default_app_dir(), "payroll_data.enc")
                 import shutil
-                shutil.copy2(enc_file, active_enc)
+                shutil.copy2(local_file, active_enc)
+                if os.path.exists(CLOUD_CACHE_FILE):
+                    try:
+                        shutil.copy2(local_file, CLOUD_CACHE_FILE)
+                    except Exception:
+                        pass
                 load_database()
-                return True, "Restored from local encrypted file."
+                return True, "Restored from permanent local encrypted file."
+            elif local_file.endswith(".db"):
+                import shutil
+                if OFFLINE_TEMP_DB_PATH:
+                    shutil.copy2(local_file, OFFLINE_TEMP_DB_PATH)
+                if TEMP_DB_PATH and TEMP_DB_PATH != SUPABASE_DB_SENTINEL:
+                    shutil.copy2(local_file, str(TEMP_DB_PATH))
+                    save_database()
+                _persist_offline_cache()
+                return True, "Restored from permanent local SQLite database file."
+        if is_local_key and not payload:
             return False, "Local backup file not found."
-    else:
-        if get_db_mode() != "supabase" or is_supabase_offline():
-            return False, "Cloud is offline"
-        pg = get_shared_supabase_conn()
-        cur = pg.cursor()
-        cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (slot_key,))
-        row = cur.fetchone()
-        if not row or not row[0]:
-            return False, "Backup not found in cloud."
-        payload = row[0]
+
+    if not payload:
+        if get_db_mode() == "supabase" and not is_supabase_offline():
+            try:
+                pg = get_shared_supabase_conn()
+                cur = pg.cursor()
+                cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (slot_key,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    payload = row[0]
+            except Exception:
+                pass
+
+    if not payload and local_file and local_file.endswith(".json.gz"):
+        with open(local_file, "r", encoding="utf-8") as f:
+            payload = f.read()
+
+    if not payload:
+        return False, "Backup payload not found in cloud or local permanent storage."
 
     snapshot = _decode_cloud_backup_payload(payload)
     if not snapshot:
@@ -7616,6 +7890,10 @@ def get_cipher(password, salt):
 
 def commit_and_save(conn):
     """Commits to the temp SQLite database, then encrypts it to the permanent file."""
+    try:
+        _record_action_for_auto_backup("commit")
+    except Exception:
+        pass
     if get_db_mode() == "supabase":
         conn.commit()
         if is_supabase_offline() or using_local_cache():
@@ -9409,20 +9687,79 @@ if HAS_DEPS:
                         if hasattr(curr, "xview_scroll") and hasattr(curr, "xview"):
                             try:
                                 xv = curr.xview()
-                                if xv and tuple(xv) != (0.0, 1.0):
-                                    curr.xview_scroll(delta, "units")
-                                    _mark_event_scrolled(event)
-                                    return "break"
+                                if xv and len(xv) == 2:
+                                    x0, x1 = float(xv[0]), float(xv[1])
+                                    if (x1 - x0) < 0.999:
+                                        can_scroll_x = (delta < 0 and x0 > 0.001) or (delta > 0 and x1 < 0.999)
+                                        if can_scroll_x:
+                                            curr.xview_scroll(delta, "units")
+                                            _mark_event_scrolled(event)
+                                            return "break"
                             except Exception:
                                 pass
                     else:
+                        # Dynamically refresh scrollregion if curr is a Canvas so tabs always scroll
+                        if cls_name == "Canvas" or isinstance(curr, tk.Canvas):
+                            try:
+                                bbox = curr.bbox("all")
+                                if bbox:
+                                    cw = max(int(bbox[2]), int(curr.winfo_width()))
+                                    ch = max(int(bbox[3]), int(curr.winfo_height()))
+                                    curr.configure(scrollregion=(0, 0, cw, ch))
+                            except Exception:
+                                pass
+
                         if hasattr(curr, "yview_scroll") and hasattr(curr, "yview"):
                             try:
                                 yv = curr.yview()
-                                if yv and tuple(yv) != (0.0, 1.0):
-                                    curr.yview_scroll(delta, "units")
-                                    _mark_event_scrolled(event)
-                                    return "break"
+                                if yv and len(yv) == 2:
+                                    y0, y1 = float(yv[0]), float(yv[1])
+                                    if (y1 - y0) < 0.999:
+                                        can_scroll_y = (delta < 0 and y0 > 0.001) or (delta > 0 and y1 < 0.999)
+                                        if can_scroll_y:
+                                            # If curr is an inner table/listbox nested inside a scrollable tab Canvas,
+                                            # scroll the outer tab Canvas first unless the inner table was explicitly clicked/focused
+                                            parent_canvas = None
+                                            p_anc = getattr(curr, "master", None)
+                                            while p_anc is not None:
+                                                try:
+                                                    p_cls = p_anc.winfo_class()
+                                                except Exception:
+                                                    p_cls = ""
+                                                if isinstance(p_anc, tk.Canvas) or p_cls == "Canvas":
+                                                    try:
+                                                        pbbox = p_anc.bbox("all")
+                                                        if pbbox:
+                                                            pcw = max(int(pbbox[2]), int(p_anc.winfo_width()))
+                                                            pch = max(int(pbbox[3]), int(p_anc.winfo_height()))
+                                                            p_anc.configure(scrollregion=(0, 0, pcw, pch))
+                                                        pyv = p_anc.yview()
+                                                        if pyv and len(pyv) == 2 and (float(pyv[1]) - float(pyv[0])) < 0.999:
+                                                            parent_canvas = p_anc
+                                                            break
+                                                    except Exception:
+                                                        pass
+                                                p_anc = getattr(p_anc, "master", None)
+
+                                            if parent_canvas is not None and curr is not parent_canvas:
+                                                try:
+                                                    py0, py1 = float(parent_canvas.yview()[0]), float(parent_canvas.yview()[1])
+                                                    parent_can_scroll = (delta < 0 and py0 > 0.001) or (delta > 0 and py1 < 0.999)
+                                                except Exception:
+                                                    parent_can_scroll = False
+                                                focused_w = None
+                                                try:
+                                                    focused_w = curr.winfo_toplevel().focus_get()
+                                                except Exception:
+                                                    pass
+                                                if parent_can_scroll and focused_w is not curr:
+                                                    parent_canvas.yview_scroll(delta, "units")
+                                                    _mark_event_scrolled(event)
+                                                    return "break"
+
+                                            curr.yview_scroll(delta, "units")
+                                            _mark_event_scrolled(event)
+                                            return "break"
                             except Exception:
                                 pass
 
@@ -18385,7 +18722,7 @@ if HAS_DEPS:
             tb.Button(btn_box, text=self._tr("Cancel"), bootstyle="secondary", command=_close_prompt).pack(side=LEFT, padx=5)
 
         def _build_activity_and_backup_panel(self, parent):
-            """Per-user activity log and twice-daily Supabase backups."""
+            """Per-user activity log and permanent/auto backups (Daily + 30+ Actions + Manual)."""
             try:
                 top = parent.winfo_toplevel()
             except Exception:
@@ -18395,45 +18732,165 @@ if HAS_DEPS:
             vscroll = tb.Scrollbar(parent, orient=VERTICAL, command=canvas.yview)
             inner = tb.Frame(canvas, padding=16)
 
-            inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+            def _refresh_canvas_scrollregion(_e=None):
+                try:
+                    bbox = canvas.bbox("all")
+                    if bbox:
+                        cw = max(int(bbox[2]), int(canvas.winfo_width()))
+                        ch = max(int(bbox[3]), int(canvas.winfo_height()))
+                        canvas.configure(scrollregion=(0, 0, cw, ch))
+                except Exception:
+                    pass
+
+            inner.bind("<Configure>", _refresh_canvas_scrollregion)
             win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
             canvas.configure(yscrollcommand=vscroll.set)
 
             def _on_canvas_configure(e):
-                if getattr(canvas, "_last_cfg_w", None) == e.width:
-                    return
-                canvas._last_cfg_w = e.width
-                try:
-                    canvas.itemconfigure(win_id, width=e.width)
-                except Exception:
-                    pass
-            canvas.bind("<Configure>", _on_canvas_configure)
-
-            def _act_mousewheel(event):
-                if _was_event_scrolled(event):
-                    return
-                delta = _scroll_delta(event)
-                if delta:
+                if getattr(canvas, "_last_cfg_w", None) != e.width:
+                    canvas._last_cfg_w = e.width
                     try:
-                        canvas.yview_scroll(delta, "units")
-                        _mark_event_scrolled(event)
+                        canvas.itemconfigure(win_id, width=e.width)
                     except Exception:
                         pass
+                _refresh_canvas_scrollregion()
 
-            def _bind_wheel(_e=None):
-                pass
-
-            def _unbind_wheel(_e=None):
-                pass
-
-            canvas.bind("<MouseWheel>", _act_mousewheel, add="+")
-            canvas.bind("<Button-4>", _act_mousewheel, add="+")
-            canvas.bind("<Button-5>", _act_mousewheel, add="+")
+            canvas.bind("<Configure>", _on_canvas_configure)
 
             vscroll.pack(side=RIGHT, fill=Y)
             canvas.pack(side=LEFT, fill=BOTH, expand=True)
 
-            # --- CSV Log Downloader from Date to Date ---
+            # Ensure daily backup exists when opening panel
+            try:
+                ensure_daily_auto_backup()
+            except Exception:
+                pass
+
+            # --- 1. PERMANENT BACKUPS & RESTORE CARD (TOP OF TAB FOR INSTANT ACCESS) ---
+            bak_lf = tb.Labelframe(
+                inner,
+                text=self._tr("💾 Permanent Backups & Restore (Always Preserved Locally & Cloud)"),
+                padding=12,
+                bootstyle="info",
+            )
+            bak_lf.pack(fill=X, pady=(0, 14))
+
+            status_banner = tb.Frame(bak_lf)
+            status_banner.pack(fill=X, pady=(0, 8))
+
+            perm_vault_path = get_permanent_backups_dir()
+            tb.Label(
+                status_banner,
+                text=self._tr(
+                    f"🛡️ Permanent Backup Vault: {perm_vault_path}\n"
+                    "Backups are permanently preserved on disk even if cloud sync is deleted, data is wiped, or PC is detached.\n"
+                    "⚡ Automatic Backups: Runs Daily + Immediately after every 30+ user actions. Password required to load/restore."
+                ),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+                justify=LEFT,
+                wraplength=740,
+            ).pack(side=LEFT, anchor=W)
+
+            global _UI_ACTION_COUNTER_VAR
+            _UI_ACTION_COUNTER_VAR = tk.StringVar(
+                value=f"{_ACTION_COUNT_SINCE_LAST_BACKUP} / 30 actions until next auto-backup"
+            )
+            counter_badge = tb.Label(
+                status_banner,
+                textvariable=_UI_ACTION_COUNTER_VAR,
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="info",
+            )
+            counter_badge.pack(side=RIGHT, anchor=NE, padx=(10, 0))
+
+            bak_cols = ("When", "Slot", "User", "Size")
+            bak_holder = tb.Frame(bak_lf)
+            bak_holder.pack(fill=X)
+            bak_tree = tb.Treeview(bak_holder, columns=bak_cols, show="headings", height=7, bootstyle="secondary")
+            bak_tree.heading("When", text=self._tr("Date & Time"))
+            bak_tree.heading("Slot", text=self._tr("Backup Type / Slot"))
+            bak_tree.heading("User", text=self._tr("Device / User"))
+            bak_tree.heading("Size", text=self._tr("Size"))
+            bak_tree.column("When", width=150, anchor=CENTER)
+            bak_tree.column("Slot", width=220, anchor=W)
+            bak_tree.column("User", width=210, anchor=W)
+            bak_tree.column("Size", width=85, anchor=CENTER)
+            self._attach_tree_scrollbars(bak_holder, bak_tree)
+
+            def _prompt_user_password_for_restore(action_title="Load & Restore Backup"):
+                """Modal prompt requiring the current user's password (or Admin password) before restoring any backup."""
+                res = {"ok": False, "pw": ""}
+                pw_win = tb.Toplevel(top)
+                pw_win.title(self._tr(f"🔒 Password Required — {action_title}"))
+                pw_win.geometry("430x240")
+                try:
+                    pw_win.transient(top)
+                except Exception:
+                    pass
+                self._safe_grab_set(pw_win)
+                self._present_window(pw_win)
+                pw_win.focus_set()
+
+                try:
+                    sw = pw_win.winfo_screenwidth()
+                    sh = pw_win.winfo_screenheight()
+                    pw_win.geometry(f"430x240+{(sw - 430) // 2}+{(sh - 240) // 2}")
+                except Exception:
+                    pass
+
+                who = getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
+                tb.Label(
+                    pw_win,
+                    text=self._tr("🔒 Authorize Backup Restoration"),
+                    font=("Segoe UI", 12, "bold"),
+                    bootstyle="warning",
+                ).pack(pady=(16, 6))
+
+                tb.Label(
+                    pw_win,
+                    text=self._tr(
+                        f"Enter password for user '{who}' to load this backup.\n"
+                        "A safety backup of your current data will be saved automatically first."
+                    ),
+                    font=("Segoe UI", 9),
+                    justify=CENTER,
+                    wraplength=390,
+                ).pack(padx=15, pady=(0, 10))
+
+                pw_ent = tb.Entry(pw_win, show="*", width=26, font=("Segoe UI", 11))
+                pw_ent.pack(pady=4)
+                pw_ent.focus()
+
+                def _on_confirm(_e=None):
+                    entered = (pw_ent.get() or "").strip()
+                    if not entered:
+                        messagebox.showerror("Password Required", "Please enter your password.", parent=pw_win)
+                        return
+                    if verify_user_password_everywhere(who, entered) or verify_user_password_everywhere(DEFAULT_ADMIN_USERNAME, entered):
+                        res["ok"] = True
+                        res["pw"] = entered
+                        self._safe_grab_release(pw_win)
+                        pw_win.destroy()
+                    else:
+                        messagebox.showerror("Invalid Password", "Incorrect password. Backup load cancelled.", parent=pw_win)
+
+                def _on_cancel():
+                    self._safe_grab_release(pw_win)
+                    pw_win.destroy()
+
+                pw_win.protocol("WM_DELETE_WINDOW", _on_cancel)
+                pw_ent.bind("<Return>", _on_confirm)
+
+                btn_f = tb.Frame(pw_win)
+                btn_f.pack(pady=12)
+                tb.Button(btn_f, text=self._tr("Verify & Load Backup"), bootstyle="success", command=_on_confirm).pack(side=LEFT, padx=6)
+                tb.Button(btn_f, text=self._tr("Cancel"), bootstyle="secondary", command=_on_cancel).pack(side=LEFT, padx=6)
+
+                pw_win.wait_window()
+                return res["ok"], res["pw"]
+
+            # --- 2. CSV Log Downloader from Date to Date ---
             exp_lf = tb.Labelframe(inner, text=self._tr("📥 Download Activity Logs (CSV)"), padding=12, bootstyle="primary")
             exp_lf.pack(fill=X, pady=(0, 12))
 
@@ -18467,7 +18924,7 @@ if HAS_DEPS:
             cbo_log_type = tb.Combobox(row_type, width=20, state="readonly", values=[self._tr("All Activity Logs"), self._tr("User Actions Only"), self._tr("Database Changes Only")])
             cbo_log_type.set(self._tr("All Activity Logs"))
             cbo_log_type.pack(side=LEFT, padx=(0, 16))
-            
+
             def do_export_csv():
                 s_date = start_dt_ent.entry.get().strip()
                 e_date = end_dt_ent.entry.get().strip()
@@ -18475,7 +18932,7 @@ if HAS_DEPS:
                     messagebox.showerror("Error", self._tr("Please select valid Start and End dates."), parent=top)
                     return
                 l_type = cbo_log_type.get()
-                
+
                 save_path = filedialog.asksaveasfilename(
                     parent=top,
                     title=self._tr("Save Activity Logs CSV"),
@@ -18485,13 +18942,13 @@ if HAS_DEPS:
                 )
                 if not save_path:
                     return
-                    
+
                 try:
                     import csv
                     rows_out = []
                     conn = sqlite3.connect(TEMP_DB_PATH)
                     cur = conn.cursor()
-                    
+
                     # 1. user_action_log
                     if "User Actions" in l_type or "All" in l_type or l_type == self._tr("All Activity Logs"):
                         try:
@@ -18515,7 +18972,7 @@ if HAS_DEPS:
                                 ])
                         except Exception:
                             pass
-                            
+
                     # 2. database_history_log
                     if "Database" in l_type or "All" in l_type or l_type == self._tr("All Activity Logs"):
                         try:
@@ -18539,16 +18996,16 @@ if HAS_DEPS:
                                 ])
                         except Exception:
                             pass
-                            
+
                     conn.close()
                     rows_out.sort(key=lambda x: str(x[0]))
-                    
+
                     with open(save_path, "w", newline="", encoding="utf-8-sig") as csv_f:
                         writer = csv.writer(csv_f)
                         writer.writerow(["Timestamp", "User", "Action", "Target", "Summary / Old Data", "Details / New Data"])
                         for ro in rows_out:
                             writer.writerow(ro)
-                            
+
                     messagebox.showinfo("Export Successful", f"Successfully exported {len(rows_out)} log entries to:\n{save_path}", parent=top)
                 except Exception as e:
                     messagebox.showerror("Export Failed", str(e), parent=top)
@@ -18557,6 +19014,7 @@ if HAS_DEPS:
             row_action.pack(fill=X)
             tb.Button(row_action, text=self._tr("📥 Download Activity Logs (CSV)"), bootstyle="success", command=do_export_csv).pack(side=LEFT)
 
+            # --- 3. Activity Log Table ---
             log_lf = tb.Labelframe(inner, text=self._tr("Activity log"), padding=10)
             log_lf.pack(fill=X, pady=(0, 12))
             filter_row = tb.Frame(log_lf)
@@ -18577,30 +19035,6 @@ if HAS_DEPS:
             log_tree.column("User", width=110, anchor=CENTER)
             log_tree.column("Action", width=420, anchor=W)
             self._attach_tree_scrollbars(log_holder, log_tree)
-
-            bak_lf = tb.Labelframe(inner, text=self._tr("📁 Daily Backups (Local & Cloud DB)"), padding=10, bootstyle="info")
-            bak_lf.pack(fill=X)
-            tb.Label(
-                bak_lf,
-                text=self._tr("Daily morning (AM) and afternoon (PM) backups are saved locally on each linked device and synced to Cloud DB."),
-                font=("Segoe UI", 10),
-                bootstyle="secondary",
-                wraplength=720,
-                justify=LEFT,
-            ).pack(anchor=W, pady=(0, 8))
-            bak_cols = ("When", "Slot", "User", "Size")
-            bak_holder = tb.Frame(bak_lf)
-            bak_holder.pack(fill=X)
-            bak_tree = tb.Treeview(bak_holder, columns=bak_cols, show="headings", height=6, bootstyle="secondary")
-            bak_tree.heading("When", text=self._tr("Date & Time"))
-            bak_tree.heading("Slot", text=self._tr("Type / Slot"))
-            bak_tree.heading("User", text=self._tr("Device / User"))
-            bak_tree.heading("Size", text=self._tr("Size"))
-            bak_tree.column("When", width=150, anchor=CENTER)
-            bak_tree.column("Slot", width=160, anchor=W)
-            bak_tree.column("User", width=220, anchor=W)
-            bak_tree.column("Size", width=90, anchor=CENTER)
-            self._attach_tree_scrollbars(bak_holder, bak_tree)
 
             def load_logs():
                 for item in log_tree.get_children():
@@ -18652,6 +19086,7 @@ if HAS_DEPS:
                     user_filter.set(current)
                 else:
                     user_filter.set(all_label)
+                _refresh_canvas_scrollregion()
 
             def load_backups():
                 for item in bak_tree.get_children():
@@ -18663,7 +19098,7 @@ if HAS_DEPS:
 
                 def run():
                     try:
-                        recs = list_all_backups(60)
+                        recs = list_all_backups(80)
                     except Exception:
                         recs = []
 
@@ -18685,6 +19120,7 @@ if HAS_DEPS:
                                     iid=key,
                                     values=(rec.get("created_at") or "", slot_label, rec.get("created_by") or "", size_txt),
                                 )
+                            _refresh_canvas_scrollregion()
                         except Exception:
                             pass
 
@@ -18700,7 +19136,11 @@ if HAS_DEPS:
                 try:
                     ok, msg = create_cloud_backup(kind="manual")
                     if ok:
-                        messagebox.showinfo("Backup Success", "Backup saved locally on this device and synced to Cloud DB.", parent=top)
+                        messagebox.showinfo(
+                            "Backup Saved",
+                            f"Backup saved permanently on this PC ({get_permanent_backups_dir()}) and synced to Cloud DB.",
+                            parent=top,
+                        )
                         load_backups()
                         load_logs()
                     else:
@@ -18711,26 +19151,48 @@ if HAS_DEPS:
             def do_restore():
                 sel = bak_tree.selection()
                 if not sel:
-                    messagebox.showwarning("Select", "Please select a backup to restore.", parent=top)
+                    messagebox.showwarning("Select Backup", "Please select a backup from the list to load/restore.", parent=top)
                     return
                 key = sel[0]
                 is_loc = str(key).startswith("local::")
-                source_txt = "Local disk backup on this PC" if is_loc else "Cloud DB backup"
-                if not messagebox.askyesno(
-                    "Restore backup",
-                    f"This will replace current application data with the selected {source_txt}.\n\nContinue?",
-                    parent=top,
-                ):
+                source_txt = "Permanent Local Backup on this PC" if is_loc else "Cloud DB / Local Backup"
+
+                # Require User Password
+                ok_pw, verified_pw = _prompt_user_password_for_restore(action_title="Load Selected Backup")
+                if not ok_pw:
                     return
+
                 try:
+                    # Save safety pre-restore backup first
+                    try:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        create_local_backup(
+                            slot_key=f"pre_restore_{ts}",
+                            slot="pre_restore",
+                            backup_date=datetime.now().strftime("%Y-%m-%d"),
+                        )
+                    except Exception:
+                        pass
+
+                    who = getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
                     ok, msg = restore_cloud_backup(key)
                     if ok:
-                        messagebox.showinfo("Restore", "Backup restored successfully. Refreshing views...", parent=top)
+                        # Ensure the user's current password is preserved even if restoring an older snapshot
+                        if verified_pw:
+                            try:
+                                update_user_password_everywhere(who, verified_pw)
+                            except Exception:
+                                pass
+                        messagebox.showinfo(
+                            "Restore Complete",
+                            f"Backup ({source_txt}) loaded successfully!\nAll tables and views have been refreshed.",
+                            parent=top,
+                        )
                         try:
                             self._schedule_soft_ui_refresh(full=True)
                         except Exception:
                             pass
-                        load_logs()
+                        refresh_all()
                     else:
                         messagebox.showerror("Restore Failed", str(msg), parent=top)
                 except Exception as e:
@@ -18743,41 +19205,43 @@ if HAS_DEPS:
                     return
                 key = sel[0]
                 payload = None
-                if str(key).startswith("local::"):
-                    raw_key = str(key)[7:]
-                    b_dir = get_local_backups_dir()
-                    json_file = os.path.join(b_dir, f"snapshot_{raw_key}.json.gz")
-                    if os.path.isfile(json_file):
-                        with open(json_file, "r", encoding="utf-8") as f:
+                raw_key = str(key)[7:] if str(key).startswith("local::") else str(key)
+                local_file = _find_local_backup_file(raw_key)
+
+                if local_file and (local_file.endswith(".enc") or local_file.endswith(".db")):
+                    ext = ".enc" if local_file.endswith(".enc") else ".db"
+                    dest = filedialog.asksaveasfilename(
+                        title="Save Backup File As",
+                        initialfile=f"payroll_backup_{raw_key}{ext}",
+                        defaultextension=ext,
+                        filetypes=[("Backup File", f"*{ext}"), ("All Files (*.*)", "*.*")],
+                        parent=top,
+                    )
+                    if dest:
+                        import shutil
+                        shutil.copy2(local_file, dest)
+                        messagebox.showinfo("Download Complete", f"Backup file saved to:\n{dest}", parent=top)
+                        log_user_action("backup_download", extra_summary=f"Downloaded backup {key} to {os.path.basename(dest)}")
+                    return
+
+                if local_file and local_file.endswith(".json.gz"):
+                    try:
+                        with open(local_file, "r", encoding="utf-8") as f:
                             payload = f.read()
-                    if not payload:
-                        enc_file = os.path.join(b_dir, f"backup_{raw_key}.enc")
-                        if os.path.isfile(enc_file):
-                            dest = filedialog.asksaveasfilename(
-                                title="Download Backup File",
-                                initialfile=f"payroll_backup_{raw_key}.enc",
-                                defaultextension=".enc",
-                                filetypes=[("Encrypted Database (*.enc)", "*.enc"), ("All Files (*.*)", "*.*")],
-                                parent=top,
-                            )
-                            if dest:
-                                import shutil
-                                shutil.copy2(enc_file, dest)
-                                messagebox.showinfo("Success", f"Backup downloaded to:\n{dest}", parent=top)
-                                log_user_action("backup_download", extra_summary=f"Downloaded local backup {key} to {os.path.basename(dest)}")
-                            return
-                else:
-                    if get_db_mode() == "supabase" and not is_supabase_offline():
-                        try:
-                            pg = get_shared_supabase_conn()
-                            cur = pg.cursor()
-                            cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (key,))
-                            row = cur.fetchone()
-                            if row and row[0]:
-                                payload = row[0]
-                        except Exception as e:
-                            messagebox.showerror("Error", f"Failed to fetch cloud backup: {e}", parent=top)
-                            return
+                    except Exception:
+                        pass
+
+                if not payload and get_db_mode() == "supabase" and not is_supabase_offline():
+                    try:
+                        pg = get_shared_supabase_conn()
+                        cur = pg.cursor()
+                        cur.execute("SELECT payload FROM cloud_backups WHERE slot_key = %s", (key,))
+                        row = cur.fetchone()
+                        if row and row[0]:
+                            payload = row[0]
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to fetch cloud backup: {e}", parent=top)
+                        return
 
                 if not payload:
                     messagebox.showerror("Error", "Could not retrieve backup data for the selected entry.", parent=top)
@@ -18819,11 +19283,13 @@ if HAS_DEPS:
             def do_load_backup_file():
                 file_path = filedialog.askopenfilename(
                     title="Select Backup File to Load & Restore",
+                    initialdir=get_permanent_backups_dir(),
                     filetypes=[
-                        ("All Supported Backups (*.json.gz, *.json, *.enc)", "*.json.gz;*.json;*.enc"),
+                        ("All Supported Backups (*.json.gz, *.json, *.enc, *.db)", "*.json.gz;*.json;*.enc;*.db"),
                         ("Compressed Snapshot (*.json.gz)", "*.json.gz"),
                         ("JSON Snapshot (*.json)", "*.json"),
                         ("Encrypted Database (*.enc)", "*.enc"),
+                        ("SQLite Database (*.db)", "*.db"),
                         ("All Files (*.*)", "*.*"),
                     ],
                     parent=top,
@@ -18832,22 +19298,63 @@ if HAS_DEPS:
                     return
 
                 fn = os.path.basename(file_path)
-                if not messagebox.askyesno(
-                    "Confirm Restore from File",
-                    f"Restoring from file will replace current application data with the contents of:\n\n{fn}\n\nAre you sure you want to proceed?",
-                    icon="warning",
-                    parent=top,
-                ):
+                # Require User Password before loading from disk
+                ok_pw, verified_pw = _prompt_user_password_for_restore(action_title=f"Load File: {fn}")
+                if not ok_pw:
                     return
 
                 try:
+                    # Save pre-restore safety backup first
+                    try:
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        create_local_backup(
+                            slot_key=f"pre_restore_{ts}",
+                            slot="pre_restore",
+                            backup_date=datetime.now().strftime("%Y-%m-%d"),
+                        )
+                    except Exception:
+                        pass
+
+                    who = getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
                     if file_path.endswith(".enc"):
                         active_enc = os.path.join(get_default_app_dir(), "payroll_data.enc")
                         import shutil
                         shutil.copy2(file_path, active_enc)
+                        if os.path.exists(CLOUD_CACHE_FILE):
+                            try:
+                                shutil.copy2(file_path, CLOUD_CACHE_FILE)
+                            except Exception:
+                                pass
                         load_database()
+                        if verified_pw:
+                            try:
+                                update_user_password_everywhere(who, verified_pw)
+                            except Exception:
+                                pass
                         log_user_action("backup_load_file", extra_summary=f"Restored database from file: {fn}")
                         messagebox.showinfo("Restore Success", f"Database successfully restored from:\n{fn}", parent=top)
+                        try:
+                            self._schedule_soft_ui_refresh(full=True)
+                        except Exception:
+                            pass
+                        refresh_all()
+                        return
+
+                    if file_path.endswith(".db"):
+                        import shutil
+                        if OFFLINE_TEMP_DB_PATH:
+                            shutil.copy2(file_path, OFFLINE_TEMP_DB_PATH)
+                        if TEMP_DB_PATH and TEMP_DB_PATH != SUPABASE_DB_SENTINEL:
+                            shutil.copy2(file_path, str(TEMP_DB_PATH))
+                            save_database()
+                        _persist_offline_cache()
+                        if verified_pw:
+                            try:
+                                update_user_password_everywhere(who, verified_pw)
+                            except Exception:
+                                pass
+                        log_user_action("backup_load_file", extra_summary=f"Restored SQLite database from file: {fn}")
+                        messagebox.showinfo("Restore Success", f"SQLite Database successfully restored from:\n{fn}", parent=top)
                         try:
                             self._schedule_soft_ui_refresh(full=True)
                         except Exception:
@@ -18859,8 +19366,13 @@ if HAS_DEPS:
                     if file_path.endswith(".json.gz"):
                         with open(file_path, "rb") as f:
                             gz_data = f.read()
-                        raw_str = gzip.decompress(gz_data).decode("utf-8")
-                        snapshot = json.loads(raw_str)
+                        try:
+                            raw_str = gzip.decompress(gz_data).decode("utf-8")
+                            snapshot = json.loads(raw_str)
+                        except Exception:
+                            # File may be encrypted base64 payload stored as .json.gz
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                snapshot = _decode_cloud_backup_payload(f.read())
                     else:
                         with open(file_path, "r", encoding="utf-8") as f:
                             content = f.read()
@@ -18874,6 +19386,11 @@ if HAS_DEPS:
 
                     ok, msg = restore_snapshot_dict(snapshot, source_name=f"file:{fn}")
                     if ok:
+                        if verified_pw:
+                            try:
+                                update_user_password_everywhere(who, verified_pw)
+                            except Exception:
+                                pass
                         messagebox.showinfo("Restore Success", f"Successfully loaded and restored backup from:\n{fn}", parent=top)
                         try:
                             self._schedule_soft_ui_refresh(full=True)
@@ -18895,14 +19412,14 @@ if HAS_DEPS:
 
             btn_row1 = tb.Frame(btn_container)
             btn_row1.pack(fill=X, pady=2)
-            tb.Button(btn_row1, text=self._tr("🔄 Refresh"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row1, text=self._tr("📥 Backup Now (Local + Cloud)"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row1, text=self._tr("Restore Selected Backup"), bootstyle="warning outline", command=do_restore).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row1, text=self._tr("🔄 Refresh List"), bootstyle="secondary outline", command=refresh_all).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row1, text=self._tr("➕ Create Backup Now"), bootstyle="success", command=do_backup_now).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row1, text=self._tr("🔒 Load / Restore Selected Backup"), bootstyle="warning", command=do_restore).pack(side=LEFT, padx=(0, 6))
 
             btn_row2 = tb.Frame(btn_container)
             btn_row2.pack(fill=X, pady=2)
-            tb.Button(btn_row2, text=self._tr("💾 Download Selected File"), bootstyle="info outline", command=do_download_backup).pack(side=LEFT, padx=(0, 6))
-            tb.Button(btn_row2, text=self._tr("📂 Load Backup from Disk..."), bootstyle="primary outline", command=do_load_backup_file).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row2, text=self._tr("📂 Load Backup from File..."), bootstyle="primary", command=do_load_backup_file).pack(side=LEFT, padx=(0, 6))
+            tb.Button(btn_row2, text=self._tr("💾 Download Selected Backup"), bootstyle="info outline", command=do_download_backup).pack(side=LEFT, padx=(0, 6))
 
             refresh_all()
 
@@ -19322,39 +19839,51 @@ if HAS_DEPS:
                         import shutil
                         import json
                         b_dir = get_local_backups_dir()
+                        perm_dir = get_permanent_backups_dir()
                         os.makedirs(b_dir, exist_ok=True)
+                        os.makedirs(perm_dir, exist_ok=True)
                         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-                        # 1. Save full local backup snapshot & raw DB copies FIRST
+                        # 1. Save full local + permanent backup snapshot & raw DB copies FIRST
+                        try:
+                            create_local_backup(
+                                slot_key=f"pre_detach_{ts}",
+                                slot="pre_detach",
+                                backup_date=datetime.now().strftime("%Y-%m-%d"),
+                            )
+                        except Exception:
+                            pass
                         try:
                             save_local_daily_snapshot()
                         except Exception:
                             pass
 
                         backup_paths_saved = []
+                        src_db_path = None
                         if OFFLINE_TEMP_DB_PATH and os.path.exists(OFFLINE_TEMP_DB_PATH):
-                            dst_db = os.path.join(b_dir, f"pre_detach_backup_{ts}.db")
-                            try:
-                                shutil.copy2(OFFLINE_TEMP_DB_PATH, dst_db)
-                                backup_paths_saved.append(dst_db)
-                            except Exception:
-                                pass
+                            src_db_path = OFFLINE_TEMP_DB_PATH
                         elif TEMP_DB_PATH and os.path.exists(str(TEMP_DB_PATH)):
-                            dst_db = os.path.join(b_dir, f"pre_detach_backup_{ts}.db")
-                            try:
-                                shutil.copy2(str(TEMP_DB_PATH), dst_db)
-                                backup_paths_saved.append(dst_db)
-                            except Exception:
-                                pass
+                            src_db_path = str(TEMP_DB_PATH)
+
+                        if src_db_path:
+                            for t_dir in (perm_dir, b_dir):
+                                dst_db = os.path.join(t_dir, f"pre_detach_backup_{ts}.db")
+                                try:
+                                    shutil.copy2(src_db_path, dst_db)
+                                    if dst_db not in backup_paths_saved:
+                                        backup_paths_saved.append(dst_db)
+                                except Exception:
+                                    pass
 
                         if os.path.exists(CLOUD_CACHE_FILE):
-                            dst_enc = os.path.join(b_dir, f"pre_detach_cloud_cache_{ts}.enc")
-                            try:
-                                shutil.copy2(CLOUD_CACHE_FILE, dst_enc)
-                                if not backup_paths_saved:
-                                    backup_paths_saved.append(dst_enc)
-                            except Exception:
-                                pass
+                            for t_dir in (perm_dir, b_dir):
+                                dst_enc = os.path.join(t_dir, f"pre_detach_cloud_cache_{ts}.enc")
+                                try:
+                                    shutil.copy2(CLOUD_CACHE_FILE, dst_enc)
+                                    if not backup_paths_saved:
+                                        backup_paths_saved.append(dst_enc)
+                                except Exception:
+                                    pass
 
                         # 2. Stop all background syncing & close active cloud connections
                         self.stop_live_sync()
