@@ -854,7 +854,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.30"
+APP_VERSION = "2.5.32"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1924,11 +1924,22 @@ def _clean_supabase_config(config):
 
 
 def _extract_supabase_ref(host, user):
+    import re
+    def _sanitize_ref(val):
+        if not val:
+            return None
+        c = re.sub(r"[^a-z0-9]", "", str(val).lower())
+        if len(c) < 8 or c in ("supabase", "postgres", "localhost", "poolersupabasecom", "amazonaws"):
+            return None
+        return c
+
     ref = None
-    h = str(host or "").strip().lower()
-    u = str(user or "").strip()
+    h = str(host or "").strip().lower().strip("'\" ")
+    u = str(user or "").strip().strip("'\" ")
+
     if "." in u and u.startswith("postgres."):
-        ref = u.split(".", 1)[1].strip()
+        ref = _sanitize_ref(u.split(".", 1)[1])
+
     if not ref and h:
         clean_h = h.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0].strip()
         if "pooler.supabase.com" not in clean_h:
@@ -1937,13 +1948,14 @@ def _extract_supabase_ref(host, user):
                     part = clean_h.split(dom)[0]
                     if part.startswith("db."):
                         part = part[3:]
-                    ref = part.strip()
+                    ref = _sanitize_ref(part)
                     break
             if not ref:
                 if clean_h.startswith("db.") and clean_h.endswith(".co"):
-                    ref = clean_h[3:-3].strip()
-                elif "." not in clean_h and len(clean_h) >= 12:
-                    ref = clean_h
+                    ref = _sanitize_ref(clean_h[3:-3])
+                elif "." not in clean_h:
+                    ref = _sanitize_ref(clean_h)
+
     if not ref:
         try:
             cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
@@ -1953,9 +1965,12 @@ def _extract_supabase_ref(host, user):
                 saved_u = str(saved.get("supabase_user", "")).strip()
                 saved_h = str(saved.get("supabase_host", "")).strip().lower()
                 if "." in saved_u and saved_u.startswith("postgres."):
-                    ref = saved_u.split(".", 1)[1].strip()
-                elif ".supabase.co" in saved_h and "pooler" not in saved_h:
-                    ref = saved_h.replace("https://", "").replace("http://", "").replace("db.", "").split(".supabase.co")[0].strip()
+                    ref = _sanitize_ref(saved_u.split(".", 1)[1])
+                if not ref and ".supabase.co" in saved_h and "pooler" not in saved_h:
+                    part = saved_h.replace("https://", "").replace("http://", "").split(".supabase.co")[0]
+                    if part.startswith("db."):
+                        part = part[3:]
+                    ref = _sanitize_ref(part)
         except Exception:
             pass
     return ref
@@ -1963,13 +1978,130 @@ def _extract_supabase_ref(host, user):
 
 _IPV4_DNS_CACHE = {}
 _IPV4_DNS_LOCK = threading.Lock()
+_DNS_QUERY_SEM = threading.Semaphore(4)
+
+
+def _query_dns_udp_ipv4(domain, qtype=1, dns_ip="8.8.8.8", timeout=0.8):
+    """Pure IPv4 RFC 1035 UDP DNS query directly to a public IPv4 DNS server (zero getaddrinfo/IPv6).
+    Supports qtype=1 (A record -> IPv4 list) and qtype=28 (AAAA record -> IPv6 list).
+    """
+    import struct, random
+    sock = None
+    try:
+        tid = random.randint(1, 65534)
+        header = struct.pack("!HHHHHH", tid, 0x0100, 1, 0, 0, 0)
+        qname = b""
+        for part in domain.strip(".").split("."):
+            b = part.encode("ascii", errors="ignore")
+            qname += struct.pack("!B", len(b)) + b
+        qname += b"\x00"
+        pkt = header + qname + struct.pack("!HH", int(qtype), 1)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(pkt, (dns_ip, 53))
+        data, _ = sock.recvfrom(1024)
+        if len(data) < 12:
+            return None, []
+        r_tid, flags, qcount, ancount, _, _ = struct.unpack("!HHHHHH", data[:12])
+        if r_tid != tid:
+            return None, []
+        rcode = flags & 0x000F
+        pos = 12
+
+        def _skip_name(buf, p):
+            while p < len(buf):
+                length = buf[p]
+                if length == 0:
+                    return p + 1
+                elif (length & 0xC0) == 0xC0:
+                    return p + 2
+                else:
+                    p += 1 + length
+            return p
+
+        for _ in range(qcount):
+            pos = _skip_name(data, pos) + 4
+        results = []
+        for _ in range(ancount):
+            pos = _skip_name(data, pos)
+            if pos + 10 > len(data):
+                break
+            rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", data[pos:pos + 10])
+            pos += 10
+            if rtype == 1 and rdlen == 4 and pos + 4 <= len(data) and qtype == 1:
+                ip = socket.inet_ntoa(data[pos:pos + 4])
+                if ip and ip not in results:
+                    results.append(ip)
+            elif rtype == 28 and rdlen == 16 and pos + 16 <= len(data) and qtype == 28:
+                try:
+                    ip6 = socket.inet_ntop(socket.AF_INET6, data[pos:pos + 16]).lower()
+                    if ip6 and ip6 not in results:
+                        results.append(ip6)
+                except Exception:
+                    pass
+            pos += rdlen
+        return rcode, results
+    except Exception:
+        return None, []
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def _query_doh_ipv4_literal(domain, qtype="A", dns_ip="8.8.8.8", host_header="dns.google", path="/resolve", timeout=1.5):
+    """Pure IPv4 HTTPS DoH query directly to literal IP 8.8.8.8:443 or 1.1.1.1:443 using http.client.HTTPResponse
+    so chunked transfer encoding and gzip/headers are parsed natively without urllib or IPv6.
+    """
+    import http.client
+    sock = None
+    try:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(timeout)
+        raw_sock.connect((dns_ip, 443))
+        ctx = ssl._create_unverified_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(raw_sock, server_hostname=host_header)
+        req_str = (
+            f"GET {path}?name={domain}&type={qtype} HTTP/1.1\r\n"
+            f"Host: {host_header}\r\n"
+            "Accept: application/dns-json\r\n"
+            "Connection: close\r\n\r\n"
+        )
+        sock.sendall(req_str.encode("ascii"))
+        resp = http.client.HTTPResponse(sock)
+        resp.begin()
+        body = resp.read().decode("utf-8", errors="ignore")
+        data = json.loads(body)
+        results = []
+        target_type = 28 if str(qtype).upper() == "AAAA" else 1
+        for ans in data.get("Answer", []) or []:
+            if ans.get("type") == target_type:
+                val = str(ans.get("data", "")).strip().lower()
+                if val and val not in results:
+                    results.append(val)
+        return data.get("Status"), results
+    except Exception:
+        pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return None, []
 
 
 def _resolve_ipv4_addresses(host, port):
-    """Resolve hostname strictly to IPv4 (AF_INET) addresses with fast caching.
-    1. Tries local OS DNS (getaddrinfo with AF_INET).
-    2. If local OS DNS returns no IPv4, queries Google DoH (8.8.8.8) for 'A' records.
-       If Google DoH confirms no 'A' record exists, returns [] immediately without hanging.
+    """Resolve hostname strictly to IPv4 (AF_INET) addresses with 100% IPv6 immunity.
+    1. Checks fast in-memory cache.
+    2. Tries throttled local OS DNS (getaddrinfo with AF_INET).
+    3. Tries pure IPv4 UDP DNS directly to 8.8.8.8:53 and 1.1.1.1:53 (no getaddrinfo, no IPv6).
+    4. Tries pure IPv4 HTTPS DoH directly to 8.8.8.8:443 and 1.1.1.1:443 using HTTPResponse.
     """
     h = str(host or "").strip().lower()
     if not h:
@@ -1985,38 +2117,45 @@ def _resolve_ipv4_addresses(host, port):
             return list(_IPV4_DNS_CACHE[h])
 
     ipv4_list = []
-    try:
-        infos = socket.getaddrinfo(h, int(port), socket.AF_INET, socket.SOCK_STREAM)
-        for info in infos:
-            ip = info[4][0]
-            if ip and ip not in ipv4_list:
-                ipv4_list.append(ip)
-    except Exception:
-        pass
+    with _DNS_QUERY_SEM:
+        try:
+            infos = socket.getaddrinfo(h, int(port), socket.AF_INET, socket.SOCK_STREAM)
+            for info in infos:
+                ip = info[4][0]
+                if ip and ip not in ipv4_list:
+                    ipv4_list.append(ip)
+        except Exception:
+            pass
 
     if ipv4_list:
         with _IPV4_DNS_LOCK:
             _IPV4_DNS_CACHE[h] = list(ipv4_list)
         return ipv4_list
 
-    # Query Google DoH first; if it responds with valid JSON (even if 0 A records), trust it
-    for doh_url in (
-        f"https://dns.google/resolve?name={h}&type=A",
-        f"https://cloudflare-dns.com/dns-query?name={h}&type=A",
+    # Pure IPv4 UDP DNS fallback to Google (8.8.8.8) and Cloudflare (1.1.1.1)
+    for dns_server in ("8.8.8.8", "1.1.1.1", "9.9.9.9"):
+        rcode, ips = _query_dns_udp_ipv4(h, qtype=1, dns_ip=dns_server, timeout=0.7)
+        if ips:
+            with _IPV4_DNS_LOCK:
+                _IPV4_DNS_CACHE[h] = list(ips)
+            return ips
+        if rcode == 3:  # NXDOMAIN (domain definitely does not exist)
+            with _IPV4_DNS_LOCK:
+                _IPV4_DNS_CACHE[h] = []
+            return []
+
+    # Pure IPv4 HTTPS DoH fallback to literal IP 8.8.8.8:443 / 1.1.1.1:443
+    for dns_ip, host_hdr, path in (
+        ("8.8.8.8", "dns.google", "/resolve"),
+        ("1.1.1.1", "cloudflare-dns.com", "/dns-query"),
     ):
-        try:
-            req = urllib.request.Request(doh_url, headers={"Accept": "application/dns-json"})
-            with _urlopen_with_fallback(req, timeout=1.5) as resp:
-                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-                for ans in data.get("Answer", []) or []:
-                    if ans.get("type") == 1:  # IPv4 A record
-                        ip = str(ans.get("data", "")).strip()
-                        if ip and ip not in ipv4_list:
-                            ipv4_list.append(ip)
-                # Authoritative DoH response received; no need to query secondary DoH
-                break
-        except Exception:
-            pass
+        status, ips = _query_doh_ipv4_literal(h, qtype="A", dns_ip=dns_ip, host_header=host_hdr, path=path, timeout=1.4)
+        if ips:
+            with _IPV4_DNS_LOCK:
+                _IPV4_DNS_CACHE[h] = list(ips)
+            return ips
+        if status in (0, 3):  # Authoritative answer received confirming 0 A records
+            break
 
     with _IPV4_DNS_LOCK:
         _IPV4_DNS_CACHE[h] = list(ipv4_list)
@@ -2028,9 +2167,8 @@ _SCRAM_PATCHED = False
 
 
 def _ensure_universal_scram_client():
-    """Patches scramp.ScramClient once so SCRAM-SHA-256 always uses channel_binding=None ('n,,' GS2 header).
-    This prevents TLS proxy certificate mismatches on session poolers AND avoids 'y,,' GS2 header
-    rejection on Supavisor transaction poolers (port 6543) and PostgreSQL backends.
+    """Patches scramp so channel_binding is always None ('n,,' GS2 header) and make_channel_binding
+    never invokes asn1crypto certificate parsing on TLS sockets.
     """
     global _SCRAM_PATCHED
     if _SCRAM_PATCHED:
@@ -2052,6 +2190,8 @@ def _ensure_universal_scram_client():
 
             scramp.ScramClient = _UniversalScramClient
             pg8000.core.scramp.ScramClient = _UniversalScramClient
+            scramp.make_channel_binding = lambda name, ssl_socket: None
+            pg8000.core.scramp.make_channel_binding = lambda name, ssl_socket: None
             _SCRAM_PATCHED = True
         except Exception:
             pass
@@ -2122,10 +2262,54 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
         raise e
 
 
-def _detect_project_region_via_cf(ref):
-    """Detects likely AWS region from Cloudflare cf-ray header on https://{ref}.supabase.co."""
+def _detect_project_region_exact(ref):
+    """Determines the exact AWS region of a Supabase project:
+    1. Queries the AAAA (IPv6) record of db.<ref>.supabase.co over pure IPv4 UDP/DoH DNS (8.8.8.8)
+       and matches the AWS EC2 IPv6 /32 prefix (e.g. 2600:1f18 -> us-east-1, 2600:1f16 -> us-east-2).
+    2. Falls back to checking Cloudflare cf-ray header over pure IPv4.
+    """
     if not ref:
         return None
+
+    aws_ipv6_prefixes = {
+        "2600:1f18:": "us-east-1",
+        "2600:1f16:": "us-east-2",
+        "2600:1f1c:": "us-west-1",
+        "2600:1f14:": "us-west-2",
+        "2600:1f13:": "ca-central-1",
+        "2a05:d014:": "eu-central-1",
+        "2a05:d012:": "eu-central-2",
+        "2a05:d018:": "eu-west-1",
+        "2a05:d01c:": "eu-west-2",
+        "2a05:d01a:": "eu-west-3",
+        "2a05:d016:": "eu-north-1",
+        "2406:da18:": "ap-southeast-1",
+        "2406:da1c:": "ap-southeast-2",
+        "2406:da14:": "ap-northeast-1",
+        "2406:da12:": "ap-northeast-2",
+        "2406:da1a:": "ap-south-1",
+        "2600:1f1e:": "sa-east-1",
+    }
+
+    db_host = f"db.{ref}.supabase.co"
+    ipv6_list = []
+    for dns_srv in ("8.8.8.8", "1.1.1.1"):
+        _, res = _query_dns_udp_ipv4(db_host, qtype=28, dns_ip=dns_srv, timeout=0.6)
+        if res:
+            ipv6_list.extend(res)
+            break
+    if not ipv6_list:
+        _, res = _query_doh_ipv4_literal(db_host, qtype="AAAA", dns_ip="8.8.8.8", host_header="dns.google", path="/resolve", timeout=1.2)
+        if res:
+            ipv6_list.extend(res)
+
+    for ip6 in ipv6_list:
+        ip6_low = str(ip6).lower()
+        for prefix, region in aws_ipv6_prefixes.items():
+            if ip6_low.startswith(prefix):
+                return region
+
+    # Fallback: Cloudflare cf-ray header
     iata_to_region = {
         "IAD": "us-east-1", "DCA": "us-east-1", "ATL": "us-east-1", "MIA": "us-east-1", "BOS": "us-east-1", "EWR": "us-east-1", "JFK": "us-east-1",
         "CMH": "us-east-2", "ORD": "us-east-2", "DTW": "us-east-2", "IND": "us-east-2", "MSP": "us-east-2", "DFW": "us-east-1",
@@ -2145,22 +2329,37 @@ def _detect_project_region_via_cf(ref):
         "BOM": "ap-south-1", "DEL": "ap-south-1", "MAA": "ap-south-1", "BLR": "ap-south-1",
         "GRU": "sa-east-1", "GIG": "sa-east-1",
     }
+    sock = None
     try:
-        req = urllib.request.Request(f"https://{ref}.supabase.co/rest/v1/", method="HEAD")
-        headers = None
-        try:
-            with _urlopen_with_fallback(req, timeout=1.5) as resp:
-                headers = resp.headers
-        except urllib.error.HTTPError as he:
-            headers = he.headers
-        if headers:
-            cf_ray = str(headers.get("cf-ray", "") or "").upper()
-            if "-" in cf_ray:
-                iata = cf_ray.split("-")[-1].strip()
-                if iata in iata_to_region:
-                    return iata_to_region[iata]
+        target_host = f"{ref}.supabase.co"
+        ips = _resolve_ipv4_addresses(target_host, 443)
+        if not ips:
+            return None
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(1.2)
+        raw_sock.connect((ips[0], 443))
+        ctx = ssl._create_unverified_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(raw_sock, server_hostname=target_host)
+        req_str = f"HEAD /rest/v1/ HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
+        sock.sendall(req_str.encode("ascii"))
+        data = sock.recv(2048).decode("utf-8", errors="ignore")
+        for line in data.splitlines():
+            if line.lower().startswith("cf-ray:"):
+                cf_ray = line.split(":", 1)[1].strip().upper()
+                if "-" in cf_ray:
+                    iata = cf_ray.split("-")[-1].strip()
+                    if iata in iata_to_region:
+                        return iata_to_region[iata]
     except Exception:
         pass
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
     return None
 
 
@@ -2176,26 +2375,37 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
 
     ref = _extract_supabase_ref(host, user)
     port_int = int(port or 5432)
-    alt_port = 6543 if port_int == 5432 else 5432
+
+    if "pooler" in str(host).lower() and not ref:
+        raise RuntimeError(
+            f"When using a Pooler Host ({host}), your DB User MUST include your Project ID in the format:\n"
+            "postgres.YOUR_PROJECT_ID\n\n"
+            "Or enter your Direct DB Host (db.YOUR_PROJECT_ID.supabase.co) and the app will configure the pooler automatically."
+        )
 
     # Check if the entered host itself has an IPv4 address
     host_ipv4s = _resolve_ipv4_addresses(host, port_int)
     first_err = None
+    initial_reachable = 0
 
     # Only try direct host if it actually resolves to IPv4 (or if we have no ref to discover a pooler)
     if host_ipv4s or not ref:
         u_primary = f"postgres.{ref}" if ("pooler" in str(host).lower() and user == "postgres" and ref) else user
-        primary_attempts = [
-            (host, port_int, u_primary),
-            (host, alt_port, u_primary),
-        ]
-        for c_host, c_port, c_user in primary_attempts:
+        # Always test port 6543 first for Cloud DB / pooler hosts so we don't hang on blocked port 5432
+        is_cloud_host = "supabase" in str(host).lower() or "pooler" in str(host).lower()
+        if is_cloud_host:
+            ports_to_try = [6543, 5432] if port_int != 5432 else [6543, 5432]
+        else:
+            alt_port = 6543 if port_int == 5432 else 5432
+            ports_to_try = [port_int, alt_port]
+
+        for c_port in ports_to_try:
             try:
-                t_out = min(timeout, 4.0) if ref else min(timeout, 7.0)
+                t_out = min(timeout, 3.5) if ref else min(timeout, 7.0)
                 conn = _pg8000_connect_ipv4(
-                    host=c_host,
+                    host=host,
                     port=c_port,
-                    user=c_user,
+                    user=u_primary,
                     password=password,
                     database=database,
                     timeout=t_out,
@@ -2204,20 +2414,24 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                     conn.commit()
                 except Exception:
                     pass
-                return conn, c_host, c_port, c_user
+                return conn, host, c_port, u_primary
             except Exception as e:
                 if first_err is None:
                     first_err = e
                 msg = str(e).lower()
                 if "password authentication failed" in msg:
                     raise RuntimeError(
-                        f"Connected to DB host {c_host}:{c_port}, but password authentication failed. Please verify your DB password."
+                        f"Connected to DB host {host}:{c_port}, but password authentication failed. Please verify your DB password."
                     ) from e
-                if "tenant or user not found" in msg and not ref:
-                    raise RuntimeError(
-                        f"Connected to pooler {c_host}:{c_port}, but 'Tenant or user not found'.\n"
-                        "When using a pooler host, your DB User must include your Project ID: postgres.YOUR_PROJECT_ID"
-                    ) from e
+                if "tenant or user not found" in msg:
+                    initial_reachable += 1
+                    if not ref:
+                        raise RuntimeError(
+                            f"Connected to pooler {host}:{c_port}, but 'Tenant or user not found'.\n"
+                            "When using a pooler host, your DB User must include your Project ID: postgres.YOUR_PROJECT_ID"
+                        ) from e
+                    # Wrong region pooler host! Stop testing port 5432 on this host and scan other regions immediately!
+                    break
 
     if ref:
         all_regions = [
@@ -2227,7 +2441,7 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
             "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
             "ap-northeast-2", "ap-south-1", "sa-east-1"
         ]
-        hint_reg = _detect_project_region_via_cf(ref)
+        hint_reg = _detect_project_region_exact(ref)
         ordered_regions = []
         if hint_reg and hint_reg in all_regions:
             ordered_regions.append(hint_reg)
@@ -2243,12 +2457,12 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
             "user": None,
             "auth_err": None,
             "other_err": None,
-            "reachable_count": 0,
+            "reachable_count": initial_reachable,
         }
         lock = threading.Lock()
         done_evt = threading.Event()
-        # Allow all 34 regional poolers on port 6543 to run concurrently without queuing
-        sem = threading.Semaphore(36)
+        # Use Semaphore(6) so we never overwhelm macOS mDNSResponder or WiFi router NAT tables
+        sem = threading.Semaphore(6)
 
         def _probe(item, sock_timeout=3.5):
             p_host, p_port = item
@@ -2293,29 +2507,39 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                     elif "tenant or user not found" in p_msg:
                         with lock:
                             found["reachable_count"] += 1
-                    elif "has no ipv4 address" not in p_msg:
+                    elif p_host.startswith("aws-0-") or "has no ipv4 address" not in p_msg:
                         with lock:
                             if found["other_err"] is None:
                                 found["other_err"] = f"{p_host}:{p_port} -> {pe}"
 
-        # Phase 1: Test Port 6543 ONLY across all regions (aws-0 first, then aws-1).
-        # Port 6543 is open on all WiFi networks and responds in ~200ms per region.
-        wave1_candidates = []
-        for cluster_prefix in ("aws-0", "aws-1"):
-            for reg in ordered_regions:
-                wave1_candidates.append((f"{cluster_prefix}-{reg}.pooler.supabase.com", 6543))
+        # Fast-path: If exact region was detected via AAAA IPv6 prefix or cf-ray, test that region synchronously first (< 250ms)
+        if hint_reg:
+            for prefix in ("aws-0", "aws-1"):
+                _probe((f"{prefix}-{hint_reg}.pooler.supabase.com", 6543), sock_timeout=3.0)
+                if done_evt.is_set():
+                    break
 
-        for item in wave1_candidates:
-            if done_evt.is_set():
-                break
-            t = threading.Thread(target=_probe, args=(item, 3.5), daemon=True)
-            t.start()
+        # Phase 1: Test Port 6543 across all regions (aws-0 first, then aws-1)
+        if not done_evt.is_set():
+            wave1_candidates = []
+            for cluster_prefix in ("aws-0", "aws-1"):
+                for reg in ordered_regions:
+                    if hint_reg and reg == hint_reg:
+                        continue
+                    wave1_candidates.append((f"{cluster_prefix}-{reg}.pooler.supabase.com", 6543))
 
-        # Wait up to 4.5 seconds for Phase 1 (port 6543); wakes immediately on match or auth failure
-        done_evt.wait(timeout=4.5)
+            threads = []
+            for item in wave1_candidates:
+                if done_evt.is_set():
+                    break
+                t = threading.Thread(target=_probe, args=(item, 3.5), daemon=True)
+                t.start()
+                threads.append(t)
+
+            done_evt.wait(timeout=7.5)
 
         # Phase 2: Fallback to Port 5432 ONLY if Phase 1 didn't find a connection or auth error
-        if found["conn"] is None and found["auth_err"] is None:
+        if found["conn"] is None and found["auth_err"] is None and found["reachable_count"] == 0:
             wave2_candidates = []
             for cluster_prefix in ("aws-0", "aws-1"):
                 for reg in ordered_regions:
@@ -2325,7 +2549,7 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                     break
                 t = threading.Thread(target=_probe, args=(item, 2.5), daemon=True)
                 t.start()
-            done_evt.wait(timeout=3.0)
+            done_evt.wait(timeout=3.5)
 
         if found["conn"] is not None:
             try:
@@ -2358,8 +2582,9 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
         if found["other_err"] is not None:
             raise RuntimeError(f"Could not connect to Cloud DB Pooler: {found['other_err']}")
 
+        detail = f" ({first_err})" if first_err else ""
         raise RuntimeError(
-            f"Could not reach any IPv4 Cloud DB Pooler on port 6543 or 5432 for Project ID '{ref}'. "
+            f"Could not reach any IPv4 Cloud DB Pooler on port 6543 or 5432 for Project ID '{ref}'{detail}. "
             "Please check your internet connection or firewall settings."
         )
 
