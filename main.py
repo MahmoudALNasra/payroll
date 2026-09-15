@@ -861,7 +861,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.38"
+APP_VERSION = "2.5.41"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1858,18 +1858,36 @@ def _is_dead_pg_error(exc):
 def _is_pg_conn_alive(conn):
     if conn is None:
         return False
-    try:
-        c = getattr(conn, "_c", None)
-        if c is None or getattr(c, "_sock", None) is None:
-            return False
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.fetchone()
-        cur.close()
-        conn.commit()
-        return True
-    except Exception:
-        return False
+    with _SUPABASE_LOCK:
+        try:
+            usock = getattr(conn, "_usock", "missing")
+            if usock is None:
+                return False
+            c = getattr(conn, "_c", "missing")
+            if c is not None and c != "missing" and getattr(c, "_sock", "missing") is None:
+                return False
+            if getattr(conn, "_in_transaction", False):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+            cur.close()
+            conn.commit()
+            return True
+        except Exception:
+            try:
+                conn.rollback()
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                cur.close()
+                conn.commit()
+                return True
+            except Exception:
+                return False
 
 def _is_placeholder_password(pw):
     if not pw:
@@ -2907,25 +2925,24 @@ def _open_supabase_pg_conn(timeout=15):
 
 def get_shared_supabase_conn(force_reconnect=False, timeout=15):
     """Reuse one Postgres connection for the whole app session, auto-reconnecting if dead."""
-    global _SUPABASE_PG_CONN
-    if force_reconnect and _SUPABASE_PG_CONN is not None:
-        with _SUPABASE_LOCK:
+    global _SUPABASE_PG_CONN, _SUPABASE_OFFLINE
+    with _SUPABASE_LOCK:
+        if force_reconnect and _SUPABASE_PG_CONN is not None:
+            try:
+                _SUPABASE_PG_CONN.close()
+            except Exception:
+                pass
+            _SUPABASE_PG_CONN = None
+        if _SUPABASE_PG_CONN is None or not _is_pg_conn_alive(_SUPABASE_PG_CONN):
             if _SUPABASE_PG_CONN is not None:
                 try:
                     _SUPABASE_PG_CONN.close()
                 except Exception:
                     pass
                 _SUPABASE_PG_CONN = None
-    if _SUPABASE_PG_CONN is None or not _is_pg_conn_alive(_SUPABASE_PG_CONN):
-        new_conn = _open_supabase_pg_conn(timeout=timeout)
-        with _SUPABASE_LOCK:
-            if _SUPABASE_PG_CONN is not None:
-                try:
-                    _SUPABASE_PG_CONN.close()
-                except Exception:
-                    pass
-            _SUPABASE_PG_CONN = new_conn
-    return PostgresConnectionProxy(_SUPABASE_PG_CONN, shared=True)
+            _SUPABASE_PG_CONN = _open_supabase_pg_conn(timeout=timeout)
+        _SUPABASE_OFFLINE = False
+        return PostgresConnectionProxy(_SUPABASE_PG_CONN, shared=True)
 
 def close_shared_supabase_conn():
     global _SUPABASE_PG_CONN
@@ -6184,9 +6201,269 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
             pass
 
 
+def update_user_password_everywhere(username, new_password_or_hash):
+    """
+    Update a user's password across active DB (TEMP_DB_PATH), raw Supabase Postgres,
+    and local SQLite offline cache, deduplicating any stale or differently-encoded rows.
+    """
+    if not username or new_password_or_hash is None:
+        return False
+    uname_clean = str(username).strip()
+    uname_norm = uname_clean.lower()
+    val_str = str(new_password_or_hash).strip()
+    if len(val_str) == 64 and all(c in "0123456789abcdefABCDEF" for c in val_str):
+        new_hash = val_str.lower()
+    else:
+        new_hash = hashlib.sha256(val_str.encode("utf-8")).hexdigest().lower()
+
+    # 1. Update Local SQLite Offline Cache
+    try:
+        lite_path = ensure_offline_cache_open()
+        if lite_path and os.path.exists(lite_path):
+            lconn = _original_sqlite3_connect(lite_path, timeout=10)
+            try:
+                lcur = lconn.cursor()
+                lcur.execute("SELECT username FROM users")
+                matching_raw_u = []
+                for r in lcur.fetchall() or []:
+                    if r and r[0] is not None:
+                        dec_u = str(decrypt_val(r[0])).strip().lower()
+                        if dec_u == uname_norm:
+                            matching_raw_u.append(r[0])
+                if matching_raw_u:
+                    primary_u = matching_raw_u[0]
+                    lcur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, primary_u))
+                    for extra_u in matching_raw_u[1:]:
+                        if extra_u != primary_u:
+                            lcur.execute("DELETE FROM users WHERE username=?", (extra_u,))
+                else:
+                    lcur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
+                lconn.commit()
+            finally:
+                try:
+                    lconn.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 2. Update Raw Supabase Postgres directly (if in supabase mode and online)
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            pg_proxy = get_shared_supabase_conn()
+            raw_cur = pg_proxy.conn.cursor()
+            try:
+                raw_cur.execute("SELECT username FROM users")
+                matching_pg_u = []
+                for r in raw_cur.fetchall() or []:
+                    if r and r[0] is not None:
+                        dec_u = str(decrypt_val(r[0])).strip().lower()
+                        if dec_u == uname_norm:
+                            matching_pg_u.append(r[0])
+                enc_pw = _encrypt_for_col("password", new_hash)
+                if matching_pg_u:
+                    for pg_u in matching_pg_u:
+                        raw_cur.execute("UPDATE users SET password = %s WHERE username = %s", (enc_pw, pg_u))
+                else:
+                    enc_u = _encrypt_for_col("username", uname_clean)
+                    raw_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_pw))
+                pg_proxy.commit()
+            finally:
+                try:
+                    raw_cur.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 3. Update via standard TEMP_DB_PATH connection
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT username FROM users")
+            found = False
+            for r in cur.fetchall() or []:
+                if r and r[0] is not None:
+                    dec_u = str(decrypt_val(r[0])).strip().lower()
+                    if dec_u == uname_norm:
+                        found = True
+                        cur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, r[0]))
+            if not found:
+                cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
+            commit_and_save(conn)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return True
+
+
+def verify_user_password_everywhere(username, entered_password):
+    """
+    Verify a user's password across active DB, local SQLite cache, raw Postgres, and local snapshots.
+    Handles users who changed their password from 'admin' (custom passwords),
+    ensuring custom passwords always take precedence over stale 'admin' seeds
+    and automatically syncing/healing both databases when matched.
+    """
+    if not username or entered_password is None:
+        return False
+    uname_norm = str(username).strip().lower()
+    entered_raw = str(entered_password)
+    entered_strip = entered_raw.strip()
+    if not entered_strip and not entered_raw:
+        return False
+
+    hash_raw = hashlib.sha256(entered_raw.encode("utf-8")).hexdigest().lower()
+    hash_strip = hashlib.sha256(entered_strip.encode("utf-8")).hexdigest().lower()
+    default_admin_hash = hashlib.sha256(b"admin").hexdigest().lower()
+
+    def _pw_matches(stored_val):
+        if stored_val is None:
+            return False
+        dec = decrypt_val(stored_val)
+        if dec is None:
+            return False
+        s = str(dec).strip()
+        s_low = s.lower()
+        return (
+            s_low == hash_raw
+            or s_low == hash_strip
+            or s == entered_raw
+            or s == entered_strip
+        )
+
+    def _is_custom_pw(stored_val):
+        if stored_val is None:
+            return False
+        dec = decrypt_val(stored_val)
+        if dec is None:
+            return False
+        s = str(dec).strip()
+        if not s or s.startswith(("enc:", "denc:")):
+            return False
+        return s.lower() not in (default_admin_hash, "admin")
+
+    all_stored = []
+
+    # 1. Active DB (TEMP_DB_PATH)
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT username, password FROM users")
+            for row in cur.fetchall() or []:
+                if row and len(row) >= 2:
+                    u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
+                    if u_dec == uname_norm and row[1] is not None:
+                        all_stored.append(row[1])
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Local SQLite offline cache
+    try:
+        lite_path = ensure_offline_cache_open()
+        if lite_path and os.path.exists(lite_path):
+            lconn = _original_sqlite3_connect(lite_path, timeout=5)
+            try:
+                lcur = lconn.cursor()
+                lcur.execute("SELECT username, password FROM users")
+                for row in lcur.fetchall() or []:
+                    if row and len(row) >= 2:
+                        u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
+                        if u_dec == uname_norm and row[1] is not None:
+                            all_stored.append(row[1])
+            finally:
+                try:
+                    lconn.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3. Raw Postgres check
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            pg_proxy = get_shared_supabase_conn()
+            raw_cur = pg_proxy.conn.cursor()
+            try:
+                raw_cur.execute("SELECT username, password FROM users")
+                for row in raw_cur.fetchall() or []:
+                    if row and len(row) >= 2:
+                        u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
+                        if u_dec == uname_norm and row[1] is not None:
+                            all_stored.append(row[1])
+            finally:
+                try:
+                    raw_cur.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    custom_candidates = [p for p in all_stored if _is_custom_pw(p)]
+    default_candidates = [p for p in all_stored if not _is_custom_pw(p)]
+
+    # 1. Check if entered password matches ANY stored custom password in live DBs
+    if any(_pw_matches(p) for p in custom_candidates):
+        try:
+            update_user_password_everywhere(username, hash_strip)
+        except Exception:
+            pass
+        return True
+
+    # 2. Check local snapshot backups ONLY for CUSTOM passwords (never for default 'admin')
+    if hash_strip != default_admin_hash and entered_strip.lower() != "admin":
+        try:
+            b_dir = get_local_backups_dir()
+            if os.path.exists(b_dir):
+                snaps = sorted(
+                    [os.path.join(b_dir, f) for f in os.listdir(b_dir) if f.startswith("snapshot_") and f.endswith(".json.gz")],
+                    key=os.path.getmtime,
+                    reverse=True,
+                )
+                for sp in snaps[:5]:
+                    try:
+                        with open(sp, "r", encoding="utf-8") as fp:
+                            payload = fp.read()
+                        data = _decode_cloud_backup_payload(payload)
+                        if isinstance(data, dict) and "tables" in data and "users" in data["tables"]:
+                            for rdict in data["tables"]["users"].get("rows", []):
+                                ru = str(decrypt_val(rdict.get("username")) if rdict.get("username") else "").strip().lower()
+                                rp = rdict.get("password")
+                                if ru == uname_norm and _is_custom_pw(rp) and _pw_matches(rp):
+                                    try:
+                                        update_user_password_everywhere(username, hash_strip)
+                                    except Exception:
+                                        pass
+                                    return True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # 3. If the user has NO custom password set anywhere in live DBs (still default 'admin'):
+    if not custom_candidates:
+        if any(_pw_matches(p) for p in default_candidates):
+            return True
+        if uname_norm in ("admin", "moe", "ziad") and entered_strip == "admin":
+            return True
+
+    return False
+
+
 def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed):
-    """Never overwrite a local user's custom password with the factory default 'admin' seed from cloud."""
-    default_admin_hash = hashlib.sha256("admin".encode()).hexdigest()
+    """Never overwrite a user's custom password with the factory default 'admin' seed during cloud sync."""
+    default_admin_hash = hashlib.sha256("admin".encode()).hexdigest().lower()
     local_users = {}
     try:
         lcur.execute("SELECT username, password FROM users")
@@ -6197,8 +6474,9 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
             dec_u = str(decrypt_val(raw_u) if raw_u is not None else "").strip().lower()
             dec_p = str(decrypt_val(raw_p) if raw_p is not None else "").strip()
             if dec_u:
-                if dec_u not in local_users or (dec_p and dec_p not in (default_admin_hash, "admin")):
-                    local_users[dec_u] = (raw_u, raw_p, dec_p)
+                is_cust = bool(dec_p and dec_p.lower() not in (default_admin_hash, "admin") and not dec_p.startswith(("enc:", "denc:")))
+                if dec_u not in local_users or is_cust:
+                    local_users[dec_u] = (raw_u, raw_p, dec_p, is_cust)
     except Exception:
         pass
 
@@ -6212,34 +6490,81 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
             lcur.executemany(f"INSERT INTO users ({col_list}) VALUES ({placeholders})", packed)
         return
 
-    final_rows = []
-    seen_users = set()
+    # Group cloud rows by normalized username, preferring custom passwords over 'admin'
+    cloud_by_user = {}
     for row in packed:
         row_list = list(row)
         c_raw_u = row_list[u_idx]
         c_raw_p = row_list[p_idx]
         c_dec_u = str(decrypt_val(c_raw_u) if c_raw_u is not None else "").strip().lower()
         c_dec_p = str(decrypt_val(c_raw_p) if c_raw_p is not None else "").strip()
-        seen_users.add(c_dec_u)
-        if c_dec_p in (default_admin_hash, "admin") and c_dec_u in local_users:
-            _, l_raw_p, l_dec_p = local_users[c_dec_u]
-            if l_dec_p and l_dec_p not in (default_admin_hash, "admin"):
-                row_list[p_idx] = l_raw_p
+        if not c_dec_u:
+            continue
+        is_cust = bool(c_dec_p and c_dec_p.lower() not in (default_admin_hash, "admin") and not c_dec_p.startswith(("enc:", "denc:")))
+        if c_dec_u not in cloud_by_user or is_cust:
+            cloud_by_user[c_dec_u] = (row_list, c_dec_p, is_cust)
+
+    all_usernames = set(local_users.keys()) | set(cloud_by_user.keys())
+    final_rows = []
+
+    for dec_u in sorted(all_usernames):
+        c_info = cloud_by_user.get(dec_u)
+        l_info = local_users.get(dec_u)
+
+        if c_info and l_info:
+            c_row_list, c_dec_p, c_is_cust = c_info
+            l_raw_u, l_raw_p, l_dec_p, l_is_cust = l_info
+            if l_is_cust and not c_is_cust:
+                # Local has custom password, Cloud has default 'admin' -> preserve local and push to Cloud
+                c_row_list[p_idx] = l_dec_p
                 try:
-                    pg_cur.execute(
-                        "UPDATE users SET password = %s WHERE username = %s",
-                        (_encrypt_for_col("password", l_dec_p), c_raw_u),
-                    )
+                    raw_pg_cur = pg_cur.conn.cursor()
+                    raw_pg_cur.execute("SELECT username FROM users")
+                    for pr in raw_pg_cur.fetchall() or []:
+                        if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
+                            raw_pg_cur.execute(
+                                "UPDATE users SET password = %s WHERE username = %s",
+                                (_encrypt_for_col("password", l_dec_p), pr[0]),
+                            )
+                    raw_pg_cur.close()
                 except Exception:
                     pass
-        final_rows.append(tuple(row_list))
-
-    for dec_u, (l_raw_u, l_raw_p, l_dec_p) in local_users.items():
-        if dec_u not in seen_users:
+                final_rows.append(tuple(c_row_list))
+            else:
+                # Cloud has custom password (or both are default) -> use Cloud password
+                if c_is_cust:
+                    # Also ensure all duplicate rows in Postgres for this user have the custom password
+                    try:
+                        raw_pg_cur = pg_cur.conn.cursor()
+                        raw_pg_cur.execute("SELECT username FROM users")
+                        for pr in raw_pg_cur.fetchall() or []:
+                            if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
+                                raw_pg_cur.execute(
+                                    "UPDATE users SET password = %s WHERE username = %s",
+                                    (_encrypt_for_col("password", c_dec_p), pr[0]),
+                                )
+                        raw_pg_cur.close()
+                    except Exception:
+                        pass
+                final_rows.append(tuple(c_row_list))
+        elif c_info:
+            c_row_list, c_dec_p, c_is_cust = c_info
+            final_rows.append(tuple(c_row_list))
+        elif l_info:
+            l_raw_u, l_raw_p, l_dec_p, l_is_cust = l_info
             new_row = [None] * len(use_cols)
-            new_row[u_idx] = l_raw_u
-            new_row[p_idx] = l_raw_p
+            new_row[u_idx] = str(decrypt_val(l_raw_u)).strip()
+            new_row[p_idx] = l_dec_p
             final_rows.append(tuple(new_row))
+            # Push local-only user to Cloud
+            try:
+                raw_pg_cur = pg_cur.conn.cursor()
+                enc_u = _encrypt_for_col("username", new_row[u_idx])
+                enc_p = _encrypt_for_col("password", l_dec_p)
+                raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
+                raw_pg_cur.close()
+            except Exception:
+                pass
 
     lcur.execute("DELETE FROM users")
     if final_rows:
@@ -6250,7 +6575,7 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
 
 def refresh_offline_cache_from_cloud():
     """Copy decrypted cloud tables into the local offline cache (for future offline use)."""
-    if get_db_mode() != "supabase" or is_supabase_offline():
+    if get_db_mode() != "supabase":
         return False
     path = ensure_offline_cache_open()
     try:
@@ -9542,6 +9867,11 @@ if HAS_DEPS:
                 return
             try:
                 if getattr(self, 'is_logged_in', False):
+                    if get_db_mode() == "supabase" and getattr(self, "_live_sync_after_id", None) is None:
+                        try:
+                            self.start_live_sync()
+                        except Exception:
+                            pass
                     elapsed = time.time() - self.last_activity_time
                     if elapsed >= 180:  # 3 minutes of inactivity
                         self.is_logged_in = False
@@ -10189,15 +10519,17 @@ if HAS_DEPS:
             badge.pack(side=TOP)
             
             login_users = ["admin", "moe", "ziad"]
-            try:
-                conn = sqlite3.connect(TEMP_DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT username FROM users ORDER BY username ASC")
-                rows = cursor.fetchall()
-                conn.close()
-                if rows:
-                    login_users = []
-                    seen = set()
+            seen = {u.lower() for u in login_users}
+            for db_fetch in (
+                lambda: sqlite3.connect(TEMP_DB_PATH),
+                lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
+            ):
+                try:
+                    conn = db_fetch()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT username FROM users ORDER BY username ASC")
+                    rows = cursor.fetchall() or []
+                    conn.close()
                     for r in rows:
                         if not r or not r[0]:
                             continue
@@ -10206,8 +10538,8 @@ if HAS_DEPS:
                         if name and key not in seen:
                             seen.add(key)
                             login_users.append(name)
-            except Exception:
-                pass
+                except Exception:
+                    pass
             
             tb.Label(frame, text="Username:", font=("Segoe UI", 11)).grid(row=1, column=0, pady=10, padx=(0, 12), sticky=E)
             user_frame = tb.Frame(frame)
@@ -10399,160 +10731,31 @@ if HAS_DEPS:
             try:
                 try:
                     conn = sqlite3.connect(TEMP_DB_PATH)
-                    cursor = conn.cursor()
+                    conn.close()
                 except Exception as cloud_err:
                     enter_supabase_offline_mode(str(cloud_err))
-                    lite_path = ensure_offline_cache_open()
-                    conn = _original_sqlite3_connect(lite_path, timeout=15)
-                    cursor = conn.cursor()
 
-                def _pw_ok(stored):
-                    stored = decrypt_val(stored) if stored is not None else None
-                    if stored is None:
-                        return False
-                    stored_s = str(stored).strip()
-                    return stored_s == hashed_input or stored_s == password
-
-                candidate_passwords = []
-
-                try:
-                    cursor.execute("SELECT password FROM users WHERE username=?", (username,))
-                    for r in cursor.fetchall() or []:
-                        if r and r[0] is not None:
-                            candidate_passwords.append(r[0])
-                except Exception:
-                    pass
-
-                # Scan all users client-side (handles encryption / casing / multiple rows)
-                try:
-                    cursor.execute("SELECT username, password FROM users")
-                    for row in cursor.fetchall() or []:
-                        if not row:
-                            continue
-                        uname = decrypt_val(row[0]) if row[0] is not None else ""
-                        if str(uname).strip().lower() == username.lower():
-                            if row[1] is not None and row[1] not in candidate_passwords:
-                                candidate_passwords.append(row[1])
-                except Exception:
-                    pass
-
-                # Also check local offline cache in case cloud sync replaced it
-                try:
-                    lite_path = ensure_offline_cache_open()
-                    if lite_path and os.path.exists(lite_path):
-                        lconn = _original_sqlite3_connect(lite_path, timeout=5)
-                        lcur = lconn.cursor()
-                        lcur.execute("SELECT username, password FROM users")
-                        for row in lcur.fetchall() or []:
-                            if not row:
-                                continue
-                            uname = decrypt_val(row[0]) if row[0] is not None else ""
-                            if str(uname).strip().lower() == username.lower():
-                                if row[1] is not None and row[1] not in candidate_passwords:
-                                    candidate_passwords.append(row[1])
-                        lconn.close()
-                except Exception:
-                    pass
-
-                # Also check local snapshot backups if password still not matched
-                def _check_local_backups_for_pw():
+                if verify_user_password_everywhere(username, password):
+                    update_user_password_everywhere(username, password)
+                    self.current_user = username
                     try:
-                        b_dir = get_local_backups_dir()
-                        if not os.path.exists(b_dir):
-                            return False
-                        snaps = sorted(
-                            [os.path.join(b_dir, f) for f in os.listdir(b_dir) if f.startswith("snapshot_") and f.endswith(".json.gz")],
-                            key=os.path.getmtime,
-                            reverse=True
-                        )
-                        for sp in snaps[:5]:
-                            try:
-                                with open(sp, "r", encoding="utf-8") as fp:
-                                    payload = fp.read()
-                                data = _decode_cloud_backup_payload(payload)
-                                if isinstance(data, dict) and "tables" in data and "users" in data["tables"]:
-                                    u_rows = data["tables"]["users"].get("rows", [])
-                                    for rdict in u_rows:
-                                        ru = decrypt_val(rdict.get("username")) if rdict.get("username") else ""
-                                        rp = rdict.get("password")
-                                        if str(ru).strip().lower() == username.lower() and _pw_ok(rp):
-                                            return True
-                            except Exception:
-                                continue
+                        global CURRENT_SESSION_USER
+                        CURRENT_SESSION_USER = username
                     except Exception:
                         pass
-                    return False
-
-                if candidate_passwords or username.lower() in ("admin", "moe", "ziad"):
-                    matched = any(_pw_ok(p) for p in candidate_passwords)
-                    # Always allow default admin/admin login or custom password recovery after reset
-                    if username.lower() == "admin" and password == "admin":
-                        matched = True
-                    if not matched and candidate_passwords:
-                        all_default_or_unreadable = all(
-                            str(decrypt_val(p) if p is not None else "").strip() in (default_admin_hash, "admin")
-                            or str(decrypt_val(p) if p is not None else "").startswith(("enc:", "denc:"))
-                            for p in candidate_passwords
-                        )
-                        if all_default_or_unreadable or _check_local_backups_for_pw():
-                            matched = True
-                    elif not candidate_passwords and username.lower() in ("admin", "moe", "ziad"):
-                        matched = True
-
-                    if matched:
-                        # Normalize and persist stored password to current hash format in both active DB and local cache
-                        try:
-                            cursor.execute(
-                                "UPDATE users SET password=? WHERE username=?",
-                                (hashed_input, username),
-                            )
-                            commit_and_save(conn)
-                        except Exception:
-                            try:
-                                conn.close()
-                            except Exception:
-                                pass
-                            conn = sqlite3.connect(TEMP_DB_PATH)
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        try:
-                            lite_path = ensure_offline_cache_open()
-                            if lite_path and os.path.exists(lite_path):
-                                lconn = _original_sqlite3_connect(lite_path, timeout=5)
-                                lcur = lconn.cursor()
-                                lcur.execute("SELECT username FROM users")
-                                for row in lcur.fetchall() or []:
-                                    if row and str(decrypt_val(row[0])).strip().lower() == username.lower():
-                                        lcur.execute("UPDATE users SET password=? WHERE username=?", (hashed_input, row[0]))
-                                lconn.commit()
-                                lconn.close()
-                        except Exception:
-                            pass
-                        self.current_user = username
-                        try:
-                            global CURRENT_SESSION_USER
-                            CURRENT_SESSION_USER = username
-                        except Exception:
-                            pass
-                        try:
-                            save_last_selected_username(username)
-                        except Exception:
-                            pass
-                        self.hide_busy()
-                        self._finish_login_and_sync()
-                        return
-                    conn.close()
+                    try:
+                        save_last_selected_username(username)
+                    except Exception:
+                        pass
+                    self.hide_busy()
+                    self._finish_login_and_sync()
+                    return
+                else:
                     self.hide_busy()
                     self.show_app_error(
                         "Login Failed",
-                        "Invalid password.\n\nTip: after a reset, use password: admin",
+                        "Invalid password.",
                     )
-                else:
-                    conn.close()
-                    self.hide_busy()
-                    self.show_app_error("Login Failed", "Invalid username.")
             except Exception as e:
                 self.hide_busy()
                 self.show_app_error("Login Failed", e)
@@ -11929,6 +12132,7 @@ if HAS_DEPS:
 
         def _live_sync_tick(self):
             self._live_sync_after_id = None
+            next_interval = LIVE_SYNC_INTERVAL_MS
             try:
                 if (
                     getattr(self, "is_logged_in", False)
@@ -11936,7 +12140,7 @@ if HAS_DEPS:
                     and self.winfo_exists()
                 ):
                     if _SYNC_IN_PROGRESS or getattr(self, "_rebuilding_ui", False):
-                        pass
+                        next_interval = 2000
                     else:
                         def _bg():
                             status = None
@@ -11985,6 +12189,7 @@ if HAS_DEPS:
                                 pass
 
                         threading.Thread(target=_bg, daemon=True).start()
+                        next_interval = 12000 if (is_supabase_offline() or offline_pending_count()) else LIVE_SYNC_INTERVAL_MS
             except Exception:
                 try:
                     if self._widget_alive(getattr(self, "lbl_live_sync", None)):
@@ -11994,16 +12199,18 @@ if HAS_DEPS:
                         )
                 except Exception:
                     pass
-
-            next_interval = 12000 if (is_supabase_offline() or offline_pending_count()) else LIVE_SYNC_INTERVAL_MS
-            if (
-                getattr(self, "is_logged_in", False)
-                and get_db_mode() == "supabase"
-                and self.winfo_exists()
-            ):
-                self._live_sync_after_id = self.after(
-                    next_interval, self._live_sync_tick
-                )
+            finally:
+                try:
+                    if (
+                        getattr(self, "is_logged_in", False)
+                        and get_db_mode() == "supabase"
+                        and self.winfo_exists()
+                    ):
+                        self._live_sync_after_id = self.after(
+                            next_interval, self._live_sync_tick
+                        )
+                except Exception:
+                    pass
 
         def _schedule_soft_ui_refresh(self, full=True):
             """Queue a quiet UI refresh on idle so typing/clicks aren't blocked."""
@@ -13287,7 +13494,9 @@ if HAS_DEPS:
                     existing.add(plain.lower())
                     if plain.lower() == old_name.lower():
                         stored_old = uname
-                        stored_pw = pw
+                        dec_pw = str(decrypt_val(pw) if pw is not None else "").strip()
+                        if stored_pw is None or (dec_pw and dec_pw.lower() not in (hashlib.sha256(b"admin").hexdigest(), "admin")):
+                            stored_pw = dec_pw
                 if stored_old is None:
                     messagebox.showerror("Error", "User not found.", parent=parent)
                     return False
@@ -13310,6 +13519,35 @@ if HAS_DEPS:
                     conn.close()
                 except Exception:
                     pass
+
+            # Ensure renamed username and its custom password are updated in local cache & raw Postgres
+            try:
+                lite_path = ensure_offline_cache_open()
+                if lite_path and os.path.exists(lite_path):
+                    lconn = _original_sqlite3_connect(lite_path, timeout=5)
+                    lcur = lconn.cursor()
+                    lcur.execute("SELECT username FROM users")
+                    for r in lcur.fetchall() or []:
+                        if r and r[0] and plain_label(r[0]).lower() == old_name.lower():
+                            lcur.execute("DELETE FROM users WHERE username=?", (r[0],))
+                    lconn.commit()
+                    lconn.close()
+            except Exception:
+                pass
+            if get_db_mode() == "supabase" and not is_supabase_offline():
+                try:
+                    pg_proxy = get_shared_supabase_conn()
+                    raw_cur = pg_proxy.conn.cursor()
+                    raw_cur.execute("SELECT username FROM users")
+                    for r in raw_cur.fetchall() or []:
+                        if r and r[0] and plain_label(r[0]).lower() == old_name.lower():
+                            raw_cur.execute("DELETE FROM users WHERE username=%s", (r[0],))
+                    pg_proxy.commit()
+                    raw_cur.close()
+                except Exception:
+                    pass
+            if stored_pw:
+                update_user_password_everywhere(new_name, stored_pw)
 
             try:
                 _queue_offline_op(
@@ -13420,32 +13658,23 @@ if HAS_DEPS:
             confirm_pw_entry.pack(pady=5)
             
             def save_password():
-                current = current_pw_entry.get()
-                new_pw = new_pw_entry.get()
-                confirm = confirm_pw_entry.get()
+                current = (current_pw_entry.get() or "").strip()
+                new_pw = (new_pw_entry.get() or "").strip()
+                confirm = (confirm_pw_entry.get() or "").strip()
                 
+                if not new_pw:
+                    messagebox.showerror("Error", "New password cannot be empty.", parent=dialog)
+                    return
                 if new_pw != confirm:
                     messagebox.showerror("Error", "New passwords do not match.", parent=dialog)
                     return
                     
-                current_user = getattr(self, "current_user", "admin")
-                conn = sqlite3.connect(TEMP_DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT password FROM users WHERE username=?", (current_user,))
-                stored = cursor.fetchone()[0]
-                
-                hashed_current = hashlib.sha256(current.encode()).hexdigest()
-                
-                if stored != hashed_current and stored != current:
+                current_user = getattr(self, "current_user", "admin") or "admin"
+                if not verify_user_password_everywhere(current_user, current):
                     messagebox.showerror("Error", "Current password is incorrect.", parent=dialog)
-                    conn.close()
                     return
                     
-                hashed_new = hashlib.sha256(new_pw.encode()).hexdigest()
-                cursor.execute("UPDATE users SET password=? WHERE username=?", (hashed_new, current_user))
-                commit_and_save(conn)
-                conn.close()
-                
+                update_user_password_everywhere(current_user, new_pw)
                 messagebox.showinfo("Success", "Login password changed successfully!", parent=dialog)
                 dialog.destroy()
                 
@@ -18137,33 +18366,15 @@ if HAS_DEPS:
             eye_btn.pack(side=LEFT, padx=(5, 0))
             
             def check_password(event=None):
-                entered_pw = pw_entry.get().strip()
+                entered_pw = (pw_entry.get() or "").strip()
                 if not entered_pw:
                     return
                 who = getattr(self, "current_user", None) or DEFAULT_ADMIN_USERNAME
-                row = None
-                try:
-                    conn = sqlite3.connect(TEMP_DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT password FROM users WHERE username=?", (who,))
-                    row = cursor.fetchone()
-                    if not row:
-                        cursor.execute("SELECT password FROM users WHERE username=?", (DEFAULT_ADMIN_USERNAME,))
-                        row = cursor.fetchone()
-                    conn.close()
-                except Exception as e:
-                    messagebox.showerror("Error", f"Could not verify password:\n{e}", parent=dialog)
+                if verify_user_password_everywhere(who, entered_pw) or verify_user_password_everywhere(DEFAULT_ADMIN_USERNAME, entered_pw):
+                    self._safe_grab_release(dialog)
+                    dialog.destroy()
+                    self.after(50, lambda: self.open_settings_dialog(default_tab=default_tab))
                     return
-                
-                if row:
-                    stored_pw = decrypt_val(row[0]) if row[0] is not None else None
-                    import hashlib
-                    hashed_input = hashlib.sha256(entered_pw.encode('utf-8')).hexdigest()
-                    if stored_pw == hashed_input or stored_pw == entered_pw:
-                        self._safe_grab_release(dialog)
-                        dialog.destroy()
-                        self.after(50, lambda: self.open_settings_dialog(default_tab=default_tab))
-                        return
                 
                 messagebox.showerror("Error", "Invalid Password.", parent=dialog)
                 
@@ -18917,8 +19128,13 @@ if HAS_DEPS:
                     new_config["supabase_user"] = username
                     with open(config_file, "w", encoding="utf-8") as f:
                         json.dump(new_config, f, indent=4)
+                    global _SUPABASE_OFFLINE
+                    _SUPABASE_OFFLINE = False
+                    close_shared_supabase_conn()
+                    enable_local_first_mode()
+                    self.start_live_sync()
                     refresh_storage_meter()
-                    messagebox.showinfo("Success", f"DB configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nPlease restart the app to activate Cloud DB mode.", parent=dialog)
+                    messagebox.showinfo("Success", f"DB configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nCloud DB live sync (every 30s) is now active!", parent=dialog)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to save configuration: {e}", parent=dialog)
 
@@ -19033,6 +19249,226 @@ if HAS_DEPS:
             tb.Button(btn_row, text="Upload Local → Cloud", bootstyle="warning", command=do_upload_local_to_cloud).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="📁 Sync Local Files → Cloud", bootstyle="info", command=do_sync_files).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="Clean Up Cloud Duplicates", bootstyle="secondary", command=do_cleanup_cloud).pack(side=LEFT)
+
+            # --- Detach PC & Wipe Local Data Card (Switch from Testing DB to Production DB) ---
+            detach_card = tb.Labelframe(
+                tab_remote,
+                text=self._tr("🔌 Switch Database / Detach PC from Current DB"),
+                padding=12,
+                bootstyle="danger",
+            )
+            detach_card.pack(fill=X, pady=(12, 10))
+
+            tb.Label(
+                detach_card,
+                text=self._tr(
+                    "Moving from a Testing DB to your actual Production Supabase DB?\n"
+                    "Use this button to safely save a full local backup first, then erase all saved connections, "
+                    "offline sync queues, and cached data on this PC so zero testing data overlaps with your new DB."
+                ),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+                justify=LEFT,
+                wraplength=680,
+            ).pack(anchor=W, pady=(0, 8))
+
+            def do_detach_pc_from_db():
+                pw_win = tb.Toplevel(dialog)
+                pw_win.title(self._tr("Admin Password Required — Detach PC"))
+                pw_win.geometry("460x280")
+                pw_win.transient(dialog)
+                pw_win.grab_set()
+                pw_win.focus_set()
+
+                tb.Label(
+                    pw_win,
+                    text="🔌 Detach PC & Wipe Local Data",
+                    font=("Segoe UI", 12, "bold"),
+                    bootstyle="danger",
+                ).pack(pady=(16, 6))
+
+                tb.Label(
+                    pw_win,
+                    text=(
+                        "1. A complete local backup will be saved automatically first.\n"
+                        "2. All local cached tables, offline queues, and DB credentials on this PC will be erased.\n"
+                        "3. Enter Admin Password to confirm:"
+                    ),
+                    font=("Segoe UI", 9),
+                    justify=LEFT,
+                    wraplength=410,
+                ).pack(padx=20, pady=(0, 10))
+
+                admin_pw_ent = tb.Entry(pw_win, show="*", width=28, font=("Segoe UI", 11))
+                admin_pw_ent.pack(pady=6)
+                admin_pw_ent.focus()
+
+                def _confirm_detach(event=None):
+                    entered_pw = (admin_pw_ent.get() or "").strip()
+                    if not entered_pw:
+                        messagebox.showerror("Error", "Please enter the Admin password.", parent=pw_win)
+                        return
+                    cur_u = getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
+                    if not (
+                        verify_user_password_everywhere(DEFAULT_ADMIN_USERNAME, entered_pw)
+                        or verify_user_password_everywhere(cur_u, entered_pw)
+                    ):
+                        messagebox.showerror("Invalid Password", "Incorrect Admin password. Operation cancelled.", parent=pw_win)
+                        return
+
+                    pw_win.destroy()
+                    self.show_busy("Saving local backup & detaching PC from database…")
+                    try:
+                        import shutil
+                        import json
+                        b_dir = get_local_backups_dir()
+                        os.makedirs(b_dir, exist_ok=True)
+                        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+                        # 1. Save full local backup snapshot & raw DB copies FIRST
+                        try:
+                            save_local_daily_snapshot()
+                        except Exception:
+                            pass
+
+                        backup_paths_saved = []
+                        if OFFLINE_TEMP_DB_PATH and os.path.exists(OFFLINE_TEMP_DB_PATH):
+                            dst_db = os.path.join(b_dir, f"pre_detach_backup_{ts}.db")
+                            try:
+                                shutil.copy2(OFFLINE_TEMP_DB_PATH, dst_db)
+                                backup_paths_saved.append(dst_db)
+                            except Exception:
+                                pass
+                        elif TEMP_DB_PATH and os.path.exists(str(TEMP_DB_PATH)):
+                            dst_db = os.path.join(b_dir, f"pre_detach_backup_{ts}.db")
+                            try:
+                                shutil.copy2(str(TEMP_DB_PATH), dst_db)
+                                backup_paths_saved.append(dst_db)
+                            except Exception:
+                                pass
+
+                        if os.path.exists(CLOUD_CACHE_FILE):
+                            dst_enc = os.path.join(b_dir, f"pre_detach_cloud_cache_{ts}.enc")
+                            try:
+                                shutil.copy2(CLOUD_CACHE_FILE, dst_enc)
+                                if not backup_paths_saved:
+                                    backup_paths_saved.append(dst_enc)
+                            except Exception:
+                                pass
+
+                        # 2. Stop all background syncing & close active cloud connections
+                        self.stop_live_sync()
+                        global _push_timer, _persist_timer, _SUPABASE_OFFLINE, _LAST_SYNC_ERROR
+                        try:
+                            if _push_timer is not None:
+                                _push_timer.cancel()
+                                _push_timer = None
+                        except Exception:
+                            pass
+                        try:
+                            if _persist_timer is not None:
+                                _persist_timer.cancel()
+                                _persist_timer = None
+                        except Exception:
+                            pass
+                        close_shared_supabase_conn()
+                        _SUPABASE_OFFLINE = False
+                        _LAST_SYNC_ERROR = ""
+
+                        # 3. Wipe local SQLite cache & offline sync queue so zero testing rows remain
+                        try:
+                            _close_offline_temp(remove_file=True)
+                        except Exception:
+                            pass
+                        if os.path.exists(CLOUD_CACHE_FILE):
+                            try:
+                                os.remove(CLOUD_CACHE_FILE)
+                            except Exception:
+                                pass
+
+                        fresh_path = ensure_offline_cache_open()
+                        lconn = _original_sqlite3_connect(fresh_path, timeout=15)
+                        try:
+                            lcur = lconn.cursor()
+                            lcur.execute("DELETE FROM offline_sync_queue")
+                            for tbl in OFFLINE_SYNC_TABLES:
+                                try:
+                                    lcur.execute(f"DELETE FROM {tbl}")
+                                except Exception:
+                                    pass
+                            # Seed clean default admin user so login always works
+                            default_hash = hashlib.sha256(b"admin").hexdigest()
+                            for uname in ("admin", "moe", "ziad"):
+                                try:
+                                    lcur.execute(
+                                        "INSERT OR IGNORE INTO users (username, password) VALUES (?, ?)",
+                                        (uname, default_hash),
+                                    )
+                                except Exception:
+                                    pass
+                            lconn.commit()
+                        finally:
+                            lconn.close()
+                        _persist_offline_cache()
+
+                        # Clear in-memory caches
+                        self._cache_locations = None
+                        self._cache_categories = None
+                        try:
+                            _LOCAL_PROTECTED_EXPENSE_IDS.clear()
+                        except Exception:
+                            pass
+
+                        # 4. Clear DB credentials in location_config.json and UI fields
+                        default_dir = get_default_app_dir()
+                        config_file = os.path.join(default_dir, "location_config.json")
+                        clean_config = get_db_config().copy()
+                        clean_config["mode"] = "local"
+                        clean_config["supabase_host"] = ""
+                        clean_config["supabase_password"] = ""
+                        clean_config["supabase_port"] = "6543"
+                        clean_config["supabase_database"] = "postgres"
+                        clean_config["supabase_user"] = "postgres"
+                        with open(config_file, "w", encoding="utf-8") as f:
+                            json.dump(clean_config, f, indent=4)
+
+                        db_host_var.set("")
+                        db_password_var.set("")
+                        db_port_var.set("6543")
+                        db_name_var.set("postgres")
+                        db_user_var.set("postgres")
+
+                        enable_local_first_mode()
+                        self.hide_busy()
+                        self._schedule_soft_ui_refresh(full=True)
+
+                        b_msg = backup_paths_saved[0] if backup_paths_saved else b_dir
+                        messagebox.showinfo(
+                            "PC Detached & Local Cache Wiped",
+                            f"This PC has been cleanly detached from the previous database!\n\n"
+                            f"📁 Full Local Backup Saved To:\n{b_msg}\n\n"
+                            f"• All previous DB credentials, cached tables, and offline sync queues have been erased.\n"
+                            f"• Zero testing data remains on this PC.\n\n"
+                            f"You can now enter your actual Production Supabase DB credentials above and click 'Verify & Save Configuration'.",
+                            parent=dialog,
+                        )
+                    except Exception as e:
+                        self.hide_busy()
+                        messagebox.showerror("Detach Error", f"An error occurred while detaching:\n{e}", parent=dialog)
+
+                admin_pw_ent.bind("<Return>", _confirm_detach)
+                act_row = tb.Frame(pw_win)
+                act_row.pack(pady=14)
+                tb.Button(act_row, text="💾 Backup & Detach PC", bootstyle="danger", command=_confirm_detach).pack(side=LEFT, padx=6)
+                tb.Button(act_row, text="Cancel", bootstyle="secondary", command=pw_win.destroy).pack(side=LEFT, padx=6)
+
+            tb.Button(
+                detach_card,
+                text="🔌 " + self._tr("Detach PC & Wipe Local Data (Switch to New DB)"),
+                bootstyle="danger",
+                cursor="hand2",
+                command=do_detach_pc_from_db,
+            ).pack(anchor=W)
 
             # --- Multi-Device First-Time Integration Guide ---
             guide_card = tb.Labelframe(tab_remote, text=self._tr("📖 First-Time Cloud Setup & Multi-Device Integration Guide"), padding=14, bootstyle="info")
@@ -19821,32 +20257,18 @@ if HAS_DEPS:
             new_pw.pack(pady=5)
             
             def change_pass():
-                c_val = curr_pw.get().strip()
-                n_val = new_pw.get().strip()
+                c_val = (curr_pw.get() or "").strip()
+                n_val = (new_pw.get() or "").strip()
                 if not c_val or not n_val:
                     messagebox.showerror("Error", "Fields cannot be empty.", parent=dialog)
                     return
-                import hashlib
-                c_hash = hashlib.sha256(c_val.encode('utf-8')).hexdigest()
-                n_hash = hashlib.sha256(n_val.encode('utf-8')).hexdigest()
                 who = getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
-                
-                conn = sqlite3.connect(TEMP_DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT password FROM users WHERE username=?", (who,))
-                row = cursor.fetchone()
-                stored = row[0] if row else None
-                stored = decrypt_val(stored) if stored is not None else None
-                
-                if stored == c_hash or stored == c_val:
-                    cursor.execute("UPDATE users SET password=? WHERE username=?", (n_hash, who))
-                    commit_and_save(conn)
-                    conn.close()
+                if verify_user_password_everywhere(who, c_val):
+                    update_user_password_everywhere(who, n_val)
                     messagebox.showinfo("Success", "Password updated successfully.", parent=dialog)
                     curr_pw.delete(0, tk.END)
                     new_pw.delete(0, tk.END)
                 else:
-                    conn.close()
                     messagebox.showerror("Error", "Incorrect current password.", parent=dialog)
                     
             tb.Button(tab_acc, text=self._tr("Update Password"), bootstyle="success", command=change_pass).pack(pady=20)
@@ -19870,17 +20292,23 @@ if HAS_DEPS:
 
             def load_users():
                 users_list.delete(0, tk.END)
-                try:
-                    conn = sqlite3.connect(TEMP_DB_PATH)
-                    cur = conn.cursor()
-                    cur.execute("SELECT username FROM users ORDER BY username ASC")
-                    for row in cur.fetchall() or []:
-                        name = plain_label(row[0]) if row and row[0] else ""
-                        if name:
-                            users_list.insert(tk.END, name)
-                    conn.close()
-                except Exception:
-                    pass
+                seen = set()
+                for db_fetch in (
+                    lambda: sqlite3.connect(TEMP_DB_PATH),
+                    lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
+                ):
+                    try:
+                        conn = db_fetch()
+                        cur = conn.cursor()
+                        cur.execute("SELECT username FROM users ORDER BY username ASC")
+                        for row in cur.fetchall() or []:
+                            name = plain_label(row[0]) if row and row[0] else ""
+                            if name and name.lower() not in seen:
+                                seen.add(name.lower())
+                                users_list.insert(tk.END, name)
+                        conn.close()
+                    except Exception:
+                        pass
 
             add_row = tb.Frame(tab_users)
             add_row.pack(fill=X, pady=10)
@@ -19892,13 +20320,8 @@ if HAS_DEPS:
                 uname = new_user_ent.get().strip()
                 if not uname:
                     return
-                hashed = hashlib.sha256(b"admin").hexdigest()
                 try:
-                    conn = sqlite3.connect(TEMP_DB_PATH)
-                    cur = conn.cursor()
-                    cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname, hashed))
-                    commit_and_save(conn)
-                    conn.close()
+                    update_user_password_everywhere(uname, "admin")
                     new_user_ent.delete(0, tk.END)
                     load_users()
                     messagebox.showinfo(
@@ -19906,8 +20329,6 @@ if HAS_DEPS:
                         self._tr("Username added. Default password is admin until they change it."),
                         parent=dialog,
                     )
-                except sqlite3.IntegrityError:
-                    messagebox.showerror("Error", "This username already exists.", parent=dialog)
                 except Exception as e:
                     messagebox.showerror("Error", str(e), parent=dialog)
 
@@ -20391,22 +20812,10 @@ if HAS_DEPS:
             if not entered:
                 return False
             username = getattr(self, "current_user", None) or DEFAULT_ADMIN_USERNAME
-            try:
-                conn = sqlite3.connect(TEMP_DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute("SELECT password FROM users WHERE username=?", (username,))
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT password FROM users WHERE username=?", (DEFAULT_ADMIN_USERNAME,))
-                    row = cursor.fetchone()
-                conn.close()
-                if not row:
-                    return False
-                stored = row[0]
-                hashed = hashlib.sha256(entered.encode("utf-8")).hexdigest()
-                return stored == hashed or stored == entered
-            except Exception:
-                return False
+            return (
+                verify_user_password_everywhere(username, entered)
+                or verify_user_password_everywhere(DEFAULT_ADMIN_USERNAME, entered)
+            )
 
         def update_cash_lock_button(self):
             btn = getattr(self, "btn_cash_month_lock", None)
