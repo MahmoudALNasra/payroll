@@ -845,8 +845,8 @@ TRANSLATIONS = {
 }
 
 # --- APP CONFIGURATION ---
-APP_TITLE = "💈 BarberShop Pro — Shop & Payroll Suite"
-APP_LOGO_TITLE = "BARBERSHOP PRO"
+APP_TITLE = "Highend Payroll App - Custom Made ✂"
+APP_LOGO_TITLE = "★ HIGHEND PAYROLL ★"
 APP_GEOMETRY = "1250x900"
 APP_THEME = "darkly"
 
@@ -854,7 +854,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.27"
+APP_VERSION = "2.5.29"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -2148,7 +2148,6 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
     Returns (conn, active_host, active_port, active_user).
     """
     import pg8000.dbapi, threading
-    from concurrent.futures import ThreadPoolExecutor
     ref = _extract_supabase_ref(host, user)
     port_int = int(port or 5432)
     alt_port = 6543 if port_int == 5432 else 5432
@@ -2207,48 +2206,52 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
         found = {"conn": None, "host": None, "port": None, "user": None, "auth_err": None, "other_err": None}
         lock = threading.Lock()
         done_evt = threading.Event()
+        sem = threading.Semaphore(16)
 
         def _probe(item):
             p_host, p_port = item
             if done_evt.is_set():
                 return
-            try:
-                c = _pg8000_connect_ipv4(
-                    host=p_host,
-                    port=p_port,
-                    user=pooler_user,
-                    password=password,
-                    database=database,
-                    timeout=5.0,
-                )
+            with sem:
+                if done_evt.is_set():
+                    return
                 try:
-                    c.commit()
-                except Exception:
-                    pass
-                with lock:
-                    if found["conn"] is None:
-                        found["conn"] = c
-                        found["host"] = p_host
-                        found["port"] = p_port
-                        found["user"] = pooler_user
-                        done_evt.set()
-                    else:
-                        try:
-                            c.close()
-                        except Exception:
-                            pass
-            except Exception as pe:
-                p_msg = str(pe).lower()
-                if "password authentication failed" in p_msg:
+                    c = _pg8000_connect_ipv4(
+                        host=p_host,
+                        port=p_port,
+                        user=pooler_user,
+                        password=password,
+                        database=database,
+                        timeout=5.0,
+                    )
+                    try:
+                        c.commit()
+                    except Exception:
+                        pass
                     with lock:
-                        found["auth_err"] = RuntimeError(
-                            f"Discovered IPv4 DB Pooler ({p_host}:{p_port}), but Password Authentication Failed. Please verify your DB password."
-                        )
-                        done_evt.set()
-                elif "tenant or user not found" not in p_msg and "has no ipv4 address" not in p_msg:
-                    with lock:
-                        if found["other_err"] is None:
-                            found["other_err"] = f"{p_host}:{p_port} -> {pe}"
+                        if found["conn"] is None:
+                            found["conn"] = c
+                            found["host"] = p_host
+                            found["port"] = p_port
+                            found["user"] = pooler_user
+                            done_evt.set()
+                        else:
+                            try:
+                                c.close()
+                            except Exception:
+                                pass
+                except Exception as pe:
+                    p_msg = str(pe).lower()
+                    if "password authentication failed" in p_msg:
+                        with lock:
+                            found["auth_err"] = RuntimeError(
+                                f"Discovered IPv4 DB Pooler ({p_host}:{p_port}), but Password Authentication Failed. Please verify your DB password."
+                            )
+                            done_evt.set()
+                    elif "tenant or user not found" not in p_msg and "has no ipv4 address" not in p_msg:
+                        with lock:
+                            if found["other_err"] is None:
+                                found["other_err"] = f"{p_host}:{p_port} -> {pe}"
 
         candidates = [
             (f"{ref}.pooler.supabase.com", 6543),
@@ -2259,10 +2262,14 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                 for p_port in (6543, 5432):
                     candidates.append((f"{cluster_prefix}-{reg}.pooler.supabase.com", p_port))
 
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            futures = [executor.submit(_probe, item) for item in candidates]
-            # Wait up to 8 seconds total; wakes immediately when done_evt is set
-            done_evt.wait(timeout=8.0)
+        for item in candidates:
+            if done_evt.is_set():
+                break
+            t = threading.Thread(target=_probe, args=(item,), daemon=True)
+            t.start()
+
+        # Wait up to 8 seconds total; wakes immediately when done_evt is set
+        done_evt.wait(timeout=8.0)
 
         if found["conn"] is not None:
             try:
@@ -8440,8 +8447,8 @@ if HAS_DEPS:
                     pass
 
         def _create_barber_pole_badge(self, parent, mode="hero", subtitle=None):
-            """Renders an authentic Barbershop Pole ('popsicle') with diagonal Red, White, and Royal Blue
-            stripes and matching Red-White-Blue BARBERSHOP PRO typography.
+            """Renders an authentic Barbershop Pole ('popstickle') with diagonal Red, White, and Royal Blue
+            stripes and matching Red-White-Blue HIGHEND PAYROLL APP typography.
             """
             wrapper = tb.Frame(parent)
             if mode == "header":
@@ -8464,9 +8471,9 @@ if HAS_DEPS:
 
                 txt_f = tb.Frame(wrapper)
                 txt_f.pack(side=LEFT)
-                tk.Label(txt_f, text="BARBER", font=("Segoe UI", 13, "bold"), fg="#FF5252", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
-                tk.Label(txt_f, text="SHOP ", font=("Segoe UI", 13, "bold"), fg="#FFFFFF", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
-                tk.Label(txt_f, text="PRO", font=("Segoe UI", 13, "bold"), fg="#60A5FA", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                tk.Label(txt_f, text="HIGHEND ", font=("Segoe UI", 13, "bold"), fg="#FF5252", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                tk.Label(txt_f, text="PAYROLL ", font=("Segoe UI", 13, "bold"), fg="#FFFFFF", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                tk.Label(txt_f, text="APP", font=("Segoe UI", 13, "bold"), fg="#60A5FA", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
                 return wrapper
 
             # Hero mode (Splash screen & Login page)
@@ -8497,16 +8504,16 @@ if HAS_DEPS:
 
             title_row = tk.Frame(wrapper, bg=bg_col)
             title_row.pack(side=TOP)
-            tk.Label(title_row, text="BARBER", font=("Segoe UI", 24, "bold"), fg="#EF4444", bg=bg_col).pack(side=LEFT)
-            tk.Label(title_row, text="SHOP ", font=("Segoe UI", 24, "bold"), fg="#FFFFFF", bg=bg_col).pack(side=LEFT)
-            tk.Label(title_row, text="PRO", font=("Segoe UI", 24, "bold"), fg="#3B82F6", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="★ HIGHEND ", font=("Segoe UI", 24, "bold"), fg="#EF4444", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="PAYROLL ", font=("Segoe UI", 24, "bold"), fg="#FFFFFF", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="APP ★", font=("Segoe UI", 24, "bold"), fg="#3B82F6", bg=bg_col).pack(side=LEFT)
 
             # 3-color Barbershop ribbon bar
-            ribbon = tk.Canvas(wrapper, width=220, height=5, highlightthickness=0, bg=bg_col)
+            ribbon = tk.Canvas(wrapper, width=260, height=5, highlightthickness=0, bg=bg_col)
             ribbon.pack(side=TOP, pady=(4, 6))
-            ribbon.create_rectangle(0, 0, 73, 5, fill="#EF4444", outline="")
-            ribbon.create_rectangle(73, 0, 146, 5, fill="#FFFFFF", outline="")
-            ribbon.create_rectangle(146, 0, 220, 5, fill="#3B82F6", outline="")
+            ribbon.create_rectangle(0, 0, 86, 5, fill="#EF4444", outline="")
+            ribbon.create_rectangle(86, 0, 173, 5, fill="#FFFFFF", outline="")
+            ribbon.create_rectangle(173, 0, 260, 5, fill="#3B82F6", outline="")
 
             if subtitle:
                 tb.Label(wrapper, text=subtitle, font=("Segoe UI", 11, "italic"), bootstyle="secondary").pack(side=TOP, pady=(2, 0))
@@ -8518,7 +8525,7 @@ if HAS_DEPS:
             container = tb.Frame(self, padding=40)
             container.place(relx=0.5, rely=0.5, anchor=CENTER)
             
-            badge = self._create_barber_pole_badge(container, mode="hero", subtitle="Shop & Payroll Management Suite ✂️")
+            badge = self._create_barber_pole_badge(container, mode="hero", subtitle="Custom Made ✂️")
             badge.pack(pady=(0, 20))
             
             progress = tb.Progressbar(container, orient=tk.HORIZONTAL, length=380, mode="indeterminate", bootstyle="info")
