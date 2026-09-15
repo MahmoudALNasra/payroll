@@ -854,7 +854,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.26"
+APP_VERSION = "2.5.27"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1998,53 +1998,41 @@ def _resolve_ipv4_addresses(host, port):
     return ipv4_list
 
 
-def _patch_pg8000_for_ipv4_and_poolers():
-    """Disables SCRAM-SHA-256-PLUS channel binding in pg8000/scramp so that TLS-terminating
-    connection poolers (ports 6543 & 5432) authenticate cleanly via standard SCRAM-SHA-256.
-    """
-    try:
-        import pg8000.core
-        import scramp
-        pg8000.core.scramp.make_channel_binding = lambda *a, **kw: None
-        scramp.make_channel_binding = lambda *a, **kw: None
-    except Exception:
-        pass
-
-
 def _pg8000_connect_ipv4(host, port, user, password, database, timeout=6):
-    """Connects to PostgreSQL using an explicit IPv4 (AF_INET) TCP socket and unverified SSL context."""
+    """Connects to PostgreSQL using an explicit IPv4 (AF_INET) TCP socket, unverified SSL context,
+    and RFC 5802 compliant SCRAM authentication (trying SCRAM-SHA-256-PLUS 'p=' first, then
+    falling back to SCRAM-SHA-256 with 'y,,' flag if connecting across a TLS-terminating proxy).
+    """
     import pg8000.dbapi
-    _patch_pg8000_for_ipv4_and_poolers()
+    import pg8000.core
+    import scramp
 
     ipv4_addrs = _resolve_ipv4_addresses(host, port)
     if not ipv4_addrs:
         raise OSError(f"Host '{host}' has no IPv4 address (IPv6-only endpoint).")
 
-    last_sock_err = None
-    sock = None
-    for ip in ipv4_addrs:
-        s = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
+    def _open_tcp_sock():
+        last_err = None
+        for ip in ipv4_addrs:
+            s = None
             try:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
-            s.connect((ip, int(port)))
-            sock = s
-            break
-        except Exception as e:
-            last_sock_err = e
-            if s is not None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
                 try:
-                    s.close()
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 except Exception:
                     pass
-
-    if sock is None:
-        err_detail = str(last_sock_err) if last_sock_err else "TCP handshake failed"
+                s.connect((ip, int(port)))
+                return s
+            except Exception as e:
+                last_err = e
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        err_detail = str(last_err) if last_err else "TCP handshake failed"
         raise OSError(f"IPv4 connection to {host} ({ipv4_addrs[0]}:{port}) failed: {err_detail}")
 
     try:
@@ -2054,8 +2042,10 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=6):
     except Exception:
         ssl_ctx = True
 
+    # Attempt 1: Standard TLS + default SCRAM (with real channel binding 'p=tls-server-end-point')
+    sock1 = _open_tcp_sock()
     try:
-        conn = pg8000.dbapi.connect(
+        return pg8000.dbapi.connect(
             user=user,
             host=host,
             database=database,
@@ -2063,15 +2053,49 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=6):
             password=password,
             timeout=timeout,
             ssl_context=ssl_ctx,
-            sock=sock,
+            sock=sock1,
         )
-        return conn
-    except Exception as e:
+    except Exception as e1:
         try:
-            sock.close()
+            sock1.close()
         except Exception:
             pass
-        raise e
+        msg1 = str(e1).lower()
+        # If wrong password or wrong tenant/region, fail immediately without retrying SCRAM mode
+        if "password authentication failed" in msg1 or "tenant or user not found" in msg1:
+            raise e1
+
+        # Attempt 2: Retry with SCRAM-SHA-256 ('y,,' flag) in case proxy TLS cert differs from backend
+        orig_scram = scramp.ScramClient
+        try:
+            class _ProxySafeScramClient(orig_scram):
+                def __init__(self, mechanisms, username, password, channel_binding=None, c_nonce=None):
+                    filtered = [m for m in mechanisms if m != "SCRAM-SHA-256-PLUS"] or list(mechanisms)
+                    super().__init__(filtered, username, password, channel_binding=channel_binding, c_nonce=c_nonce)
+
+            scramp.ScramClient = _ProxySafeScramClient
+            pg8000.core.scramp.ScramClient = _ProxySafeScramClient
+            sock2 = _open_tcp_sock()
+            try:
+                return pg8000.dbapi.connect(
+                    user=user,
+                    host=host,
+                    database=database,
+                    port=int(port),
+                    password=password,
+                    timeout=timeout,
+                    ssl_context=ssl_ctx,
+                    sock=sock2,
+                )
+            except Exception:
+                try:
+                    sock2.close()
+                except Exception:
+                    pass
+                raise e1
+        finally:
+            scramp.ScramClient = orig_scram
+            pg8000.core.scramp.ScramClient = orig_scram
 
 
 def _detect_project_region_via_cf(ref):
@@ -2120,16 +2144,16 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
     """
     Connects to PostgreSQL Cloud DB via pg8000 using pure IPv4 (AF_INET) sockets.
     Automatically switches between ports 6543 and 5432 and discovers IPv4 pooler
-    endpoints (aws-0-* / aws-1-*) if the direct host is IPv6-only on macOS DHCP WiFi.
+    endpoints (<ref>.pooler.supabase.com / aws-0-* / aws-1-*) if the direct host is IPv6-only on macOS DHCP WiFi.
     Returns (conn, active_host, active_port, active_user).
     """
     import pg8000.dbapi, threading
+    from concurrent.futures import ThreadPoolExecutor
     ref = _extract_supabase_ref(host, user)
     port_int = int(port or 5432)
     alt_port = 6543 if port_int == 5432 else 5432
 
     primary_attempts = []
-    # If user is connecting to pooler host with bare 'postgres' user and we know ref, fix user
     u_primary = f"postgres.{ref}" if ("pooler" in str(host).lower() and user == "postgres" and ref) else user
     primary_attempts.append((host, port_int, u_primary))
     primary_attempts.append((host, alt_port, u_primary))
@@ -2137,7 +2161,7 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
     first_err = None
     for c_host, c_port, c_user in primary_attempts:
         try:
-            t_out = min(timeout, 5) if ref else min(timeout, 7)
+            t_out = min(timeout, 4.5) if ref else min(timeout, 7)
             conn = _pg8000_connect_ipv4(
                 host=c_host,
                 port=c_port,
@@ -2180,11 +2204,12 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                 ordered_regions.append(r)
 
         pooler_user = f"postgres.{ref}"
-        found = {"conn": None, "host": None, "port": None, "user": None, "auth_err": None}
+        found = {"conn": None, "host": None, "port": None, "user": None, "auth_err": None, "other_err": None}
         lock = threading.Lock()
         done_evt = threading.Event()
 
-        def _probe(p_host, p_port):
+        def _probe(item):
+            p_host, p_port = item
             if done_evt.is_set():
                 return
             try:
@@ -2194,7 +2219,7 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                     user=pooler_user,
                     password=password,
                     database=database,
-                    timeout=4.5,
+                    timeout=5.0,
                 )
                 try:
                     c.commit()
@@ -2220,27 +2245,24 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                             f"Discovered IPv4 DB Pooler ({p_host}:{p_port}), but Password Authentication Failed. Please verify your DB password."
                         )
                         done_evt.set()
+                elif "tenant or user not found" not in p_msg and "has no ipv4 address" not in p_msg:
+                    with lock:
+                        if found["other_err"] is None:
+                            found["other_err"] = f"{p_host}:{p_port} -> {pe}"
 
-        # Build candidate (host, port) list prioritizing detected region + aws-0 / aws-1
-        candidates = []
+        candidates = [
+            (f"{ref}.pooler.supabase.com", 6543),
+            (f"{ref}.pooler.supabase.com", 5432),
+        ]
         for reg in ordered_regions:
             for cluster_prefix in ("aws-0", "aws-1"):
                 for p_port in (6543, 5432):
                     candidates.append((f"{cluster_prefix}-{reg}.pooler.supabase.com", p_port))
 
-        # Run in fast batches of 10 threads to avoid macOS mDNSResponder throttling
-        batch_size = 10
-        for i in range(0, len(candidates), batch_size):
-            if done_evt.is_set():
-                break
-            batch = candidates[i:i + batch_size]
-            threads = []
-            for p_host, p_port in batch:
-                t = threading.Thread(target=_probe, args=(p_host, p_port), daemon=True)
-                threads.append(t)
-                t.start()
-            # Wait up to 2.5s for this batch (or immediate wake if found)
-            done_evt.wait(timeout=2.5 if i == 0 else 1.8)
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(_probe, item) for item in candidates]
+            # Wait up to 8 seconds total; wakes immediately when done_evt is set
+            done_evt.wait(timeout=8.0)
 
         if found["conn"] is not None:
             try:
@@ -2258,6 +2280,8 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
             return found["conn"], found["host"], found["port"], found["user"]
         if found["auth_err"] is not None:
             raise found["auth_err"]
+        if found["other_err"] is not None:
+            raise RuntimeError(f"Could not connect to DB Pooler: {found['other_err']}")
 
     raise RuntimeError(f"Could not connect to DB ({host}:{port_int}): {first_err}")
 
