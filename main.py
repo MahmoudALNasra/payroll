@@ -855,13 +855,13 @@ TRANSLATIONS = {
 APP_TITLE = "Highend Payroll App - Custom Made ✂"
 APP_LOGO_TITLE = "★ HIGHEND PAYROLL ★"
 APP_GEOMETRY = "1250x900"
-APP_THEME = "darkly"
+APP_THEME = "cosmo"
 
 # Versioning Policy:
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.42"
+APP_VERSION = "2.5.43"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1007,27 +1007,78 @@ def get_db_mode():
     return get_db_config().get("mode", "local")
 
 
+_LAST_SELECTED_USERNAME_MEM = None
+_UI_COL_PREFS_MEM = None
+
+
 def save_last_selected_username(username):
+    global _LAST_SELECTED_USERNAME_MEM
+    if not username:
+        return
+    uname = str(username).strip()
+    if uname.lower() == "ziad":
+        uname = "zad"
+    _LAST_SELECTED_USERNAME_MEM = uname
     try:
         cfg = get_db_config()
-        cfg["last_selected_username"] = username
+        cfg["last_selected_username"] = uname
         config_file = os.path.join(get_default_app_dir(), "location_config.json")
+        os.makedirs(os.path.dirname(config_file), exist_ok=True)
         with open(config_file, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4)
     except Exception:
         pass
+    try:
+        perm_file = os.path.join(get_permanent_backups_dir(), "last_selected_username.txt")
+        os.makedirs(os.path.dirname(perm_file), exist_ok=True)
+        with open(perm_file, "w", encoding="utf-8") as f:
+            f.write(uname)
+    except Exception:
+        pass
+
+
+def get_last_selected_username():
+    global _LAST_SELECTED_USERNAME_MEM
+    val = _LAST_SELECTED_USERNAME_MEM
+    if not val:
+        try:
+            cfg = get_db_config()
+            if isinstance(cfg, dict) and cfg.get("last_selected_username"):
+                val = str(cfg.get("last_selected_username")).strip()
+        except Exception:
+            pass
+    if not val:
+        try:
+            perm_file = os.path.join(get_permanent_backups_dir(), "last_selected_username.txt")
+            if os.path.isfile(perm_file):
+                with open(perm_file, "r", encoding="utf-8") as f:
+                    val = f.read().strip()
+        except Exception:
+            pass
+    if val and val.lower() == "ziad":
+        val = "zad"
+    return val or "admin"
 
 def load_ui_column_preferences():
+    global _UI_COL_PREFS_MEM
+    if isinstance(_UI_COL_PREFS_MEM, dict):
+        return dict(_UI_COL_PREFS_MEM)
     pref_file = os.path.join(get_default_app_dir(), "ui_column_preferences.json")
     if os.path.isfile(pref_file):
         try:
             with open(pref_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _UI_COL_PREFS_MEM = dict(data)
+                    return dict(data)
         except Exception:
             pass
     return {}
 
 def save_ui_column_preferences(prefs):
+    global _UI_COL_PREFS_MEM
+    if isinstance(prefs, dict):
+        _UI_COL_PREFS_MEM = dict(prefs)
     try:
         pref_file = os.path.join(get_default_app_dir(), "ui_column_preferences.json")
         os.makedirs(os.path.dirname(pref_file), exist_ok=True)
@@ -1089,6 +1140,19 @@ def get_calendar_hidden_columns():
 def save_calendar_hidden_columns(hidden_set):
     prefs = load_ui_column_preferences()
     prefs["calendar_hidden_columns"] = list(hidden_set)
+    save_ui_column_preferences(prefs)
+
+def get_calendar_column_colors():
+    """Return dict mapping column key (e.g. 'Service Sales') to hex color string (e.g. '#dcfce7')."""
+    prefs = load_ui_column_preferences()
+    colors = prefs.get("calendar_column_colors")
+    if isinstance(colors, dict):
+        return dict(colors)
+    return {}
+
+def save_calendar_column_colors(colors_dict):
+    prefs = load_ui_column_preferences()
+    prefs["calendar_column_colors"] = dict(colors_dict or {})
     save_ui_column_preferences(prefs)
 
 CURRENT_SESSION_USER = "admin"
@@ -6484,6 +6548,7 @@ def update_user_password_everywhere(username, new_password_or_hash):
         return False
     uname_clean = str(username).strip()
     uname_norm = uname_clean.lower()
+    target_names = {"zad", "ziad"} if uname_norm in ("zad", "ziad") else {uname_norm}
     val_str = str(new_password_or_hash).strip()
     if len(val_str) == 64 and all(c in "0123456789abcdefABCDEF" for c in val_str):
         new_hash = val_str.lower()
@@ -6502,7 +6567,7 @@ def update_user_password_everywhere(username, new_password_or_hash):
                 for r in lcur.fetchall() or []:
                     if r and r[0] is not None:
                         dec_u = str(decrypt_val(r[0])).strip().lower()
-                        if dec_u == uname_norm:
+                        if dec_u in target_names:
                             matching_raw_u.append(r[0])
                 if matching_raw_u:
                     primary_u = matching_raw_u[0]
@@ -6532,7 +6597,7 @@ def update_user_password_everywhere(username, new_password_or_hash):
                 for r in raw_cur.fetchall() or []:
                     if r and r[0] is not None:
                         dec_u = str(decrypt_val(r[0])).strip().lower()
-                        if dec_u == uname_norm:
+                        if dec_u in target_names:
                             matching_pg_u.append(r[0])
                 enc_pw = _encrypt_for_col("password", new_hash)
                 if matching_pg_u:
@@ -6560,7 +6625,7 @@ def update_user_password_everywhere(username, new_password_or_hash):
             for r in cur.fetchall() or []:
                 if r and r[0] is not None:
                     dec_u = str(decrypt_val(r[0])).strip().lower()
-                    if dec_u == uname_norm:
+                    if dec_u in target_names:
                         found = True
                         cur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, r[0]))
             if not found:
@@ -6587,6 +6652,7 @@ def verify_user_password_everywhere(username, entered_password):
     if not username or entered_password is None:
         return False
     uname_norm = str(username).strip().lower()
+    target_names = {"zad", "ziad"} if uname_norm in ("zad", "ziad") else {uname_norm}
     entered_raw = str(entered_password)
     entered_strip = entered_raw.strip()
     if not entered_strip and not entered_raw:
@@ -6633,7 +6699,7 @@ def verify_user_password_everywhere(username, entered_password):
             for row in cur.fetchall() or []:
                 if row and len(row) >= 2:
                     u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
-                    if u_dec == uname_norm and row[1] is not None:
+                    if u_dec in target_names and row[1] is not None:
                         all_stored.append(row[1])
         finally:
             try:
@@ -6654,7 +6720,7 @@ def verify_user_password_everywhere(username, entered_password):
                 for row in lcur.fetchall() or []:
                     if row and len(row) >= 2:
                         u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
-                        if u_dec == uname_norm and row[1] is not None:
+                        if u_dec in target_names and row[1] is not None:
                             all_stored.append(row[1])
             finally:
                 try:
@@ -6674,7 +6740,7 @@ def verify_user_password_everywhere(username, entered_password):
                 for row in raw_cur.fetchall() or []:
                     if row and len(row) >= 2:
                         u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
-                        if u_dec == uname_norm and row[1] is not None:
+                        if u_dec in target_names and row[1] is not None:
                             all_stored.append(row[1])
             finally:
                 try:
@@ -6714,7 +6780,7 @@ def verify_user_password_everywhere(username, entered_password):
                             for rdict in data["tables"]["users"].get("rows", []):
                                 ru = str(decrypt_val(rdict.get("username")) if rdict.get("username") else "").strip().lower()
                                 rp = rdict.get("password")
-                                if ru == uname_norm and _is_custom_pw(rp) and _pw_matches(rp):
+                                if ru in target_names and _is_custom_pw(rp) and _pw_matches(rp):
                                     try:
                                         update_user_password_everywhere(username, hash_strip)
                                     except Exception:
@@ -6729,7 +6795,7 @@ def verify_user_password_everywhere(username, entered_password):
     if not custom_candidates:
         if any(_pw_matches(p) for p in default_candidates):
             return True
-        if uname_norm in ("admin", "moe", "ziad") and entered_strip == "admin":
+        if uname_norm in ("admin", "moe", "zad", "ziad") and entered_strip == "admin":
             return True
 
     return False
@@ -9627,6 +9693,51 @@ if HAS_DEPS:
             events from child widgets (labels, frames, buttons, inputs) up to their parent scrollable
             Canvas, Treeview, or Listbox.
             """
+            def _find_scrollable_canvas_in_window(start_widget):
+                """Find the visible vertically-scrollable Canvas inside the active window/tab when cursor is on outer window chrome."""
+                try:
+                    top = start_widget.winfo_toplevel()
+                except Exception:
+                    return None
+                queue = [top]
+                candidates = []
+                visited_nodes = set()
+                while queue:
+                    node = queue.pop(0)
+                    if node in visited_nodes:
+                        continue
+                    visited_nodes.add(node)
+                    try:
+                        if not node.winfo_ismapped():
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        cls = node.winfo_class()
+                    except Exception:
+                        cls = ""
+                    if isinstance(node, tk.Canvas) or cls == "Canvas":
+                        try:
+                            bbox = node.bbox("all")
+                            if bbox:
+                                cw = max(int(bbox[2]), int(node.winfo_width()))
+                                ch = max(int(bbox[3]), int(node.winfo_height()))
+                                node.configure(scrollregion=(0, 0, cw, ch))
+                            yv = node.yview()
+                            if yv and len(yv) == 2 and (float(yv[1]) - float(yv[0])) < 0.999:
+                                candidates.append(node)
+                        except Exception:
+                            pass
+                    try:
+                        for ch_w in node.winfo_children():
+                            queue.append(ch_w)
+                    except Exception:
+                        pass
+                if not candidates:
+                    return None
+                # Prefer the canvas whose bounding box is closest to pointer or largest visible
+                return candidates[-1]
+
             def _dispatch_scroll(event, force_horiz=False):
                 try:
                     self.reset_idle_timer(event)
@@ -9638,7 +9749,9 @@ if HAS_DEPS:
                 if not delta:
                     return
 
-                is_horiz = force_horiz or bool(getattr(event, "state", 0) & 0x0001)
+                # Never check event.state & 0x0001 because macOS/Windows trackpad two-finger
+                # vertical gestures set bit 0x0001 in event.state! Only use force_horiz (Shift-MouseWheel).
+                is_horiz = bool(force_horiz)
 
                 w = getattr(event, "widget", None)
                 if not w or isinstance(w, str):
@@ -9663,20 +9776,30 @@ if HAS_DEPS:
                         curr = getattr(curr, "master", None)
                         continue
 
-                    # Synchronized main calendar tables (tree_frozen + tree_calendar)
+                    # Synchronized main calendar tables (tree_frozen + tree_calendar + per-column trees)
                     tf = getattr(self, "tree_frozen", None)
                     tc = getattr(self, "tree_calendar", None)
-                    if curr is tf or curr is tc:
+                    col_trees = list((getattr(self, "cal_col_trees", None) or {}).values())
+                    cal_canvas = getattr(self, "cal_cols_canvas", None)
+                    if curr is tf or curr is tc or curr in col_trees or curr is cal_canvas:
                         try:
-                            if is_horiz and tc and self._widget_alive(tc):
-                                tc.xview_scroll(delta, "units")
-                                _mark_event_scrolled(event)
-                                return "break"
-                            elif not is_horiz:
+                            if is_horiz:
+                                if cal_canvas and self._widget_alive(cal_canvas):
+                                    cal_canvas.xview_scroll(delta, "units")
+                                    _mark_event_scrolled(event)
+                                    return "break"
+                                elif tc and self._widget_alive(tc):
+                                    tc.xview_scroll(delta, "units")
+                                    _mark_event_scrolled(event)
+                                    return "break"
+                            else:
                                 if tf and self._widget_alive(tf):
                                     tf.yview_scroll(delta, "units")
                                 if tc and self._widget_alive(tc):
                                     tc.yview_scroll(delta, "units")
+                                for ct in col_trees:
+                                    if self._widget_alive(ct):
+                                        ct.yview_scroll(delta, "units")
                                 _mark_event_scrolled(event)
                                 return "break"
                         except Exception:
@@ -9765,6 +9888,22 @@ if HAS_DEPS:
 
                     curr = getattr(curr, "master", None)
 
+                # Fallback when pointing cursor on the window frame/header/background outside the inner canvas
+                # (e.g. when a window has two tables and cursor is pointed on the window itself):
+                if not is_horiz:
+                    fallback_canvas = _find_scrollable_canvas_in_window(w)
+                    if fallback_canvas is not None:
+                        try:
+                            fyv = fallback_canvas.yview()
+                            if fyv and len(fyv) == 2:
+                                fy0, fy1 = float(fyv[0]), float(fyv[1])
+                                if (delta < 0 and fy0 > 0.001) or (delta > 0 and fy1 < 0.999):
+                                    fallback_canvas.yview_scroll(delta, "units")
+                                    _mark_event_scrolled(event)
+                                    return "break"
+                        except Exception:
+                            pass
+
             self.bind_all("<MouseWheel>", lambda e: _dispatch_scroll(e, False), add="+")
             self.bind_all("<Shift-MouseWheel>", lambda e: _dispatch_scroll(e, True), add="+")
             self.bind_all("<Button-4>", lambda e: _dispatch_scroll(e, False), add="+")
@@ -9810,7 +9949,7 @@ if HAS_DEPS:
                 return wrapper
 
             # Hero mode (Splash screen & Login page)
-            bg_col = self.style.colors.bg if hasattr(self, "style") else "#222222"
+            bg_col = self.style.colors.bg if hasattr(self, "style") else "#ffffff"
             pole_w, pole_h = 44, 76
             pole_cv = tk.Canvas(wrapper, width=pole_w, height=pole_h, highlightthickness=0, bg=bg_col)
             pole_cv.pack(side=TOP, pady=(0, 10))
@@ -9838,8 +9977,8 @@ if HAS_DEPS:
             title_row = tk.Frame(wrapper, bg=bg_col)
             title_row.pack(side=TOP)
             tk.Label(title_row, text="★ HIGHEND ", font=("Segoe UI", 24, "bold"), fg="#EF4444", bg=bg_col).pack(side=LEFT)
-            tk.Label(title_row, text="PAYROLL ", font=("Segoe UI", 24, "bold"), fg="#FFFFFF", bg=bg_col).pack(side=LEFT)
-            tk.Label(title_row, text="APP ★", font=("Segoe UI", 24, "bold"), fg="#3B82F6", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="PAYROLL ", font=("Segoe UI", 24, "bold"), fg="#1E293B", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="APP ★", font=("Segoe UI", 24, "bold"), fg="#2563EB", bg=bg_col).pack(side=LEFT)
 
             # 3-color Barbershop ribbon bar
             ribbon = tk.Canvas(wrapper, width=260, height=5, highlightthickness=0, bg=bg_col)
@@ -10264,10 +10403,10 @@ if HAS_DEPS:
             # Floating card — background UI stays visible
             panel = tk.Frame(
                 self,
-                bg="#1e1e1e",
+                bg="#ffffff",
                 padx=22,
                 pady=18,
-                highlightbackground="#4CAF50",
+                highlightbackground="#2780e3",
                 highlightthickness=2,
             )
             panel.place(relx=0.5, rely=0.5, anchor="center")
@@ -10277,20 +10416,20 @@ if HAS_DEPS:
                 panel,
                 text="Working…",
                 font=("Segoe UI", 13, "bold"),
-                fg="#ffffff",
-                bg="#1e1e1e",
+                fg="#1e293b",
+                bg="#ffffff",
             ).pack(pady=(0, 4))
             tk.Label(
                 panel,
                 textvariable=self._busy_msg_var,
                 font=("Segoe UI", 10),
-                fg="#cccccc",
-                bg="#1e1e1e",
+                fg="#475569",
+                bg="#ffffff",
                 wraplength=280,
                 justify="center",
             ).pack(pady=(0, 10))
 
-            canvas = tk.Canvas(panel, width=84, height=84, bg="#1e1e1e", highlightthickness=0, bd=0)
+            canvas = tk.Canvas(panel, width=84, height=84, bg="#ffffff", highlightthickness=0, bd=0)
             canvas.pack()
             self._busy_canvas = canvas
             self._busy_spin_angle = 0
@@ -10298,13 +10437,13 @@ if HAS_DEPS:
             # True circular spinner: faint track ring + rotating arc
             pad = 14
             box = (pad, pad, 84 - pad, 84 - pad)
-            canvas.create_oval(*box, outline="#3a3a3a", width=5)
+            canvas.create_oval(*box, outline="#e2e8f0", width=5)
             self._busy_arc = canvas.create_arc(
                 *box,
                 start=0,
                 extent=78,
                 style="arc",
-                outline="#4CAF50",
+                outline="#2780e3",
                 width=5,
             )
 
@@ -10855,8 +10994,9 @@ if HAS_DEPS:
             badge = self._create_barber_pole_badge(title_frame, mode="hero", subtitle=self._tr("Shop & Payroll Management Suite ✂️"))
             badge.pack(side=TOP)
             
-            login_users = ["admin", "moe", "ziad"]
-            seen = {u.lower() for u in login_users}
+            base_users = ["admin", "moe", "zad"]
+            seen = {u.lower() for u in base_users}
+            extra_users = []
             for db_fetch in (
                 lambda: sqlite3.connect(TEMP_DB_PATH),
                 lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
@@ -10864,37 +11004,46 @@ if HAS_DEPS:
                 try:
                     conn = db_fetch()
                     cursor = conn.cursor()
-                    cursor.execute("SELECT username FROM users ORDER BY username ASC")
+                    cursor.execute("SELECT username FROM users")
                     rows = cursor.fetchall() or []
                     conn.close()
                     for r in rows:
                         if not r or not r[0]:
                             continue
-                        name = plain_label(r[0])
+                        name = plain_label(r[0]).strip()
+                        if name.lower() == "ziad":
+                            name = "zad"
                         key = name.lower()
                         if name and key not in seen:
                             seen.add(key)
-                            login_users.append(name)
+                            extra_users.append(name)
                 except Exception:
                     pass
-            
+
+            # Sort all users in DESCENDING alphabetical order (e.g. zad, moe, admin)
+            all_users_desc = sorted(base_users + extra_users, key=lambda x: x.lower(), reverse=True)
+
+            # Keep last used/selected user always upfront at index 0 so user doesn't need to choose it each time
+            cached_user = get_last_selected_username()
+            login_users = list(all_users_desc)
+            if cached_user:
+                match_idx = next((i for i, u in enumerate(login_users) if u.lower() == cached_user.lower()), None)
+                if match_idx is not None:
+                    upfront_u = login_users.pop(match_idx)
+                    login_users.insert(0, upfront_u)
+                else:
+                    login_users.insert(0, cached_user)
+
             tb.Label(frame, text="Username:", font=("Segoe UI", 11)).grid(row=1, column=0, pady=10, padx=(0, 12), sticky=E)
             user_frame = tb.Frame(frame)
             user_frame.grid(row=1, column=1, pady=10, sticky=EW)
             self.username_entry = tb.Combobox(user_frame, width=28, font=("Segoe UI", 11), values=login_users, state="readonly")
-            cached_user = "admin"
-            try:
-                cfg = get_db_config()
-                if isinstance(cfg, dict) and cfg.get("last_selected_username"):
-                    cached_user = cfg.get("last_selected_username")
-            except Exception:
-                pass
-            if cached_user in login_users:
-                self.username_entry.set(cached_user)
-            elif "admin" in login_users:
-                self.username_entry.set("admin")
-            elif login_users:
+            if login_users:
                 self.username_entry.set(login_users[0])
+            self.username_entry.bind(
+                "<<ComboboxSelected>>",
+                lambda e: save_last_selected_username(self.username_entry.get()),
+            )
             self.username_entry.pack(side=LEFT, fill=X, expand=True)
             
             tb.Label(frame, text="Password:", font=("Segoe UI", 11)).grid(row=2, column=0, pady=10, padx=(0, 12), sticky=E)
@@ -11561,12 +11710,53 @@ if HAS_DEPS:
             else:
                 lbl.config(text=f"{len(sel)} {self._tr('Cycles Selected')}")
 
+        def _contrast_text_for_hex(self, hex_str):
+            """Return '#0f172a' for light/pastel backgrounds or '#ffffff' for dark backgrounds."""
+            if not hex_str or not isinstance(hex_str, str) or not hex_str.startswith("#"):
+                return "#0f172a"
+            h = hex_str.lstrip("#")
+            if len(h) == 3:
+                h = "".join(c * 2 for c in h)
+            if len(h) != 6:
+                return "#0f172a"
+            try:
+                r = int(h[0:2], 16)
+                g = int(h[2:4], 16)
+                b = int(h[4:6], 16)
+                lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+                return "#0f172a" if lum > 0.58 else "#ffffff"
+            except Exception:
+                return "#0f172a"
+
+        def apply_calendar_column_colors(self):
+            """Immediately apply saved per-column background colors to the Shop Earnings table columns."""
+            colors = get_calendar_column_colors()
+            # 1. Apply to frozen 'Name' column if present
+            tf = getattr(self, "tree_frozen", None)
+            if self._widget_alive(tf):
+                name_hex = colors.get("Name", "")
+                if name_hex:
+                    tf.tag_configure("col_bg", background=name_hex, foreground=self._contrast_text_for_hex(name_hex))
+                else:
+                    tf.tag_configure("col_bg", background="", foreground="")
+
+            # 2. Apply to each synchronized column Treeview
+            col_trees = getattr(self, "cal_col_trees", None) or {}
+            for col_key, tv in col_trees.items():
+                if not self._widget_alive(tv):
+                    continue
+                hex_col = colors.get(col_key, "")
+                if hex_col:
+                    tv.tag_configure("col_bg", background=hex_col, foreground=self._contrast_text_for_hex(hex_col))
+                else:
+                    tv.tag_configure("col_bg", background="", foreground="")
+
         def open_calendar_columns_dialog(self, parent=None):
-            """Dialog to customize which columns are displayed in the Shop Earnings / Calendar table."""
+            """Dialog to customize which columns are displayed and specify per-column colors in the Shop Earnings table."""
             parent = parent if self._widget_alive(parent) else self
             dialog = tb.Toplevel(parent)
-            dialog.title(self._tr("⚙️ Customize Table Columns"))
-            dialog.geometry("520x620")
+            dialog.title(self._tr("⚙️ Customize Table Columns & Colors"))
+            dialog.geometry("680x660")
             dialog.transient(parent)
             self._safe_grab_set(dialog)
             dialog.focus_set()
@@ -11582,17 +11772,17 @@ if HAS_DEPS:
             
             tb.Label(
                 main_f,
-                text=self._tr("Select Columns to Display"),
+                text=self._tr("Select Columns & Customize Column Colors"),
                 font=("Segoe UI", 14, "bold"),
                 bootstyle="primary",
             ).pack(anchor=W, pady=(0, 4))
             
             tb.Label(
                 main_f,
-                text=self._tr("Check the columns you want visible in the Shop Earnings table. Changes are saved automatically."),
+                text=self._tr("Toggle columns on/off and click any Color Box to choose a custom color for that column. Click '↺ Default' next to any column to return it to its default color."),
                 font=("Segoe UI", 10),
                 bootstyle="secondary",
-                wraplength=480,
+                wraplength=630,
                 justify=LEFT,
             ).pack(anchor=W, pady=(0, 12))
             
@@ -11611,15 +11801,140 @@ if HAS_DEPS:
             canvas.pack(side=LEFT, fill=BOTH, expand=True)
             
             hidden_now = get_calendar_hidden_columns()
+            saved_colors = get_calendar_column_colors()
             check_vars = {}
-            
+            color_vars = {}
+            color_btns = {}
+
+            PRESET_PALETTE = [
+                ("Mint", "#dcfce7"),
+                ("Sky", "#e0f2fe"),
+                ("Amber", "#fef3c7"),
+                ("Rose", "#ffe4e6"),
+                ("Lavender", "#f3e8ff"),
+                ("Peach", "#ffedd5"),
+                ("Emerald", "#a7f3d0"),
+                ("Indigo", "#e0e7ff"),
+                ("Coral", "#fecdd3"),
+                ("Lemon", "#fef08a"),
+                ("Cyan", "#cffafe"),
+                ("Slate", "#e2e8f0"),
+            ]
+
+            def _update_color_btn_appearance(col_key):
+                btn = color_btns.get(col_key)
+                if not btn or not btn.winfo_exists():
+                    return
+                hex_c = color_vars.get(col_key, "")
+                if hex_c:
+                    fg_c = self._contrast_text_for_hex(hex_c)
+                    btn.configure(
+                        text=f"■ {hex_c.upper()}",
+                        bg=hex_c,
+                        fg=fg_c,
+                        activebackground=hex_c,
+                        activeforeground=fg_c,
+                    )
+                else:
+                    btn.configure(
+                        text=self._tr("🎨 Default"),
+                        bg="#f8f9fa",
+                        fg="#334155",
+                        activebackground="#e2e8f0",
+                        activeforeground="#0f172a",
+                    )
+
+            def _set_col_color(col_key, new_hex):
+                color_vars[col_key] = new_hex or ""
+                _update_color_btn_appearance(col_key)
+                # Immediately persist and apply to the table so the column color changes live!
+                current_map = get_calendar_column_colors()
+                if new_hex:
+                    current_map[col_key] = new_hex
+                else:
+                    current_map.pop(col_key, None)
+                save_calendar_column_colors(current_map)
+                self.apply_calendar_column_colors()
+
+            def _open_color_picker_for_column(col_key, anchor_btn):
+                pop = tb.Toplevel(dialog)
+                pop.title(f"{self._tr('Choose Color')}: {self._tr(col_key)}")
+                pop.transient(dialog)
+                pop.resizable(False, False)
+                try:
+                    bx = anchor_btn.winfo_rootx()
+                    by = anchor_btn.winfo_rooty() + anchor_btn.winfo_height() + 4
+                    pop.geometry(f"+{max(20, bx - 120)}+{max(20, by)}")
+                except Exception:
+                    pass
+                self._safe_grab_set(pop)
+                pop.focus_set()
+
+                p_frame = tb.Frame(pop, padding=14)
+                p_frame.pack(fill=BOTH, expand=True)
+                tb.Label(
+                    p_frame,
+                    text=f"{self._tr('Select Column Color for')} '{self._tr(col_key)}'",
+                    font=("Segoe UI", 10, "bold"),
+                ).pack(anchor=W, pady=(0, 8))
+
+                grid_f = tb.Frame(p_frame)
+                grid_f.pack(fill=X, pady=(0, 10))
+                for idx, (p_name, p_hex) in enumerate(PRESET_PALETTE):
+                    r_i, c_i = divmod(idx, 4)
+                    fg_c = self._contrast_text_for_hex(p_hex)
+                    sw_btn = tk.Button(
+                        grid_f,
+                        text=p_name,
+                        bg=p_hex,
+                        fg=fg_c,
+                        activebackground=p_hex,
+                        activeforeground=fg_c,
+                        font=("Segoe UI", 9, "bold"),
+                        width=10,
+                        relief="groove",
+                        bd=1,
+                        cursor="hand2",
+                        command=lambda hx=p_hex: (_set_col_color(col_key, hx), self._safe_grab_release(pop), pop.destroy()),
+                    )
+                    sw_btn.grid(row=r_i, column=c_i, padx=3, pady=3)
+
+                bot_f = tb.Frame(p_frame)
+                bot_f.pack(fill=X, pady=(4, 0))
+
+                def _pick_custom():
+                    from tkinter import colorchooser
+                    init_c = color_vars.get(col_key) or "#dcfce7"
+                    rgb, hex_val = colorchooser.askcolor(color=init_c, title=f"{self._tr('Choose Color for')} {self._tr(col_key)}", parent=pop)
+                    if hex_val:
+                        _set_col_color(col_key, hex_val)
+                        self._safe_grab_release(pop)
+                        pop.destroy()
+
+                tb.Button(bot_f, text=self._tr("🎨 Custom Color..."), bootstyle="primary-outline", cursor="hand2", command=_pick_custom).pack(side=LEFT)
+                tb.Button(
+                    bot_f,
+                    text=self._tr("↺ Default"),
+                    bootstyle="secondary-outline",
+                    cursor="hand2",
+                    command=lambda: (_set_col_color(col_key, ""), self._safe_grab_release(pop), pop.destroy()),
+                ).pack(side=LEFT, padx=6)
+                tb.Button(
+                    bot_f,
+                    text=self._tr("Close"),
+                    bootstyle="secondary",
+                    cursor="hand2",
+                    command=lambda: (self._safe_grab_release(pop), pop.destroy()),
+                ).pack(side=RIGHT)
+
             for col_key, desc in ALL_CALENDAR_COLUMNS:
                 col_tr = self._tr(col_key)
                 is_checked = (col_key not in hidden_now and col_tr not in hidden_now)
                 var = tk.BooleanVar(value=is_checked)
                 check_vars[col_key] = var
+                color_vars[col_key] = saved_colors.get(col_key, "")
                 
-                row_f = tb.Frame(inner, padding=(4, 6))
+                row_f = tb.Frame(inner, padding=(4, 5))
                 row_f.pack(fill=X, expand=True)
                 
                 cb = tb.Checkbutton(
@@ -11629,7 +11944,35 @@ if HAS_DEPS:
                     bootstyle="primary-round-toggle",
                     cursor="hand2",
                 )
-                cb.pack(anchor=W)
+                cb.pack(side=LEFT, anchor=W)
+
+                # Right-aligned Color Box + Default reset button
+                right_ctrl = tb.Frame(row_f)
+                right_ctrl.pack(side=RIGHT, anchor=E)
+
+                c_btn = tk.Button(
+                    right_ctrl,
+                    text=self._tr("🎨 Default"),
+                    font=("Segoe UI", 9, "bold"),
+                    width=12,
+                    relief="solid",
+                    bd=1,
+                    cursor="hand2",
+                )
+                c_btn.pack(side=LEFT, padx=(0, 6))
+                color_btns[col_key] = c_btn
+                c_btn.configure(command=lambda ck=col_key, b=c_btn: _open_color_picker_for_column(ck, b))
+                _update_color_btn_appearance(col_key)
+
+                def_btn = tb.Button(
+                    right_ctrl,
+                    text=self._tr("↺ Default"),
+                    bootstyle="secondary-outline",
+                    width=9,
+                    cursor="hand2",
+                    command=lambda ck=col_key: _set_col_color(ck, ""),
+                )
+                def_btn.pack(side=LEFT)
             
             btn_f = tb.Frame(main_f, padding=(0, 15, 0, 0))
             btn_f.pack(fill=X, side=BOTTOM)
@@ -11641,11 +11984,15 @@ if HAS_DEPS:
                         new_hidden.add(col_key)
                         new_hidden.add(self._tr(col_key))
                 save_calendar_hidden_columns(new_hidden)
+                # Ensure colors are saved
+                clean_colors = {k: v for k, v in color_vars.items() if v}
+                save_calendar_column_colors(clean_colors)
                 self.refresh_calendar_column_visibility()
+                self.apply_calendar_column_colors()
                 _close_col_dialog()
                 messagebox.showinfo(
                     self._tr("Columns Updated"),
-                    self._tr("Table columns display updated successfully."),
+                    self._tr("Table columns and colors updated successfully."),
                     parent=self,
                 )
 
@@ -11653,23 +12000,74 @@ if HAS_DEPS:
                 for var in check_vars.values():
                     var.set(val)
 
+            def _reset_all_to_default():
+                _select_all_cols(True)
+                if "Written Up" in check_vars:
+                    check_vars["Written Up"].set(False)
+                for ck in list(color_vars.keys()):
+                    _set_col_color(ck, "")
+
             tb.Button(btn_f, text=self._tr("Save & Apply"), bootstyle="success", cursor="hand2", command=_save_and_apply).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Select All"), bootstyle="secondary-outline", cursor="hand2", command=lambda: _select_all_cols(True)).pack(side=LEFT, padx=5)
-            tb.Button(btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=lambda: (_select_all_cols(True), check_vars.get("Written Up", tk.BooleanVar()).set(False))).pack(side=LEFT, padx=5)
+            tb.Button(btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=_reset_all_to_default).pack(side=LEFT, padx=5)
             tb.Button(btn_f, text=self._tr("Cancel"), bootstyle="secondary", cursor="hand2", command=_close_col_dialog).pack(side=RIGHT, padx=5)
 
         def refresh_calendar_column_visibility(self):
-            """Apply current hidden columns to tree_calendar."""
-            if not self._widget_alive(getattr(self, "tree_calendar", None)):
-                return
+            """Apply current hidden columns and column widths to the Shop Earnings table."""
             hidden = get_calendar_hidden_columns()
-            disp_cols = [c for c in self.columns if c != self._tr("Name")]
-            self.apply_and_memorize_column_widths(
-                "calendar_table",
-                self.tree_calendar,
-                disp_cols,
-                hidden_cols=list(hidden),
-            )
+            # Show/hide frozen Name pane
+            if hasattr(self, "frozen_frame") and self._widget_alive(self.frozen_frame):
+                if "Name" in hidden or self._tr("Name") in hidden:
+                    self.frozen_frame.pack_forget()
+                else:
+                    self.frozen_frame.pack(side=LEFT, fill=Y)
+
+            # Show/hide per-column frames in cal_cols_inner
+            col_frames = getattr(self, "cal_col_frames", None) or {}
+            col_trees = getattr(self, "cal_col_trees", None) or {}
+            saved_widths = get_saved_column_widths("calendar_table")
+            default_widths = {
+                "Date": 105,
+                "Cycle": 150,
+                "Location": 115,
+                "Service Sales": 120,
+                "Service Sales Calculations": 175,
+                "Service Add-on Sales": 145,
+                "Product Sales": 115,
+                "Tip": 95,
+                "Hour Rate": 95,
+                "Percentage": 105,
+                "Hours": 85,
+                "Total Calculation": 155,
+                "Notes": 180,
+                "Written Up": 120,
+            }
+            for col_key, frame in col_frames.items():
+                if not self._widget_alive(frame):
+                    continue
+                col_tr = self._tr(col_key)
+                if col_key in hidden or col_tr in hidden:
+                    frame.pack_forget()
+                else:
+                    w = int(saved_widths.get(col_tr, saved_widths.get(col_key, default_widths.get(col_key, 120))))
+                    frame.configure(width=w)
+                    frame.pack(side=LEFT, fill=Y, expand=False)
+                    tv = col_trees.get(col_key)
+                    if self._widget_alive(tv):
+                        tv.column(col_tr, width=w, stretch=True)
+
+            # Refresh canvas horizontal scrollregion
+            cal_canvas = getattr(self, "cal_cols_canvas", None)
+            cal_inner = getattr(self, "cal_cols_inner", None)
+            if self._widget_alive(cal_canvas) and self._widget_alive(cal_inner):
+                try:
+                    cal_inner.update_idletasks()
+                    bbox = cal_canvas.bbox("all")
+                    if bbox:
+                        cal_canvas.configure(scrollregion=bbox)
+                except Exception:
+                    pass
+            self.apply_calendar_column_colors()
 
         def _bind_dialog_save_keys(self, dialog, save_fn):
             """Enter / keypad Enter runs Save while this dialog is focused."""
@@ -12703,6 +13101,7 @@ if HAS_DEPS:
             frozen_frame = tb.Frame(tree_frame, width=175)
             frozen_frame.pack_propagate(False)
             frozen_frame.pack(side=LEFT, fill=Y)
+            self.frozen_frame = frozen_frame
 
             self.tree_frozen = tb.Treeview(
                 frozen_frame,
@@ -12718,7 +13117,7 @@ if HAS_DEPS:
             frozen_spacer = tb.Frame(frozen_frame, height=18)
             frozen_spacer.pack(side=BOTTOM, fill=X)
 
-            # 2. Right Vertical Scrollbar (Synchronized for both panes)
+            # 2. Right Vertical Scrollbar (Synchronized for all panes)
             scroll_y = tb.Scrollbar(tree_frame, orient=VERTICAL)
             scroll_y.pack(side=RIGHT, fill=Y)
 
@@ -12738,92 +13137,190 @@ if HAS_DEPS:
             ))
 
             disp_cols = [c for c in self.columns if c != self._tr("Name")]
+            # Backing Treeview kept for full compatibility with edit/delete/export/selection callers
             self.tree_calendar = tb.Treeview(
                 main_table_frame,
                 columns=self.columns,
                 displaycolumns=disp_cols,
                 show="headings",
                 bootstyle="primary",
-                xscrollcommand=scroll_x.set,
                 selectmode="extended",
             )
-            scroll_x.config(command=self.tree_calendar.xview)
 
-            # Synchronize vertical scrolling
+            # Horizontally scrollable canvas hosting synchronized 1-column Treeviews for per-column custom colors
+            self.cal_cols_canvas = tk.Canvas(main_table_frame, highlightthickness=0)
+            self.cal_cols_canvas.pack(side=TOP, fill=BOTH, expand=True)
+            self.cal_cols_canvas.configure(xscrollcommand=scroll_x.set)
+            scroll_x.config(command=self.cal_cols_canvas.xview)
+
+            self.cal_cols_inner = tb.Frame(self.cal_cols_canvas)
+            self.cal_cols_win = self.cal_cols_canvas.create_window((0, 0), window=self.cal_cols_inner, anchor="nw")
+
+            def _on_cols_canvas_cfg(e):
+                try:
+                    self.cal_cols_canvas.itemconfigure(self.cal_cols_win, height=max(100, e.height))
+                except Exception:
+                    pass
+
+            def _on_cols_inner_cfg(e):
+                try:
+                    bbox = self.cal_cols_canvas.bbox("all")
+                    if bbox:
+                        self.cal_cols_canvas.configure(scrollregion=bbox)
+                except Exception:
+                    pass
+
+            self.cal_cols_canvas.bind("<Configure>", _on_cols_canvas_cfg)
+            self.cal_cols_inner.bind("<Configure>", _on_cols_inner_cfg)
+
+            self.cal_col_frames = {}
+            self.cal_col_trees = {}
+            default_col_widths = {
+                "Date": 105,
+                "Cycle": 150,
+                "Location": 115,
+                "Service Sales": 120,
+                "Service Sales Calculations": 175,
+                "Service Add-on Sales": 145,
+                "Product Sales": 115,
+                "Tip": 95,
+                "Hour Rate": 95,
+                "Percentage": 105,
+                "Hours": 85,
+                "Total Calculation": 155,
+                "Notes": 180,
+                "Written Up": 120,
+            }
+            saved_w = get_saved_column_widths("calendar_table")
+
+            for col_key, _ in ALL_CALENDAR_COLUMNS:
+                if col_key == "Name":
+                    continue
+                col_tr = self._tr(col_key)
+                init_w = int(saved_w.get(col_tr, saved_w.get(col_key, default_col_widths.get(col_key, 120))))
+                cf = tb.Frame(self.cal_cols_inner, width=init_w)
+                cf.pack_propagate(False)
+                cf.pack(side=LEFT, fill=Y, expand=False)
+                tv = tb.Treeview(
+                    cf,
+                    columns=(col_tr,),
+                    show="headings",
+                    bootstyle="primary",
+                    selectmode="extended",
+                )
+                tv.heading(col_tr, text=col_tr)
+                tv.column(col_tr, width=init_w, stretch=True)
+                tv.pack(side=TOP, fill=BOTH, expand=True)
+                self.cal_col_frames[col_key] = cf
+                self.cal_col_trees[col_key] = tv
+
+                def _on_col_resize(e, ck=col_key, t_widget=tv, f_widget=cf, c_tr=col_tr):
+                    try:
+                        nw = int(t_widget.column(c_tr, "width"))
+                        if nw >= 45 and abs(nw - f_widget.winfo_width()) > 2:
+                            f_widget.configure(width=nw)
+                            prefs = load_ui_column_preferences()
+                            tbl_w = prefs.get("calendar_table", {})
+                            tbl_w[c_tr] = nw
+                            tbl_w[ck] = nw
+                            prefs["calendar_table"] = tbl_w
+                            save_ui_column_preferences(prefs)
+                            self.cal_cols_inner.update_idletasks()
+                            bbox = self.cal_cols_canvas.bbox("all")
+                            if bbox:
+                                self.cal_cols_canvas.configure(scrollregion=bbox)
+                    except Exception:
+                        pass
+
+                tv.bind("<ButtonRelease-1>", _on_col_resize, add="+")
+
+            all_trees = [self.tree_frozen, self.tree_calendar] + list(self.cal_col_trees.values())
+
+            # Synchronize vertical scrolling across all column trees
+            self._syncing_cal_y = False
             def _sync_yview(*args):
+                if getattr(self, "_syncing_cal_y", False):
+                    return
+                self._syncing_cal_y = True
                 try:
-                    self.tree_frozen.yview(*args)
-                except Exception:
-                    pass
-                try:
-                    self.tree_calendar.yview(*args)
-                except Exception:
-                    pass
+                    for t in all_trees:
+                        if self._widget_alive(t):
+                            try:
+                                t.yview(*args)
+                            except Exception:
+                                pass
+                finally:
+                    self._syncing_cal_y = False
+
             scroll_y.config(command=_sync_yview)
 
-            def _on_cal_yscroll(*args):
-                scroll_y.set(*args)
-                try:
-                    self.tree_frozen.yview_moveto(args[0])
-                except Exception:
-                    pass
-            self.tree_calendar.configure(yscrollcommand=_on_cal_yscroll)
+            def _make_yscroll_handler(src_tree):
+                def _handler(*args):
+                    scroll_y.set(*args)
+                    if getattr(self, "_syncing_cal_y", False):
+                        return
+                    self._syncing_cal_y = True
+                    try:
+                        for t in all_trees:
+                            if t is not src_tree and self._widget_alive(t):
+                                try:
+                                    t.yview_moveto(args[0])
+                                except Exception:
+                                    pass
+                    finally:
+                        self._syncing_cal_y = False
+                return _handler
 
-            def _on_frozen_yscroll(*args):
-                scroll_y.set(*args)
-                try:
-                    self.tree_calendar.yview_moveto(args[0])
-                except Exception:
-                    pass
-            self.tree_frozen.configure(yscrollcommand=_on_frozen_yscroll)
+            for t in all_trees:
+                t.configure(yscrollcommand=_make_yscroll_handler(t))
 
-            # Synchronize mousewheel scrolling across both panes
+            # Synchronize mousewheel scrolling across all panes
             def _on_wheel(e):
                 if _was_event_scrolled(e):
                     return "break"
                 delta = _scroll_delta(e)
                 if delta:
                     try:
-                        self.tree_frozen.yview_scroll(delta, "units")
-                        self.tree_calendar.yview_scroll(delta, "units")
+                        for t in all_trees:
+                            if self._widget_alive(t):
+                                t.yview_scroll(delta, "units")
                         _mark_event_scrolled(e)
                     except Exception:
                         pass
                 return "break"
 
-            for t in (self.tree_frozen, self.tree_calendar):
+            for t in all_trees:
                 t.bind("<MouseWheel>", _on_wheel)
                 t.bind("<Button-4>", _on_wheel)
                 t.bind("<Button-5>", _on_wheel)
 
-            # Synchronize row selection between frozen column and table
-            def _sync_sel_from_frozen(e=None):
-                sel = self.tree_frozen.selection()
-                if self.tree_calendar.selection() != sel:
-                    self.tree_calendar.selection_set(sel)
-                    if sel:
-                        self.tree_calendar.focus(sel[0])
+            # Synchronize row selection across frozen column, backing tree, and all column trees
+            self._syncing_cal_sel = False
+            def _make_sel_handler(src_tree):
+                def _on_sel(e=None):
+                    if getattr(self, "_syncing_cal_sel", False):
+                        return
+                    self._syncing_cal_sel = True
+                    try:
+                        sel = src_tree.selection()
+                        for t in all_trees:
+                            if t is not src_tree and self._widget_alive(t):
+                                try:
+                                    if t.selection() != sel:
+                                        t.selection_set(sel)
+                                        if sel:
+                                            t.focus(sel[0])
+                                except Exception:
+                                    pass
+                    finally:
+                        self._syncing_cal_sel = False
+                return _on_sel
 
-            def _sync_sel_from_cal(e=None):
-                sel = self.tree_calendar.selection()
-                if self.tree_frozen.selection() != sel:
-                    self.tree_frozen.selection_set(sel)
-                    if sel:
-                        self.tree_frozen.focus(sel[0])
+            for t in all_trees:
+                t.bind("<<TreeviewSelect>>", _make_sel_handler(t))
+                t.bind("<Double-1>", lambda e: self.edit_selected_record())
 
-            self.tree_frozen.bind("<<TreeviewSelect>>", _sync_sel_from_frozen)
-            self.tree_calendar.bind("<<TreeviewSelect>>", _sync_sel_from_cal)
-
-            self.tree_frozen.bind("<Double-1>", lambda e: self.edit_selected_record())
-            self.tree_calendar.bind("<Double-1>", lambda e: self.edit_selected_record())
-
-            self.apply_and_memorize_column_widths(
-                "calendar_table",
-                self.tree_calendar,
-                disp_cols,
-                hidden_cols=list(get_calendar_hidden_columns()),
-            )
-            self.tree_calendar.pack(side=TOP, fill=BOTH, expand=True)
+            self.refresh_calendar_column_visibility()
             self.load_calendar_data()
 
         def _rebuild_cycle_cards(self):
@@ -13067,6 +13564,10 @@ if HAS_DEPS:
             if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
                 for item in self.tree_frozen.get_children():
                     self.tree_frozen.delete(item)
+            for _ct in (getattr(self, "cal_col_trees", None) or {}).values():
+                if self._widget_alive(_ct):
+                    for item in _ct.get_children():
+                        _ct.delete(item)
                 
             emp_f = getattr(self, 'cal_name_filter', None)
             emp_val = emp_f.get() if emp_f else self._tr("All")
@@ -13361,13 +13862,36 @@ if HAS_DEPS:
                     row[15] if row[15] else "",
                 ]
                 iid = f"row_{row[0]}_{r_idx}"
+                cell_tags = ('col_bg',) + row_tags
                 self.tree_calendar.insert('', tk.END, iid=iid, values=tree_row, tags=row_tags)
                 if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
-                    self.tree_frozen.insert('', tk.END, iid=iid, values=(row[2],), tags=row_tags)
+                    self.tree_frozen.insert('', tk.END, iid=iid, values=(row[2],), tags=cell_tags)
+                col_val_map = {
+                    "Date": row[1],
+                    "Cycle": cyc_display,
+                    "Location": loc_v,
+                    "Service Sales": f"${rev_v:,.2f}",
+                    "Service Sales Calculations": f"${svc_calc:,.2f}",
+                    "Service Add-on Sales": f"${addon_v:,.2f}",
+                    "Product Sales": f"${prod_v:,.2f}",
+                    "Tip": f"${tip_v:,.2f}",
+                    "Hour Rate": hr_disp,
+                    "Percentage": perc_disp,
+                    "Hours": hrs_disp,
+                    "Total Calculation": calc_disp,
+                    "Notes": row[14] if row[14] else "",
+                    "Written Up": row[15] if row[15] else "",
+                }
+                for _ck, _ct in (getattr(self, "cal_col_trees", None) or {}).items():
+                    if self._widget_alive(_ct):
+                        _ct.insert('', tk.END, iid=iid, values=(col_val_map.get(_ck, ""),), tags=cell_tags)
 
             self.tree_calendar.insert('', tk.END, iid='spacer_row', values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
             if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
                 self.tree_frozen.insert('', tk.END, iid='spacer_row', values=("",))
+            for _ct in (getattr(self, "cal_col_trees", None) or {}).values():
+                if self._widget_alive(_ct):
+                    _ct.insert('', tk.END, iid='spacer_row', values=("",))
 
             self.tree_calendar.insert('', tk.END, iid='totals_row', values=(
                 "", "", "", "=== TOTALS ===", "",
@@ -13385,6 +13909,31 @@ if HAS_DEPS:
                 self.tree_frozen.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
                 self.tree_frozen.tag_configure('missing_rate', foreground='#e74c3c', font=('Segoe UI', 9, 'bold'))
                 self.tree_frozen.tag_configure('missing_hours', foreground='#e67e22', font=('Segoe UI', 9, 'bold'))
+
+            totals_val_map = {
+                "Date": "",
+                "Cycle": "",
+                "Location": "",
+                "Service Sales": f"${total_rev:,.2f}",
+                "Service Sales Calculations": f"${total_svc_calc:,.2f}",
+                "Service Add-on Sales": f"${total_addon:,.2f}",
+                "Product Sales": f"${total_prod:,.2f}",
+                "Tip": f"${total_tip:,.2f}",
+                "Hour Rate": "",
+                "Percentage": "",
+                "Hours": f"{total_hrs:.1f}",
+                "Total Calculation": f"⭐ ${total_calc:,.2f} ⭐",
+                "Notes": "",
+                "Written Up": "",
+            }
+            for _ck, _ct in (getattr(self, "cal_col_trees", None) or {}).items():
+                if self._widget_alive(_ct):
+                    _ct.insert('', tk.END, iid='totals_row', values=(totals_val_map.get(_ck, ""),), tags=('totals',))
+                    _ct.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
+                    _ct.tag_configure('missing_rate', foreground='#e74c3c', font=('Segoe UI', 9, 'bold'))
+                    _ct.tag_configure('missing_hours', foreground='#e67e22', font=('Segoe UI', 9, 'bold'))
+
+            self.apply_calendar_column_colors()
 
             btn_add_rate = getattr(self, "btn_missing_rate_action", None)
             if self._widget_alive(btn_add_rate):
@@ -15686,7 +16235,7 @@ if HAS_DEPS:
             self.chart_frame = tb.Labelframe(main_content, text=self._tr("Expense Distribution"), padding=10, bootstyle="warning")
             self.chart_frame.pack(side=RIGHT, fill=BOTH, padx=(20, 0), ipadx=10)
             
-            bg_color = self.style.colors.bg if hasattr(self, 'style') and hasattr(self.style, 'colors') else "#222222"
+            bg_color = self.style.colors.bg if hasattr(self, 'style') and hasattr(self.style, 'colors') else "#ffffff"
             self.chart_canvas = tk.Canvas(self.chart_frame, width=320, height=335, highlightthickness=0, bg=bg_color)
             self.chart_canvas.pack(fill=BOTH, expand=True, pady=5)
             
@@ -16231,8 +16780,8 @@ if HAS_DEPS:
                 return
                 
             # Theme specific adaptive foreground color
-            fg_color = self.style.colors.fg if hasattr(self, 'style') and hasattr(self.style, 'colors') else "#ffffff"
-            # Custom color palette reflecting darkly aesthetic
+            fg_color = self.style.colors.fg if hasattr(self, 'style') and hasattr(self.style, 'colors') else "#1e293b"
+            # Custom color palette reflecting clean light aesthetic
             colors = ["#375a7f", "#00bc8c", "#f39c12", "#e74c3c", "#9b59b6", "#3498db", "#1abc9c", "#d35400"]
             total_sum = sum(cat_totals.values())
             
@@ -16252,7 +16801,7 @@ if HAS_DEPS:
                     start=start_angle, 
                     extent=extent, 
                     fill=color, 
-                    outline="#222222", 
+                    outline="#ffffff", 
                     width=1
                 )
                 start_angle += extent
@@ -16305,7 +16854,7 @@ if HAS_DEPS:
             total_expenses = getattr(self, '_last_total_amt', 0.0)
             
             # Text Title
-            fg_color = self.style.colors.fg if hasattr(self, 'style') and hasattr(self.style, 'colors') else "#ffffff"
+            fg_color = self.style.colors.fg if hasattr(self, 'style') and hasattr(self.style, 'colors') else "#1e293b"
             self.revenue_chart_canvas.create_text(
                 160, 15, 
                 text=self._tr("Expenses vs. Revenue"), 
@@ -16343,7 +16892,7 @@ if HAS_DEPS:
                     start=0, 
                     extent=rev_extent, 
                     fill="#00bc8c", 
-                    outline="#222222", 
+                    outline="#ffffff", 
                     width=1
                 )
             if total_expenses > 0:
@@ -16352,7 +16901,7 @@ if HAS_DEPS:
                     start=rev_extent, 
                     extent=exp_extent, 
                     fill="#e74c3c", 
-                    outline="#222222", 
+                    outline="#ffffff", 
                     width=1
                 )
                 
@@ -17158,7 +17707,7 @@ if HAS_DEPS:
                 tb.Label(preview, text=os.path.basename(path), font=("Segoe UI", 12, "bold")).pack(pady=(12, 6))
                 canvas_holder = tb.Frame(preview)
                 canvas_holder.pack(fill=BOTH, expand=True, padx=10, pady=5)
-                canvas = tk.Canvas(canvas_holder, highlightthickness=0, bg="#1e1e1e")
+                canvas = tk.Canvas(canvas_holder, highlightthickness=0, bg="#f8f9fa")
                 scroll_y = tb.Scrollbar(canvas_holder, orient=VERTICAL, command=canvas.yview)
                 scroll_x = tb.Scrollbar(canvas_holder, orient=HORIZONTAL, command=canvas.xview)
                 canvas.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
