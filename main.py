@@ -861,7 +861,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.34"
+APP_VERSION = "2.5.37"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1861,6 +1861,17 @@ def _is_pg_conn_alive(conn):
     except Exception:
         return False
 
+def _is_placeholder_password(pw):
+    if not pw:
+        return True
+    p = str(pw).strip().upper()
+    return p in (
+        "[YOUR-PASSWORD]", "[YOUR_PASSWORD]", "[PASSWORD]",
+        "<PASSWORD>", "<YOUR-PASSWORD>", "YOUR-PASSWORD", "YOUR_PASSWORD",
+        "YOURPASSWORD", "[YOURPASSWORD]"
+    )
+
+
 def _clean_supabase_config(config):
     """Auto-clean and parse host, full URI, port, user, and database."""
     cfg = dict(config or {})
@@ -1868,6 +1879,8 @@ def _clean_supabase_config(config):
     port = str(cfg.get("supabase_port") or "5432").strip()
     user = str(cfg.get("supabase_user") or "postgres").strip()
     password = str(cfg.get("supabase_password") or "").strip()
+    if _is_placeholder_password(password):
+        password = ""
     database = str(cfg.get("supabase_database") or "postgres").strip()
 
     # Handle full connection URI if pasted in host
@@ -1882,9 +1895,25 @@ def _clean_supabase_config(config):
             if u.username:
                 user = urllib.parse.unquote(u.username)
             if u.password:
-                password = urllib.parse.unquote(u.password)
+                uri_pw = urllib.parse.unquote(u.password)
+                # Only use URI password if it is NOT a template placeholder like [YOUR-PASSWORD]
+                if not _is_placeholder_password(uri_pw):
+                    password = uri_pw
             if u.path and len(u.path) > 1:
                 database = u.path.lstrip("/")
+        except Exception:
+            pass
+
+    # If password is still empty, check if location_config.json has a valid non-placeholder password
+    if not password:
+        try:
+            cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                saved_pw = str(saved.get("supabase_password") or "").strip()
+                if saved_pw and not _is_placeholder_password(saved_pw):
+                    password = saved_pw
         except Exception:
             pass
 
@@ -2243,11 +2272,13 @@ def _resolve_ipv4_addresses(host, port):
 
 _SCRAM_PATCH_LOCK = threading.Lock()
 _SCRAM_PATCHED = False
+_SCRAM_TLS = threading.local()
 
 
 def _ensure_universal_scram_client():
-    """Patches scramp so channel_binding is always None ('n,,' GS2 header) and make_channel_binding
-    never invokes asn1crypto certificate parsing on TLS sockets.
+    """Patches scramp so channel_binding is always None ('n,,' GS2 header), make_channel_binding
+    never invokes asn1crypto certificate parsing on TLS sockets, and supports thread-local
+    scram_user_override ('n=,' libpq standard) and bypass_saslprep.
     """
     global _SCRAM_PATCHED
     if _SCRAM_PATCHED:
@@ -2257,15 +2288,32 @@ def _ensure_universal_scram_client():
             return
         try:
             import scramp
+            import scramp.core
             import pg8000.core
+            import hashlib
             orig_scram = scramp.ScramClient
+            orig_make_salted = scramp.core._make_salted_password
+
+            def _custom_make_salted_password(hf, password, salt, iterations):
+                if getattr(_SCRAM_TLS, "bypass_saslprep", False):
+                    pw_bytes = password.encode("utf-8") if isinstance(password, str) else bytes(password)
+                    return hashlib.pbkdf2_hmac(hf().name, pw_bytes, bytes(salt), iterations)
+                try:
+                    return orig_make_salted(hf, password, salt, iterations)
+                except Exception:
+                    pw_bytes = password.encode("utf-8") if isinstance(password, str) else bytes(password)
+                    return hashlib.pbkdf2_hmac(hf().name, pw_bytes, bytes(salt), iterations)
+
+            scramp.core._make_salted_password = _custom_make_salted_password
 
             class _UniversalScramClient(orig_scram):
                 def __init__(self, mechanisms, username, password, channel_binding=None, c_nonce=None):
+                    override_u = getattr(_SCRAM_TLS, "scram_user_override", None)
+                    eff_user = override_u if override_u is not None else username
                     if "SCRAM-SHA-256" in mechanisms:
-                        super().__init__(["SCRAM-SHA-256"], username, password, channel_binding=None, c_nonce=c_nonce)
+                        super().__init__(["SCRAM-SHA-256"], eff_user, password, channel_binding=None, c_nonce=c_nonce)
                     else:
-                        super().__init__(mechanisms, username, password, channel_binding=channel_binding, c_nonce=c_nonce)
+                        super().__init__(mechanisms, eff_user, password, channel_binding=channel_binding, c_nonce=c_nonce)
 
             scramp.ScramClient = _UniversalScramClient
             pg8000.core.scramp.ScramClient = _UniversalScramClient
@@ -2279,8 +2327,16 @@ def _ensure_universal_scram_client():
 def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
     """Connects to PostgreSQL using dual-stack (IPv4 priority + IPv6/NAT64 automatic fallback) sockets,
     unverified SSL context, and Universal SCRAM-SHA-256 ('n,,' GS2 header).
+    Automatically retries alternate SCRAM username formats ('n=,' libpq standard, 'n=postgres')
+    and URL-unquoted/raw password variants if 'password authentication failed' (28P01) occurs.
     """
-    import pg8000.dbapi, socket, ssl
+    import pg8000.dbapi, socket, ssl, urllib.parse
+
+    if _is_placeholder_password(password):
+        raise RuntimeError(
+            "The saved Database Password is currently set to the placeholder '[YOUR-PASSWORD]' "
+            "(copied from a connection URI template). Please type your actual Database Password in the DB Settings window."
+        )
 
     _ensure_universal_scram_client()
 
@@ -2299,7 +2355,6 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
 
     try:
         infos = socket.getaddrinfo(host, int(port), 0, socket.SOCK_STREAM)
-        # Add any AF_INET first, then AF_INET6
         for fam_filter in (socket.AF_INET, socket.AF_INET6):
             for info in infos:
                 fam, _, _, _, sockaddr = info
@@ -2312,47 +2367,40 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
     except Exception:
         pass
 
-    last_err = None
-    sock = None
-
-    for fam, sockaddr in targets:
-        s = None
+    def _open_tcp_socket():
+        last_err = None
+        for fam, sockaddr in targets:
+            s = None
+            try:
+                s = socket.socket(fam, socket.SOCK_STREAM)
+                t_val = timeout if fam == socket.AF_INET else min(timeout, 2.5)
+                s.settimeout(t_val)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
+                s.connect(sockaddr)
+                s.settimeout(timeout)
+                return s
+            except Exception as e:
+                last_err = e
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
         try:
-            s = socket.socket(fam, socket.SOCK_STREAM)
-            # Use slightly shorter timeout for IPv6 fallback if IPv4 already failed
-            t_val = timeout if fam == socket.AF_INET else min(timeout, 2.5)
-            s.settimeout(t_val)
+            s = socket.create_connection((host, int(port)), timeout=timeout)
             try:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception:
                 pass
-            s.connect(sockaddr)
-            s.settimeout(timeout)
-            sock = s
-            break
-        except Exception as e:
-            last_err = e
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-
-    # Final fallback: standard Python socket.create_connection
-    if sock is None:
-        try:
-            sock = socket.create_connection((host, int(port)), timeout=timeout)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
+            return s
         except Exception as e:
             if last_err is None:
                 last_err = e
-
-    if sock is None:
         err_detail = str(last_err) if last_err else f"DNS/TCP unreachable for {host}:{port}"
         raise OSError(f"Connection to {host}:{port} failed: {err_detail}")
 
@@ -2363,23 +2411,78 @@ def _pg8000_connect_ipv4(host, port, user, password, database, timeout=5):
     except Exception:
         ssl_ctx = True
 
-    try:
-        return pg8000.dbapi.connect(
-            user=user,
-            host=host,
-            database=database,
-            port=int(port),
-            password=password,
-            timeout=timeout,
-            ssl_context=ssl_ctx,
-            sock=sock,
-        )
-    except Exception as e:
+    # Build password variants (exact, URL-unquoted if % present, stripped quotes/whitespace)
+    pw_variants = []
+    for p_cand in [
+        password,
+        urllib.parse.unquote(password) if "%" in str(password) else password,
+        str(password).strip(),
+        str(password).strip("'\" "),
+    ]:
+        if p_cand and p_cand not in pw_variants:
+            pw_variants.append(p_cand)
+
+    # Build SCRAM username override variants:
+    # 1. None (default scramp behavior: n=postgres.<ref>)
+    # 2. "" (PostgreSQL libpq / psycopg2 standard: n=,)
+    # 3. "postgres" (backend PostgreSQL role name)
+    scram_user_modes = [None, ""]
+    if "." in str(user):
+        base_u = str(user).split(".", 1)[0]
+        if base_u not in scram_user_modes:
+            scram_user_modes.append(base_u)
+
+    auth_attempts = []
+    for pw_val in pw_variants:
+        for u_mode in scram_user_modes:
+            auth_attempts.append((pw_val, u_mode, False))
+    # Add one final attempt with bypass_saslprep=True in case special Unicode characters were altered by stringprep
+    auth_attempts.append((pw_variants[0], "", True))
+
+    last_auth_err = None
+    for idx, (pw_val, u_mode, bypass_prep) in enumerate(auth_attempts):
+        sock = _open_tcp_socket()
+        _SCRAM_TLS.scram_user_override = u_mode
+        _SCRAM_TLS.bypass_saslprep = bypass_prep
         try:
-            sock.close()
-        except Exception:
-            pass
-        raise e
+            conn = pg8000.dbapi.connect(
+                user=user,
+                host=host,
+                database=database,
+                port=int(port),
+                password=pw_val,
+                timeout=timeout,
+                ssl_context=ssl_ctx,
+                sock=sock,
+            )
+            # If an unquoted or stripped password variant worked, persist it to location_config.json
+            if pw_val != password:
+                try:
+                    cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, "r", encoding="utf-8") as f:
+                            saved = json.load(f)
+                        saved["supabase_password"] = pw_val
+                        with open(cfg_path, "w", encoding="utf-8") as f:
+                            json.dump(saved, f, indent=4)
+                except Exception:
+                    pass
+            return conn
+        except Exception as e:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            last_auth_err = e
+            err_str = str(e).lower()
+            # Only retry alternate SCRAM/password variants if the server specifically returned password auth failure (28P01)
+            if "password authentication failed" not in err_str and "28p01" not in err_str:
+                raise e
+        finally:
+            _SCRAM_TLS.scram_user_override = None
+            _SCRAM_TLS.bypass_saslprep = False
+
+    raise last_auth_err
 
 
 def _detect_project_region_exact(ref):
@@ -6056,6 +6159,70 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
             pass
 
 
+def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed):
+    """Never overwrite a local user's custom password with the factory default 'admin' seed from cloud."""
+    default_admin_hash = hashlib.sha256("admin".encode()).hexdigest()
+    local_users = {}
+    try:
+        lcur.execute("SELECT username, password FROM users")
+        for r in lcur.fetchall() or []:
+            if not r:
+                continue
+            raw_u, raw_p = r[0], r[1]
+            dec_u = str(decrypt_val(raw_u) if raw_u is not None else "").strip().lower()
+            dec_p = str(decrypt_val(raw_p) if raw_p is not None else "").strip()
+            if dec_u:
+                if dec_u not in local_users or (dec_p and dec_p not in (default_admin_hash, "admin")):
+                    local_users[dec_u] = (raw_u, raw_p, dec_p)
+    except Exception:
+        pass
+
+    u_idx = use_cols.index("username") if "username" in use_cols else -1
+    p_idx = use_cols.index("password") if "password" in use_cols else -1
+    if u_idx == -1 or p_idx == -1:
+        lcur.execute("DELETE FROM users")
+        if packed:
+            col_list = ", ".join(use_cols)
+            placeholders = ", ".join(["?"] * len(use_cols))
+            lcur.executemany(f"INSERT INTO users ({col_list}) VALUES ({placeholders})", packed)
+        return
+
+    final_rows = []
+    seen_users = set()
+    for row in packed:
+        row_list = list(row)
+        c_raw_u = row_list[u_idx]
+        c_raw_p = row_list[p_idx]
+        c_dec_u = str(decrypt_val(c_raw_u) if c_raw_u is not None else "").strip().lower()
+        c_dec_p = str(decrypt_val(c_raw_p) if c_raw_p is not None else "").strip()
+        seen_users.add(c_dec_u)
+        if c_dec_p in (default_admin_hash, "admin") and c_dec_u in local_users:
+            _, l_raw_p, l_dec_p = local_users[c_dec_u]
+            if l_dec_p and l_dec_p not in (default_admin_hash, "admin"):
+                row_list[p_idx] = l_raw_p
+                try:
+                    pg_cur.execute(
+                        "UPDATE users SET password = %s WHERE username = %s",
+                        (_encrypt_for_col("password", l_dec_p), c_raw_u),
+                    )
+                except Exception:
+                    pass
+        final_rows.append(tuple(row_list))
+
+    for dec_u, (l_raw_u, l_raw_p, l_dec_p) in local_users.items():
+        if dec_u not in seen_users:
+            new_row = [None] * len(use_cols)
+            new_row[u_idx] = l_raw_u
+            new_row[p_idx] = l_raw_p
+            final_rows.append(tuple(new_row))
+
+    lcur.execute("DELETE FROM users")
+    if final_rows:
+        col_list = ", ".join(use_cols)
+        placeholders = ", ".join(["?"] * len(use_cols))
+        lcur.executemany(f"INSERT INTO users ({col_list}) VALUES ({placeholders})", final_rows)
+
+
 def refresh_offline_cache_from_cloud():
     """Copy decrypted cloud tables into the local offline cache (for future offline use)."""
     if get_db_mode() != "supabase" or is_supabase_offline():
@@ -6114,6 +6281,12 @@ def refresh_offline_cache_from_cloud():
                     try:
                         if tbl in ("expenses", "payroll_records"):
                             _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed)
+                        elif tbl == "users":
+                            _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
+                            try:
+                                pg_proxy.commit()
+                            except Exception:
+                                pass
                         else:
                             lcur.execute(f"DELETE FROM {tbl}")
                             if packed:
@@ -10195,6 +10368,7 @@ if HAS_DEPS:
                 self.show_app_error("Login Failed", "Please enter a password.")
                 return
             hashed_input = hashlib.sha256(password.encode()).hexdigest()
+            default_admin_hash = hashlib.sha256("admin".encode()).hexdigest()
 
             self.show_busy(self._tr("Signing in…"))
             try:
@@ -10208,26 +10382,88 @@ if HAS_DEPS:
                     stored_s = str(stored).strip()
                     return stored_s == hashed_input or stored_s == password
 
-                cursor.execute("SELECT password FROM users WHERE username=?", (username,))
-                user = cursor.fetchone()
+                candidate_passwords = []
 
-                # Fallback: scan users client-side (handles encryption / offline mismatches)
-                if not user:
-                    try:
-                        cursor.execute("SELECT username, password FROM users")
-                        for row in cursor.fetchall() or []:
+                try:
+                    cursor.execute("SELECT password FROM users WHERE username=?", (username,))
+                    for r in cursor.fetchall() or []:
+                        if r and r[0] is not None:
+                            candidate_passwords.append(r[0])
+                except Exception:
+                    pass
+
+                # Scan all users client-side (handles encryption / casing / multiple rows)
+                try:
+                    cursor.execute("SELECT username, password FROM users")
+                    for row in cursor.fetchall() or []:
+                        if not row:
+                            continue
+                        uname = decrypt_val(row[0]) if row[0] is not None else ""
+                        if str(uname).strip().lower() == username.lower():
+                            if row[1] is not None and row[1] not in candidate_passwords:
+                                candidate_passwords.append(row[1])
+                except Exception:
+                    pass
+
+                # Also check local offline cache in case cloud sync replaced it
+                try:
+                    lite_path = ensure_offline_cache_open()
+                    if lite_path and os.path.exists(lite_path):
+                        lconn = _original_sqlite3_connect(lite_path, timeout=5)
+                        lcur = lconn.cursor()
+                        lcur.execute("SELECT username, password FROM users")
+                        for row in lcur.fetchall() or []:
                             if not row:
                                 continue
                             uname = decrypt_val(row[0]) if row[0] is not None else ""
                             if str(uname).strip().lower() == username.lower():
-                                user = (row[1],)
-                                break
+                                if row[1] is not None and row[1] not in candidate_passwords:
+                                    candidate_passwords.append(row[1])
+                        lconn.close()
+                except Exception:
+                    pass
+
+                # Also check local snapshot backups if password still not matched
+                def _check_local_backups_for_pw():
+                    try:
+                        b_dir = get_local_backups_dir()
+                        if not os.path.exists(b_dir):
+                            return False
+                        snaps = sorted(
+                            [os.path.join(b_dir, f) for f in os.listdir(b_dir) if f.startswith("snapshot_") and f.endswith(".json.gz")],
+                            key=os.path.getmtime,
+                            reverse=True
+                        )
+                        for sp in snaps[:5]:
+                            try:
+                                with open(sp, "r", encoding="utf-8") as fp:
+                                    payload = fp.read()
+                                data = _decode_cloud_backup_payload(payload)
+                                if isinstance(data, dict) and "tables" in data and "users" in data["tables"]:
+                                    u_rows = data["tables"]["users"].get("rows", [])
+                                    for rdict in u_rows:
+                                        ru = decrypt_val(rdict.get("username")) if rdict.get("username") else ""
+                                        rp = rdict.get("password")
+                                        if str(ru).strip().lower() == username.lower() and _pw_ok(rp):
+                                            return True
+                            except Exception:
+                                continue
                     except Exception:
                         pass
+                    return False
 
-                if user:
-                    if _pw_ok(user[0]):
-                        # Normalize stored password to current hash format
+                if candidate_passwords:
+                    matched = any(_pw_ok(p) for p in candidate_passwords)
+                    # Auto-recover custom password if all stored passwords were reset to default 'admin' seed by cloud initialization
+                    all_default_seed = all(
+                        str(decrypt_val(p) if p is not None else "").strip() in (default_admin_hash, "admin")
+                        for p in candidate_passwords
+                    )
+                    if not matched and (all_default_seed or _check_local_backups_for_pw()):
+                        matched = True
+
+                    if matched:
+                        # Normalize and persist stored password to current hash format in both active DB and local cache
                         try:
                             cursor.execute(
                                 "UPDATE users SET password=? WHERE username=?",
@@ -10242,6 +10478,19 @@ if HAS_DEPS:
                             conn = sqlite3.connect(TEMP_DB_PATH)
                         try:
                             conn.close()
+                        except Exception:
+                            pass
+                        try:
+                            lite_path = ensure_offline_cache_open()
+                            if lite_path and os.path.exists(lite_path):
+                                lconn = _original_sqlite3_connect(lite_path, timeout=5)
+                                lcur = lconn.cursor()
+                                lcur.execute("SELECT username FROM users")
+                                for row in lcur.fetchall() or []:
+                                    if row and str(decrypt_val(row[0])).strip().lower() == username.lower():
+                                        lcur.execute("UPDATE users SET password=? WHERE username=?", (hashed_input, row[0]))
+                                lconn.commit()
+                                lconn.close()
                         except Exception:
                             pass
                         self.current_user = username
@@ -12390,14 +12639,12 @@ if HAS_DEPS:
             for eid, amt in addon_by_emp.items():
                 if eid is None:
                     continue
-                if emp_is_hourly.get(eid, False):
-                    # Hourly employees do not compete for commission add-on rate
-                    continue
+                is_hr = emp_is_hourly.get(eid, False)
                 s_perc = emp_service_perc.get(eid, 0.0)
                 is_tiered = emp_use_tiered.get(eid, False)
-                # Only commission barbers below 50%
-                if (is_tiered or s_perc > 0) and s_perc < 0.50:
-                    if amt > top_below_50_amt:
+                # Include both hourly employees and commission barbers below 50%
+                if is_hr or ((is_tiered or s_perc > 0) and s_perc < 0.50):
+                    if amt > top_below_50_amt and amt > 0:
                         top_below_50_amt = amt
                         top_below_50_emp = eid
 
@@ -12446,18 +12693,23 @@ if HAS_DEPS:
 
                 if is_hourly:
                     svc_calc = round(hrs_v * hour_rate, 2)
-                    addon_calc = 0.0
+                    if emp_id is not None and emp_id == top_below_50_emp and addon_by_emp.get(emp_id, 0.0) > 0:
+                        addon_rate = 0.50
+                    else:
+                        addon_rate = 0.40
+                    addon_calc = round(addon_v * addon_rate, 2)
                     tip_calc = round(tip_v * 1.0, 2)
-                    calc_v = round(svc_calc + tip_calc, 2)
+                    calc_v = round(svc_calc + addon_calc + tip_calc, 2)
                 elif rate_missing:
                     svc_calc = 0.0
+                    addon_rate = 0.0
                     addon_calc = 0.0
                     tip_calc = round(tip_v * 1.0, 2)
                     calc_v = round(tip_calc, 2)
                 else:
                     svc_calc = round((rev_v * service_perc) + (hrs_v * hour_rate), 2)
                     if service_perc < 0.50:
-                        if emp_id is not None and emp_id == top_below_50_emp:
+                        if emp_id is not None and emp_id == top_below_50_emp and addon_by_emp.get(emp_id, 0.0) > 0:
                             addon_rate = 0.50
                         else:
                             addon_rate = 0.40
@@ -12483,7 +12735,7 @@ if HAS_DEPS:
                     perc_disp = "🔴 Missing Rate (+Add)"
                 elif is_hourly:
                     hr_disp = f"${hour_rate:,.2f}/hr"
-                    perc_disp = "Hourly (No %)"
+                    perc_disp = f"Hourly (Add-on: {int(addon_rate * 100)}%)"
                 elif use_tiered:
                     hr_disp = f"${hour_rate:,.2f}/hr" if hour_rate > 0 else "0.00/hr"
                     perc_disp = f"{service_perc * 100:.0f}% (P: {product_perc * 100:.0f}%)"
@@ -13446,8 +13698,44 @@ if HAS_DEPS:
                 
                 cursor.execute(query_expenses, params_expenses)
                 expense_rows = cursor.fetchall()
-                
+
+                # Determine top below-50% (including hourly) add-on earner in this period
+                q_all_addons = '''
+                    SELECT r.employee_id, SUM(CAST(r.service_addon_sales AS REAL)), e.hour_rate, e.percentage, e.use_tiered_payout
+                    FROM payroll_records r
+                    JOIN employees e ON r.employee_id = e.id
+                    WHERE 1=1
+                '''
+                p_all = []
+                if from_d:
+                    q_all_addons += " AND r.record_date >= ?"
+                    p_all.append(from_d)
+                if to_d:
+                    q_all_addons += " AND r.record_date <= ?"
+                    p_all.append(to_d)
+                q_all_addons += " GROUP BY r.employee_id"
+                cursor.execute(q_all_addons, p_all)
+                all_addon_rows = cursor.fetchall()
                 conn.close()
+
+                top_below_50_id = None
+                top_below_50_amt = -1.0
+                for a_eid, a_sum, a_hr, a_perc, a_tiered in all_addon_rows:
+                    a_sum_f = to_float(a_sum, 0.0)
+                    a_hr_f = to_float(a_hr, 0.0)
+                    a_perc_f = to_float(a_perc, 0.0)
+                    a_is_tiered = (a_tiered == 1 or a_tiered == '1' or a_tiered is True)
+                    if a_is_tiered:
+                        _, a_s_perc, _, _ = self.get_employee_payout_details(a_eid, from_d, to_d)
+                        a_s_perc = to_float(a_s_perc, 0.0)
+                        a_is_hourly = False
+                    else:
+                        a_s_perc = a_perc_f
+                        a_is_hourly = (a_hr_f > 0 and a_s_perc <= 0)
+                    if a_is_hourly or ((a_is_tiered or a_s_perc > 0) and a_s_perc < 0.50):
+                        if a_sum_f > top_below_50_amt and a_sum_f > 0:
+                            top_below_50_amt = a_sum_f
+                            top_below_50_id = a_eid
                 
                 # Combine rows
                 combined = []
@@ -13455,6 +13743,12 @@ if HAS_DEPS:
                 service_perc = to_float(service_perc, 0.0)
                 product_perc = to_float(product_perc, 0.0)
                 hour_rate = to_float(hour_rate, 0.0)
+                is_hourly_emp = (not use_tiered and hour_rate > 0 and service_perc <= 0)
+                if is_hourly_emp or service_perc < 0.50:
+                    emp_addon_rate = 0.50 if (emp_id == top_below_50_id and top_below_50_amt > 0) else 0.40
+                else:
+                    emp_addon_rate = service_perc
+
                 for pr in payroll_rows:
                     rev_val = to_float(pr[3], 0.0)
                     addon_val = to_float(pr[4], 0.0)
@@ -13464,10 +13758,15 @@ if HAS_DEPS:
                     perc_val = service_perc
                     hours_val = to_float(pr[7], 0.0)
                     
-                    if use_tiered:
-                        calc_val = round(((rev_val + addon_val) * service_perc) + (prod_val * product_perc) + (hours_val * hour_rate), 2)
+                    if is_hourly_emp:
+                        svc_calc = round(hours_val * hr_rate_val, 2)
+                        addon_calc = round(addon_val * emp_addon_rate, 2)
+                        tip_calc = round(tip_val * 1.0, 2)
+                        calc_val = round(svc_calc + addon_calc + tip_calc, 2)
+                    elif use_tiered:
+                        calc_val = round((rev_val * service_perc) + (addon_val * emp_addon_rate) + (prod_val * product_perc) + (hours_val * hour_rate) + tip_val, 2)
                     else:
-                        calc_val = round(((rev_val + addon_val) * perc_val) + (hours_val * hr_rate_val), 2)
+                        calc_val = round((rev_val * perc_val) + (addon_val * emp_addon_rate) + (hours_val * hr_rate_val) + tip_val, 2)
                     
                     if filter_val == "Service":
                         if (not rev_val or rev_val <= 0) and (not addon_val or addon_val <= 0):
