@@ -564,12 +564,14 @@ TRANSLATIONS = {
     "Filter by user:": "تصفية حسب المستخدم:",
     "All users": "كل المستخدمين",
     "Cloud backups": "النسخ الاحتياطي السحابي",
-    "Two backups are saved in Supabase every day (morning and afternoon).": "يتم حفظ نسختين احتياطيتين في Supabase كل يوم (صباحاً ومساءً).",
+    "Two backups are saved in DB every day (morning and afternoon).": "يتم حفظ نسختين احتياطيتين في قاعدة البيانات كل يوم (صباحاً ومساءً).",
+    "Two backups are saved in Supabase every day (morning and afternoon).": "يتم حفظ نسختين احتياطيتين في قاعدة البيانات كل يوم (صباحاً ومساءً).",
     "📥 Backup now to cloud": "📥 نسخ احتياطي إلى السحابة الآن",
     "Restore selected backup": "استعادة النسخة المحددة",
     "Database Backups": "النسخ الاحتياطي لقاعدة البيانات",
     "📥 Generate Immediate Backup Copy": "📥 إنشاء نسخة احتياطية فورية",
-    "Version Reversion History (Supabase Mode Only)": "سجل إرجاع الإصدارات (وضع Supabase فقط)",
+    "Version Reversion History (DB Mode Only)": "سجل إرجاع الإصدارات (وضع قاعدة البيانات فقط)",
+    "Version Reversion History (Supabase Mode Only)": "سجل إرجاع الإصدارات (وضع قاعدة البيانات فقط)",
     "🔄 Refresh Logs": "🔄 تحديث السجل",
     "⏪ Revert selected revision": "⏪ استعادة التعديل المحدد",
     "Date": "التاريخ",
@@ -831,14 +833,20 @@ TRANSLATIONS = {
     "Missing Rate": "النسبة غير محددة",
     " 🚨 CRITICAL UPDATE REQUIRED ": " 🚨 تحديث إجباري مطلوب ",
     " 🚨 RESTART REQUIRED TO ACTIVATE UPDATE ": " 🚨 يجب إعادة التشغيل لتفعيل التحديث ",
-    "🛡️ Central Device Version Enforcement (Supabase)": "🛡️ فرض إصدار موحد لجميع الأجهزة (Supabase)",
+    "🛡️ Central Device Version Enforcement (Supabase)": "🛡️ فرض إصدار موحد لجميع الأجهزة (DB)",
+    "🛡️ Central Device Version Enforcement (DB)": "🛡️ فرض إصدار موحد لجميع الأجهزة (DB)",
+    "☁️ Cloud Database (DB)": "☁️ قاعدة البيانات السحابية (DB)",
+    "📊 Cloud DB Storage (1 GB Free Tier)": "📊 مساحة تخزين قاعدة البيانات (1 جيجابايت)",
+    "DB Host / Endpoint:": "عنوان مضيف قاعدة البيانات (DB Host):",
+    "📁 Daily Backups (Local & Cloud DB)": "📁 النسخ الاحتياطي اليومي (محلي وسحابي DB)",
+    "📋 DB Update & Recovery Audit History": "📋 سجل تحديثات واستعادة قاعدة البيانات (DB)",
     "Enforce Minimum Version:": "فرض الحد الأدنى للإصدار:",
     "🔒 Enforce on All Devices": "🔒 فرض التحديث على جميع الأجهزة"
 }
 
 # --- APP CONFIGURATION ---
-APP_TITLE = "Highend Payroll App - Custom Made ✂"
-APP_LOGO_TITLE = "★ HIGHEND PAYROLL ★"
+APP_TITLE = "💈 BarberShop Pro — Shop & Payroll Suite"
+APP_LOGO_TITLE = "BARBERSHOP PRO"
 APP_GEOMETRY = "1250x900"
 APP_THEME = "darkly"
 
@@ -846,7 +854,7 @@ APP_THEME = "darkly"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.24"
+APP_VERSION = "2.5.26"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -855,6 +863,45 @@ DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
 # If a running app is older than MIN_REQUIRED_VERSION (or central Supabase config),
 # a mandatory update is enforced to prevent communication or schema errors.
 MIN_REQUIRED_VERSION = "2.5.15"
+
+_LAST_SCROLL_EVENT_KEY = [None, None]
+
+
+def _was_event_scrolled(event):
+    key = (getattr(event, "serial", None), getattr(event, "time", None))
+    if key[0] is not None and key[1] is not None and key == tuple(_LAST_SCROLL_EVENT_KEY):
+        return True
+    return False
+
+
+def _mark_event_scrolled(event):
+    serial = getattr(event, "serial", None)
+    ev_time = getattr(event, "time", None)
+    if serial is not None and ev_time is not None:
+        _LAST_SCROLL_EVENT_KEY[0] = serial
+        _LAST_SCROLL_EVENT_KEY[1] = ev_time
+
+
+def _scroll_delta(event):
+    """Universal mousewheel & macOS two-finger touchpad scroll calculator.
+    - Respects macOS System 'Scroll direction: Natural' automatically.
+    - Preserves small integer deltas on macOS (1, -1, 2, -2...) instead of zeroing them with / 120.
+    """
+    d = getattr(event, "delta", 0)
+    if d:
+        if platform.system() == "Darwin":
+            step = int(-1 * d)
+            return step if step != 0 else (-1 if d > 0 else 1)
+        else:
+            step = int(-1 * (d / 120))
+            return step if step != 0 else (-1 if d > 0 else 1)
+    num = getattr(event, "num", 0)
+    if num == 4:
+        return -1
+    elif num == 5:
+        return 1
+    return 0
+
 
 def get_default_app_dir():
     import platform
@@ -1879,33 +1926,219 @@ def _extract_supabase_ref(host, user):
     u = str(user or "").strip()
     if "." in u and u.startswith("postgres."):
         ref = u.split(".", 1)[1].strip()
-    if not ref and "pooler.supabase.com" not in h and ".supabase.co" in h:
-        clean_h = h.replace("https://", "").replace("http://", "").replace("db.", "").strip()
-        ref = clean_h.split(".supabase.co")[0].strip()
+    if not ref:
+        for dom in (".supabase.co", ".supabase.com"):
+            if dom in h and "pooler.supabase.com" not in h:
+                clean_h = h.replace("https://", "").replace("http://", "").replace("db.", "").strip()
+                ref = clean_h.split(dom)[0].strip()
+                break
+    if not ref:
+        try:
+            cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                saved_u = str(saved.get("supabase_user", "")).strip()
+                saved_h = str(saved.get("supabase_host", "")).strip().lower()
+                if "." in saved_u and saved_u.startswith("postgres."):
+                    ref = saved_u.split(".", 1)[1].strip()
+                elif ".supabase.co" in saved_h and "pooler" not in saved_h:
+                    ref = saved_h.replace("https://", "").replace("http://", "").replace("db.", "").split(".supabase.co")[0].strip()
+        except Exception:
+            pass
     return ref
+
+
+def _resolve_ipv4_addresses(host, port):
+    """Resolve hostname strictly to IPv4 (AF_INET) addresses.
+    1. Tries local OS DNS (getaddrinfo with AF_INET).
+    2. If local OS DNS returns no IPv4 (e.g. IPv6-only resolver or mDNSResponder cache),
+       queries DNS-over-HTTPS (Google 8.8.8.8 / Cloudflare 1.1.1.1) for 'A' records.
+    """
+    h = str(host or "").strip()
+    if not h:
+        return []
+    try:
+        socket.inet_aton(h)
+        return [h]
+    except Exception:
+        pass
+
+    ipv4_list = []
+    try:
+        infos = socket.getaddrinfo(h, int(port), socket.AF_INET, socket.SOCK_STREAM)
+        for info in infos:
+            ip = info[4][0]
+            if ip and ip not in ipv4_list:
+                ipv4_list.append(ip)
+    except Exception:
+        pass
+
+    if ipv4_list:
+        return ipv4_list
+
+    for doh_url in (
+        f"https://dns.google/resolve?name={h}&type=A",
+        f"https://cloudflare-dns.com/dns-query?name={h}&type=A",
+    ):
+        try:
+            req = urllib.request.Request(doh_url, headers={"Accept": "application/dns-json"})
+            with _urlopen_with_fallback(req, timeout=2.5) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                for ans in data.get("Answer", []) or []:
+                    if ans.get("type") == 1:  # IPv4 A record
+                        ip = str(ans.get("data", "")).strip()
+                        if ip and ip not in ipv4_list:
+                            ipv4_list.append(ip)
+            if ipv4_list:
+                return ipv4_list
+        except Exception:
+            pass
+
+    return ipv4_list
+
+
+def _patch_pg8000_for_ipv4_and_poolers():
+    """Disables SCRAM-SHA-256-PLUS channel binding in pg8000/scramp so that TLS-terminating
+    connection poolers (ports 6543 & 5432) authenticate cleanly via standard SCRAM-SHA-256.
+    """
+    try:
+        import pg8000.core
+        import scramp
+        pg8000.core.scramp.make_channel_binding = lambda *a, **kw: None
+        scramp.make_channel_binding = lambda *a, **kw: None
+    except Exception:
+        pass
+
+
+def _pg8000_connect_ipv4(host, port, user, password, database, timeout=6):
+    """Connects to PostgreSQL using an explicit IPv4 (AF_INET) TCP socket and unverified SSL context."""
+    import pg8000.dbapi
+    _patch_pg8000_for_ipv4_and_poolers()
+
+    ipv4_addrs = _resolve_ipv4_addresses(host, port)
+    if not ipv4_addrs:
+        raise OSError(f"Host '{host}' has no IPv4 address (IPv6-only endpoint).")
+
+    last_sock_err = None
+    sock = None
+    for ip in ipv4_addrs:
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+            s.connect((ip, int(port)))
+            sock = s
+            break
+        except Exception as e:
+            last_sock_err = e
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+    if sock is None:
+        err_detail = str(last_sock_err) if last_sock_err else "TCP handshake failed"
+        raise OSError(f"IPv4 connection to {host} ({ipv4_addrs[0]}:{port}) failed: {err_detail}")
+
+    try:
+        ssl_ctx = ssl._create_unverified_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+    except Exception:
+        ssl_ctx = True
+
+    try:
+        conn = pg8000.dbapi.connect(
+            user=user,
+            host=host,
+            database=database,
+            port=int(port),
+            password=password,
+            timeout=timeout,
+            ssl_context=ssl_ctx,
+            sock=sock,
+        )
+        return conn
+    except Exception as e:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        raise e
+
+
+def _detect_project_region_via_cf(ref):
+    """Detects likely AWS region from Cloudflare cf-ray header on https://{ref}.supabase.co."""
+    if not ref:
+        return None
+    iata_to_region = {
+        "IAD": "us-east-1", "DCA": "us-east-1", "ATL": "us-east-1", "MIA": "us-east-1", "BOS": "us-east-1", "EWR": "us-east-1", "JFK": "us-east-1",
+        "CMH": "us-east-2", "ORD": "us-east-2", "DTW": "us-east-2", "IND": "us-east-2", "MSP": "us-east-2", "DFW": "us-east-1",
+        "SJC": "us-west-1", "SFO": "us-west-1", "LAX": "us-west-1", "PHX": "us-west-1", "DEN": "us-west-2",
+        "SEA": "us-west-2", "PDX": "us-west-2",
+        "YYZ": "ca-central-1", "YUL": "ca-central-1", "YVR": "ca-central-1",
+        "FRA": "eu-central-1", "MUC": "eu-central-1", "VIE": "eu-central-1", "WAW": "eu-central-1",
+        "ZRH": "eu-central-2",
+        "DUB": "eu-west-1", "AMS": "eu-west-1",
+        "LHR": "eu-west-2", "MAN": "eu-west-2",
+        "CDG": "eu-west-3", "MRS": "eu-west-3",
+        "ARN": "eu-north-1", "HEL": "eu-north-1", "CPH": "eu-north-1",
+        "SIN": "ap-southeast-1", "BKK": "ap-southeast-1", "CGK": "ap-southeast-1",
+        "SYD": "ap-southeast-2", "MEL": "ap-southeast-2", "AKL": "ap-southeast-2",
+        "NRT": "ap-northeast-1", "HND": "ap-northeast-1", "KIX": "ap-northeast-1",
+        "ICN": "ap-northeast-2",
+        "BOM": "ap-south-1", "DEL": "ap-south-1", "MAA": "ap-south-1", "BLR": "ap-south-1",
+        "GRU": "sa-east-1", "GIG": "sa-east-1",
+    }
+    try:
+        req = urllib.request.Request(f"https://{ref}.supabase.co/rest/v1/", method="HEAD")
+        headers = None
+        try:
+            with _urlopen_with_fallback(req, timeout=2.0) as resp:
+                headers = resp.headers
+        except urllib.error.HTTPError as he:
+            headers = he.headers
+        if headers:
+            cf_ray = str(headers.get("cf-ray", "") or "").upper()
+            if "-" in cf_ray:
+                iata = cf_ray.split("-")[-1].strip()
+                if iata in iata_to_region:
+                    return iata_to_region[iata]
+    except Exception:
+        pass
+    return None
+
 
 def _connect_supabase_with_auto_pooler(host, port, user, password, database, timeout=12):
     """
-    Connects to Supabase via pg8000 with automatic IPv4 pooler & port 6543 fallback.
-    If port 5432 is blocked by the user's ISP/Wi-Fi or host is IPv6-only (db.*.supabase.co),
-    automatically tests port 6543 and candidate AWS pooler regions in parallel.
+    Connects to PostgreSQL Cloud DB via pg8000 using pure IPv4 (AF_INET) sockets.
+    Automatically switches between ports 6543 and 5432 and discovers IPv4 pooler
+    endpoints (aws-0-* / aws-1-*) if the direct host is IPv6-only on macOS DHCP WiFi.
     Returns (conn, active_host, active_port, active_user).
     """
     import pg8000.dbapi, threading
     ref = _extract_supabase_ref(host, user)
     port_int = int(port or 5432)
+    alt_port = 6543 if port_int == 5432 else 5432
 
-    primary_attempts = [(host, port_int, user)]
-    if "pooler.supabase.com" in str(host).lower() and port_int == 5432:
-        primary_attempts.append((host, 6543, user))
-    elif "pooler.supabase.com" in str(host).lower() and port_int == 6543:
-        primary_attempts.append((host, 5432, user))
+    primary_attempts = []
+    # If user is connecting to pooler host with bare 'postgres' user and we know ref, fix user
+    u_primary = f"postgres.{ref}" if ("pooler" in str(host).lower() and user == "postgres" and ref) else user
+    primary_attempts.append((host, port_int, u_primary))
+    primary_attempts.append((host, alt_port, u_primary))
 
     first_err = None
     for c_host, c_port, c_user in primary_attempts:
         try:
-            t_out = min(timeout, 5) if (len(primary_attempts) > 1 or ref) else timeout
-            conn = pg8000.dbapi.connect(
+            t_out = min(timeout, 5) if ref else min(timeout, 7)
+            conn = _pg8000_connect_ipv4(
                 host=c_host,
                 port=c_port,
                 user=c_user,
@@ -1923,16 +2156,29 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                 first_err = e
             msg = str(e).lower()
             if "password authentication failed" in msg:
-                raise e
+                raise RuntimeError(f"Connected to DB host {c_host}:{c_port}, but password authentication failed. Please check your password.") from e
+            if "tenant or user not found" in msg and not ref:
+                raise RuntimeError(
+                    f"Connected to pooler {c_host}:{c_port}, but 'Tenant or user not found'.\n"
+                    "When using a pooler host, your DB User must include your Project ID: postgres.YOUR_PROJECT_ID"
+                ) from e
 
     if ref:
-        candidate_regions = [
-            "us-east-2", "us-east-1", "us-west-1", "us-west-2",
+        all_regions = [
+            "us-east-1", "us-east-2", "us-west-1", "us-west-2",
             "ca-central-1", "eu-central-1", "eu-central-2",
             "eu-west-1", "eu-west-2", "eu-west-3", "eu-north-1",
             "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
             "ap-northeast-2", "ap-south-1", "sa-east-1"
         ]
+        hint_reg = _detect_project_region_via_cf(ref)
+        ordered_regions = []
+        if hint_reg and hint_reg in all_regions:
+            ordered_regions.append(hint_reg)
+        for r in all_regions:
+            if r not in ordered_regions:
+                ordered_regions.append(r)
+
         pooler_user = f"postgres.{ref}"
         found = {"conn": None, "host": None, "port": None, "user": None, "auth_err": None}
         lock = threading.Lock()
@@ -1942,13 +2188,13 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
             if done_evt.is_set():
                 return
             try:
-                c = pg8000.dbapi.connect(
+                c = _pg8000_connect_ipv4(
                     host=p_host,
                     port=p_port,
                     user=pooler_user,
                     password=password,
                     database=database,
-                    timeout=5,
+                    timeout=4.5,
                 )
                 try:
                     c.commit()
@@ -1968,18 +2214,34 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
                             pass
             except Exception as pe:
                 p_msg = str(pe).lower()
-                if "password authentication failed" in p_msg or "scram" in p_msg:
+                if "password authentication failed" in p_msg:
                     with lock:
-                        found["auth_err"] = pe
+                        found["auth_err"] = RuntimeError(
+                            f"Discovered IPv4 DB Pooler ({p_host}:{p_port}), but Password Authentication Failed. Please verify your DB password."
+                        )
                         done_evt.set()
 
-        for p_port in (6543, 5432):
-            for reg in candidate_regions:
-                p_host = f"aws-0-{reg}.pooler.supabase.com"
-                t = threading.Thread(target=_probe, args=(p_host, p_port), daemon=True)
-                t.start()
+        # Build candidate (host, port) list prioritizing detected region + aws-0 / aws-1
+        candidates = []
+        for reg in ordered_regions:
+            for cluster_prefix in ("aws-0", "aws-1"):
+                for p_port in (6543, 5432):
+                    candidates.append((f"{cluster_prefix}-{reg}.pooler.supabase.com", p_port))
 
-        done_evt.wait(timeout=6.0)
+        # Run in fast batches of 10 threads to avoid macOS mDNSResponder throttling
+        batch_size = 10
+        for i in range(0, len(candidates), batch_size):
+            if done_evt.is_set():
+                break
+            batch = candidates[i:i + batch_size]
+            threads = []
+            for p_host, p_port in batch:
+                t = threading.Thread(target=_probe, args=(p_host, p_port), daemon=True)
+                threads.append(t)
+                t.start()
+            # Wait up to 2.5s for this batch (or immediate wake if found)
+            done_evt.wait(timeout=2.5 if i == 0 else 1.8)
+
         if found["conn"] is not None:
             try:
                 cfg_path = os.path.join(get_default_app_dir(), "location_config.json")
@@ -1997,7 +2259,7 @@ def _connect_supabase_with_auto_pooler(host, port, user, password, database, tim
         if found["auth_err"] is not None:
             raise found["auth_err"]
 
-    raise first_err
+    raise RuntimeError(f"Could not connect to DB ({host}:{port_int}): {first_err}")
 
 def _open_supabase_pg_conn(timeout=15):
     try:
@@ -5606,7 +5868,7 @@ def db_connect(database, *args, **kwargs):
                             pass
                         return OfflineTrackingConnection(conn)
                     raise sqlite3.OperationalError(
-                        f"Failed to connect to Supabase: {str(e)}"
+                        f"Failed to connect to DB: {str(e)}"
                     )
     if database is None:
         database = ensure_offline_cache_open()
@@ -7151,7 +7413,7 @@ def upload_local_database_to_supabase(progress_cb=None):
 
     try:
         if progress_cb:
-            progress_cb("Connecting to Supabase...")
+            progress_cb("Connecting to DB...")
         db_conn = _open_supabase_pg_conn(timeout=15)
         
         # 1. Ensure all native tables and columns exist in Postgres
@@ -8024,12 +8286,10 @@ if HAS_DEPS:
             self.is_logged_in = False
             self.last_activity_time = time.time()
             
-            self.bind_all("<Key>", self.reset_idle_timer)
-            self.bind_all("<Button>", self.reset_idle_timer)
-            self.bind_all("<Motion>", self.reset_idle_timer)
-            self.bind_all("<MouseWheel>", self.reset_idle_timer)
-            self.bind_all("<Button-4>", self.reset_idle_timer)
-            self.bind_all("<Button-5>", self.reset_idle_timer)
+            self.bind_all("<Key>", self.reset_idle_timer, add="+")
+            self.bind_all("<Button>", self.reset_idle_timer, add="+")
+            self.bind_all("<Motion>", self.reset_idle_timer, add="+")
+            self._install_global_touchpad_scroll()
             
             self.after(5000, self.check_idle_time)
 
@@ -8056,18 +8316,188 @@ if HAS_DEPS:
 
             self.show_startup_splash()
 
+        def _install_global_touchpad_scroll(self):
+            """Global two-finger touchpad & mousewheel scroll dispatcher for macOS, Windows, and Linux.
+            Follows macOS System 'Scroll direction: Natural' preference automatically and bubbles
+            events from child widgets (labels, frames, buttons, inputs) up to their parent scrollable
+            Canvas, Treeview, or Listbox.
+            """
+            def _dispatch_scroll(event, force_horiz=False):
+                try:
+                    self.reset_idle_timer(event)
+                except Exception:
+                    pass
+                if _was_event_scrolled(event):
+                    return
+                delta = _scroll_delta(event)
+                if not delta:
+                    return
+
+                is_horiz = force_horiz or bool(getattr(event, "state", 0) & 0x0001)
+
+                w = getattr(event, "widget", None)
+                if not w or isinstance(w, str):
+                    try:
+                        w = self.winfo_containing(event.x_root, event.y_root)
+                    except Exception:
+                        w = None
+                if not w:
+                    return
+
+                curr = w
+                visited = set()
+                while curr is not None and curr not in visited:
+                    visited.add(curr)
+                    try:
+                        cls_name = curr.winfo_class()
+                    except Exception:
+                        cls_name = ""
+
+                    # Skip input controls so scrolling over a form scrolls the parent canvas
+                    if cls_name in ("Entry", "TEntry", "Spinbox", "TSpinbox", "TCombobox", "Combobox"):
+                        curr = getattr(curr, "master", None)
+                        continue
+
+                    # Synchronized main calendar tables (tree_frozen + tree_calendar)
+                    tf = getattr(self, "tree_frozen", None)
+                    tc = getattr(self, "tree_calendar", None)
+                    if curr is tf or curr is tc:
+                        try:
+                            if is_horiz and tc and self._widget_alive(tc):
+                                tc.xview_scroll(delta, "units")
+                                _mark_event_scrolled(event)
+                                return "break"
+                            elif not is_horiz:
+                                if tf and self._widget_alive(tf):
+                                    tf.yview_scroll(delta, "units")
+                                if tc and self._widget_alive(tc):
+                                    tc.yview_scroll(delta, "units")
+                                _mark_event_scrolled(event)
+                                return "break"
+                        except Exception:
+                            pass
+
+                    # Check if curr is a scrollable container (Canvas, Treeview, Listbox, Text)
+                    if is_horiz:
+                        if hasattr(curr, "xview_scroll") and hasattr(curr, "xview"):
+                            try:
+                                xv = curr.xview()
+                                if xv and tuple(xv) != (0.0, 1.0):
+                                    curr.xview_scroll(delta, "units")
+                                    _mark_event_scrolled(event)
+                                    return "break"
+                            except Exception:
+                                pass
+                    else:
+                        if hasattr(curr, "yview_scroll") and hasattr(curr, "yview"):
+                            try:
+                                yv = curr.yview()
+                                if yv and tuple(yv) != (0.0, 1.0):
+                                    curr.yview_scroll(delta, "units")
+                                    _mark_event_scrolled(event)
+                                    return "break"
+                            except Exception:
+                                pass
+
+                    curr = getattr(curr, "master", None)
+
+            self.bind_all("<MouseWheel>", lambda e: _dispatch_scroll(e, False), add="+")
+            self.bind_all("<Shift-MouseWheel>", lambda e: _dispatch_scroll(e, True), add="+")
+            self.bind_all("<Button-4>", lambda e: _dispatch_scroll(e, False), add="+")
+            self.bind_all("<Button-5>", lambda e: _dispatch_scroll(e, False), add="+")
+
+            # Prevent comboboxes/spinboxes from hijacking scroll gestures when scrolling down forms
+            for cls_tag in ("TCombobox", "Combobox", "TSpinbox", "Spinbox"):
+                try:
+                    self.bind_class(cls_tag, "<MouseWheel>", lambda e: _dispatch_scroll(e, False))
+                    self.bind_class(cls_tag, "<Button-4>", lambda e: _dispatch_scroll(e, False))
+                    self.bind_class(cls_tag, "<Button-5>", lambda e: _dispatch_scroll(e, False))
+                except Exception:
+                    pass
+
+        def _create_barber_pole_badge(self, parent, mode="hero", subtitle=None):
+            """Renders an authentic Barbershop Pole ('popsicle') with diagonal Red, White, and Royal Blue
+            stripes and matching Red-White-Blue BARBERSHOP PRO typography.
+            """
+            wrapper = tb.Frame(parent)
+            if mode == "header":
+                pole_w, pole_h = 20, 32
+                pole_cv = tk.Canvas(wrapper, width=pole_w, height=pole_h, highlightthickness=0, bg="#1e293b")
+                pole_cv.pack(side=LEFT, padx=(0, 8))
+                # Diagonal Red / White / Blue stripes inside cylinder
+                stripe_colors = ["#EF4444", "#FFFFFF", "#2563EB", "#FFFFFF"]
+                for i in range(-4, 8):
+                    y0 = i * 8
+                    c = stripe_colors[i % len(stripe_colors)]
+                    pole_cv.create_polygon(
+                        3, y0, pole_w - 3, y0 - 6, pole_w - 3, y0, 3, y0 + 6,
+                        fill=c, outline=""
+                    )
+                # Chrome top & bottom caps
+                pole_cv.create_rectangle(2, 0, pole_w - 2, 4, fill="#CBD5E1", outline="#64748B")
+                pole_cv.create_rectangle(2, pole_h - 4, pole_w - 2, pole_h, fill="#CBD5E1", outline="#64748B")
+                pole_cv.create_rectangle(3, 4, pole_w - 3, pole_h - 4, outline="#94A3B8", width=1)
+
+                txt_f = tb.Frame(wrapper)
+                txt_f.pack(side=LEFT)
+                tk.Label(txt_f, text="BARBER", font=("Segoe UI", 13, "bold"), fg="#FF5252", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                tk.Label(txt_f, text="SHOP ", font=("Segoe UI", 13, "bold"), fg="#FFFFFF", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                tk.Label(txt_f, text="PRO", font=("Segoe UI", 13, "bold"), fg="#60A5FA", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                return wrapper
+
+            # Hero mode (Splash screen & Login page)
+            bg_col = self.style.colors.bg if hasattr(self, "style") else "#222222"
+            pole_w, pole_h = 44, 76
+            pole_cv = tk.Canvas(wrapper, width=pole_w, height=pole_h, highlightthickness=0, bg=bg_col)
+            pole_cv.pack(side=TOP, pady=(0, 10))
+
+            stripe_colors = ["#EF4444", "#FFFFFF", "#2563EB", "#FFFFFF"]
+            for i in range(-5, 10):
+                y0 = i * 12
+                c = stripe_colors[i % len(stripe_colors)]
+                pole_cv.create_polygon(
+                    7, y0, pole_w - 7, y0 - 10, pole_w - 7, y0, 7, y0 + 10,
+                    fill=c, outline=""
+                )
+            # Mask sides outside cylinder
+            pole_cv.create_rectangle(0, 0, 6, pole_h, fill=bg_col, outline="")
+            pole_cv.create_rectangle(pole_w - 6, 0, pole_w, pole_h, fill=bg_col, outline="")
+            # Chrome dome & end caps
+            pole_cv.create_oval(7, 1, pole_w - 7, 13, fill="#E2E8F0", outline="#64748B")
+            pole_cv.create_rectangle(5, 7, pole_w - 5, 13, fill="#CBD5E1", outline="#64748B")
+            pole_cv.create_rectangle(5, pole_h - 11, pole_w - 5, pole_h - 5, fill="#CBD5E1", outline="#64748B")
+            pole_cv.create_oval(9, pole_h - 7, pole_w - 9, pole_h - 1, fill="#94A3B8", outline="#64748B")
+            # Glass cylinder outline + highlight
+            pole_cv.create_rectangle(7, 13, pole_w - 7, pole_h - 11, outline="#94A3B8", width=1)
+            pole_cv.create_line(11, 15, 11, pole_h - 13, fill="#FFFFFF", width=2)
+
+            title_row = tk.Frame(wrapper, bg=bg_col)
+            title_row.pack(side=TOP)
+            tk.Label(title_row, text="BARBER", font=("Segoe UI", 24, "bold"), fg="#EF4444", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="SHOP ", font=("Segoe UI", 24, "bold"), fg="#FFFFFF", bg=bg_col).pack(side=LEFT)
+            tk.Label(title_row, text="PRO", font=("Segoe UI", 24, "bold"), fg="#3B82F6", bg=bg_col).pack(side=LEFT)
+
+            # 3-color Barbershop ribbon bar
+            ribbon = tk.Canvas(wrapper, width=220, height=5, highlightthickness=0, bg=bg_col)
+            ribbon.pack(side=TOP, pady=(4, 6))
+            ribbon.create_rectangle(0, 0, 73, 5, fill="#EF4444", outline="")
+            ribbon.create_rectangle(73, 0, 146, 5, fill="#FFFFFF", outline="")
+            ribbon.create_rectangle(146, 0, 220, 5, fill="#3B82F6", outline="")
+
+            if subtitle:
+                tb.Label(wrapper, text=subtitle, font=("Segoe UI", 11, "italic"), bootstyle="secondary").pack(side=TOP, pady=(2, 0))
+            return wrapper
+
         def show_startup_splash(self):
             self.clear_window()
             self._startup_offline_warning = None
             container = tb.Frame(self, padding=40)
             container.place(relx=0.5, rely=0.5, anchor=CENTER)
             
-            lbl_b = tb.Label(container, text="★ Highend Payroll App ★", font=("Segoe UI", 22, "bold"), bootstyle="success")
-            lbl_b.pack(pady=(0, 5))
-            lbl_c = tb.Label(container, text="Custom Made ✂️", font=("Segoe UI", 12, "italic"), bootstyle="secondary")
-            lbl_c.pack(pady=(0, 25))
+            badge = self._create_barber_pole_badge(container, mode="hero", subtitle="Shop & Payroll Management Suite ✂️")
+            badge.pack(pady=(0, 20))
             
-            progress = tb.Progressbar(container, orient=tk.HORIZONTAL, length=380, mode="indeterminate", bootstyle="success")
+            progress = tb.Progressbar(container, orient=tk.HORIZONTAL, length=380, mode="indeterminate", bootstyle="info")
             progress.pack(pady=10)
             progress.start(15)
             self._startup_progress = progress
@@ -8978,7 +9408,7 @@ if HAS_DEPS:
                                             self._mandatory_modal_shown = True
                                             if messagebox.askyesno(
                                                 "Critical Update Required 🚨",
-                                                f"A mandatory software update (v{r_ver}) has been released for the shared Supabase database.\n\n"
+                                                f"A mandatory software update (v{r_ver}) has been released for the shared database.\n\n"
                                                 f"To prevent data corruption or communication errors, you must update now.\n\n"
                                                 f"Would you like to install update v{r_ver} and restart immediately?",
                                                 parent=self
@@ -9052,10 +9482,9 @@ if HAS_DEPS:
             
             # Add a fancy logo/title area
             title_frame = tb.Frame(frame)
-            title_frame.grid(row=0, column=0, columnspan=2, pady=(0, 30))
-            tb.Label(title_frame, text="❖", font=("Segoe UI", 36), bootstyle="primary").pack(side=TOP, pady=(0, 5))
-            tb.Label(title_frame, text=APP_LOGO_TITLE, font=("Segoe UI", 26, "bold"), bootstyle="primary").pack(side=TOP)
-            tb.Label(title_frame, text="Secure Data Vault", font=("Segoe UI", 12, "italic"), bootstyle="secondary").pack(side=TOP, pady=(5, 0))
+            title_frame.grid(row=0, column=0, columnspan=2, pady=(0, 26))
+            badge = self._create_barber_pole_badge(title_frame, mode="hero", subtitle=self._tr("Shop & Payroll Management Suite ✂️"))
+            badge.pack(side=TOP)
             
             login_users = ["admin", "moe", "ziad"]
             try:
@@ -9723,17 +10152,15 @@ if HAS_DEPS:
             self.load_calendar_data(quiet=True)
             
             def _on_pop_wheel(event):
-                if not self._widget_alive(canvas):
+                if _was_event_scrolled(event) or not self._widget_alive(canvas):
                     return
-                try:
-                    if event.delta:
-                        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                    elif event.num == 4:
-                        canvas.yview_scroll(-1, "units")
-                    elif event.num == 5:
-                        canvas.yview_scroll(1, "units")
-                except Exception:
-                    pass
+                delta = _scroll_delta(event)
+                if delta:
+                    try:
+                        canvas.yview_scroll(delta, "units")
+                        _mark_event_scrolled(event)
+                    except Exception:
+                        pass
             
             for target in (pop, outer, grid_holder, canvas, self.rev_cards_container):
                 target.bind("<MouseWheel>", _on_pop_wheel)
@@ -10065,15 +10492,9 @@ if HAS_DEPS:
             tb.Button(right_frame, text=self._tr("💸 Expense Reports"), bootstyle="warning", cursor="hand2", command=self.open_expenses_window).pack(side=RIGHT, padx=3)
             tb.Button(right_frame, text=self._tr("📁 Employee Folders"), bootstyle="success", cursor="hand2", command=self.open_folders_window).pack(side=RIGHT, padx=3)
 
-            # Left side title (compact and responsive for 13" MacBook)
-            app_short_title = APP_TITLE.split(" - ")[0] if " - " in APP_TITLE else APP_TITLE
-            self.lbl_main_title = tb.Label(
-                header,
-                text=f"💈 {app_short_title}",
-                font=("Segoe UI", 13, "bold"),
-                bootstyle="inverse-primary",
-            )
-            self.lbl_main_title.pack(side=LEFT, padx=(12, 4), pady=8)
+            # Left side title (compact and responsive for 13" MacBook with Barbershop colors)
+            self.lbl_main_title = self._create_barber_pole_badge(header, mode="header")
+            self.lbl_main_title.pack(side=LEFT, padx=(12, 4), pady=6)
             
             # Dynamic Update Banner in Main Dashboard (Appears ONLY when update is available)
             self._main_upd_banner = tb.Frame(self)
@@ -11024,12 +11445,16 @@ if HAS_DEPS:
 
             # Synchronize mousewheel scrolling across both panes
             def _on_wheel(e):
-                delta = int(-1 * (e.delta / 120)) if getattr(e, "delta", 0) else (1 if getattr(e, "num", 0) == 5 else -1)
-                try:
-                    self.tree_frozen.yview_scroll(delta, "units")
-                    self.tree_calendar.yview_scroll(delta, "units")
-                except Exception:
-                    pass
+                if _was_event_scrolled(e):
+                    return "break"
+                delta = _scroll_delta(e)
+                if delta:
+                    try:
+                        self.tree_frozen.yview_scroll(delta, "units")
+                        self.tree_calendar.yview_scroll(delta, "units")
+                        _mark_event_scrolled(e)
+                    except Exception:
+                        pass
                 return "break"
 
             for t in (self.tree_frozen, self.tree_calendar):
@@ -11150,17 +11575,17 @@ if HAS_DEPS:
                     return lambda e: self.toggle_rev_cycle(target_ck, e)
                 
                 def _on_card_wheel(e):
+                    if _was_event_scrolled(e):
+                        return
                     cv = getattr(self, "rev_pop_canvas", None)
                     if cv and self._widget_alive(cv):
-                        try:
-                            if e.delta:
-                                cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
-                            elif e.num == 4:
-                                cv.yview_scroll(-1, "units")
-                            elif e.num == 5:
-                                cv.yview_scroll(1, "units")
-                        except Exception:
-                            pass
+                        delta = _scroll_delta(e)
+                        if delta:
+                            try:
+                                cv.yview_scroll(delta, "units")
+                                _mark_event_scrolled(e)
+                            except Exception:
+                                pass
 
                 handler = _make_click(ck)
                 for w in (card, lbl_title, sub_frame, lbl_dates, lbl_cnt, lbl_rev):
@@ -12804,11 +13229,15 @@ if HAS_DEPS:
             canvas.bind("<Configure>", _sync_emp_width)
 
             def _on_emp_wheel(event):
-                try:
-                    delta = int(-1 * (event.delta / 120)) if getattr(event, "delta", 0) else (1 if getattr(event, "num", 0) == 5 else -1)
-                    canvas.yview_scroll(delta, "units")
-                except Exception:
-                    pass
+                if _was_event_scrolled(event):
+                    return
+                delta = _scroll_delta(event)
+                if delta:
+                    try:
+                        canvas.yview_scroll(delta, "units")
+                        _mark_event_scrolled(event)
+                    except Exception:
+                        pass
 
             def _bind_emp_wheel(w):
                 try:
@@ -14621,29 +15050,25 @@ if HAS_DEPS:
             canvas.pack(side=LEFT, fill=BOTH, expand=True)
 
             def _on_mousewheel(event):
-                try:
-                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                except Exception:
-                    pass
+                if _was_event_scrolled(event):
+                    return
+                delta = _scroll_delta(event)
+                if delta:
+                    try:
+                        canvas.yview_scroll(delta, "units")
+                        _mark_event_scrolled(event)
+                    except Exception:
+                        pass
 
             def _bind_canvas_wheel(_e=None):
-                canvas.bind_all("<MouseWheel>", _on_mousewheel)
-                canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
-                canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+                pass
 
             def _unbind_canvas_wheel(_e=None):
-                try:
-                    canvas.unbind_all("<MouseWheel>")
-                    canvas.unbind_all("<Button-4>")
-                    canvas.unbind_all("<Button-5>")
-                except Exception:
-                    pass
+                pass
 
-            if platform.system() == "Darwin":
-                canvas.bind("<MouseWheel>", _on_mousewheel)
-            else:
-                canvas.bind("<Enter>", _bind_canvas_wheel)
-                canvas.bind("<Leave>", _unbind_canvas_wheel)
+            canvas.bind("<MouseWheel>", _on_mousewheel, add="+")
+            canvas.bind("<Button-4>", _on_mousewheel, add="+")
+            canvas.bind("<Button-5>", _on_mousewheel, add="+")
 
             def _cleanup_expense_dialog(event=None):
                 # Toplevel is in every child's bindtags, so ignore descendant Destroy.
@@ -16934,40 +17359,25 @@ if HAS_DEPS:
             canvas.bind("<Configure>", _on_canvas_configure)
 
             def _act_mousewheel(event):
-                try:
-                    if getattr(event, "delta", 0):
-                        delta = int(-1 * (event.delta / 120)) if platform.system() != "Darwin" else int(-1 * event.delta)
-                    elif getattr(event, "num", 0) == 5:
-                        delta = 1
-                    elif getattr(event, "num", 0) == 4:
-                        delta = -1
-                    else:
-                        delta = 0
-                    if delta:
+                if _was_event_scrolled(event):
+                    return
+                delta = _scroll_delta(event)
+                if delta:
+                    try:
                         canvas.yview_scroll(delta, "units")
-                except Exception:
-                    pass
+                        _mark_event_scrolled(event)
+                    except Exception:
+                        pass
 
             def _bind_wheel(_e=None):
-                canvas.bind_all("<MouseWheel>", _act_mousewheel)
-                canvas.bind_all("<Button-4>", _act_mousewheel)
-                canvas.bind_all("<Button-5>", _act_mousewheel)
+                pass
 
             def _unbind_wheel(_e=None):
-                try:
-                    canvas.unbind_all("<MouseWheel>")
-                    canvas.unbind_all("<Button-4>")
-                    canvas.unbind_all("<Button-5>")
-                except Exception:
-                    pass
+                pass
 
-            if platform.system() == "Darwin":
-                canvas.bind("<MouseWheel>", _act_mousewheel)
-            else:
-                canvas.bind("<Enter>", _bind_wheel)
-                canvas.bind("<Leave>", _unbind_wheel)
-                inner.bind("<Enter>", _bind_wheel)
-                inner.bind("<Leave>", _unbind_wheel)
+            canvas.bind("<MouseWheel>", _act_mousewheel, add="+")
+            canvas.bind("<Button-4>", _act_mousewheel, add="+")
+            canvas.bind("<Button-5>", _act_mousewheel, add="+")
 
             vscroll.pack(side=RIGHT, fill=Y)
             canvas.pack(side=LEFT, fill=BOTH, expand=True)
@@ -17117,11 +17527,11 @@ if HAS_DEPS:
             log_tree.column("Action", width=420, anchor=W)
             self._attach_tree_scrollbars(log_holder, log_tree)
 
-            bak_lf = tb.Labelframe(inner, text=self._tr("📁 Daily Backups (Local & Supabase Cloud)"), padding=10, bootstyle="info")
+            bak_lf = tb.Labelframe(inner, text=self._tr("📁 Daily Backups (Local & Cloud DB)"), padding=10, bootstyle="info")
             bak_lf.pack(fill=X)
             tb.Label(
                 bak_lf,
-                text=self._tr("Daily morning (AM) and afternoon (PM) backups are saved locally on each linked device and synced to Supabase Cloud."),
+                text=self._tr("Daily morning (AM) and afternoon (PM) backups are saved locally on each linked device and synced to Cloud DB."),
                 font=("Segoe UI", 10),
                 bootstyle="secondary",
                 wraplength=720,
@@ -17239,7 +17649,7 @@ if HAS_DEPS:
                 try:
                     ok, msg = create_cloud_backup(kind="manual")
                     if ok:
-                        messagebox.showinfo("Backup Success", "Backup saved locally on this device and synced to Supabase Cloud.", parent=top)
+                        messagebox.showinfo("Backup Success", "Backup saved locally on this device and synced to Cloud DB.", parent=top)
                         load_backups()
                         load_logs()
                     else:
@@ -17254,7 +17664,7 @@ if HAS_DEPS:
                     return
                 key = sel[0]
                 is_loc = str(key).startswith("local::")
-                source_txt = "Local disk backup on this PC" if is_loc else "Supabase Cloud backup"
+                source_txt = "Local disk backup on this PC" if is_loc else "Cloud DB backup"
                 if not messagebox.askyesno(
                     "Restore backup",
                     f"This will replace current application data with the selected {source_txt}.\n\nContinue?",
@@ -17488,28 +17898,18 @@ if HAS_DEPS:
                 canvas.configure(yscrollcommand=scrollbar.set)
                 
                 def _wheel(e):
-                    try:
-                        delta = int(-1 * (e.delta / 120)) if platform.system() != "Darwin" else int(-1 * (getattr(e, "delta", 0) or 0))
-                        if delta:
-                            canvas.yview_scroll(delta, "units")
-                    except Exception:
-                        pass
-                def _bind_w(w):
-                    if platform.system() == "Darwin":
+                    if _was_event_scrolled(e):
                         return
-                    try:
-                        w.bind("<MouseWheel>", _wheel, add="+")
-                        w.bind("<Button-4>", _wheel, add="+")
-                        w.bind("<Button-5>", _wheel, add="+")
-                    except Exception:
-                        pass
-                    for ch in w.winfo_children():
-                        _bind_w(ch)
-                if platform.system() == "Darwin":
-                    canvas.bind("<MouseWheel>", _wheel)
-                else:
-                    dialog.after(120, lambda: _bind_w(scroll_content))
-                    dialog.after(120, lambda: _bind_w(canvas))
+                    delta = _scroll_delta(e)
+                    if delta:
+                        try:
+                            canvas.yview_scroll(delta, "units")
+                            _mark_event_scrolled(e)
+                        except Exception:
+                            pass
+                canvas.bind("<MouseWheel>", _wheel, add="+")
+                canvas.bind("<Button-4>", _wheel, add="+")
+                canvas.bind("<Button-5>", _wheel, add="+")
                 
                 canvas.pack(side=LEFT, fill=BOTH, expand=True)
                 scrollbar.pack(side=RIGHT, fill=Y)
@@ -17517,8 +17917,8 @@ if HAS_DEPS:
 
             config_data = get_db_config()
 
-            # --- SUB-TAB 1: SUPABASE CLOUD ---
-            tab_remote_wrapper, tab_remote = _create_scrollable_subtab(db_notebook, self._tr("☁️ Supabase Cloud Database"))
+            # --- SUB-TAB 1: CLOUD DB ---
+            tab_remote_wrapper, tab_remote = _create_scrollable_subtab(db_notebook, self._tr("☁️ Cloud Database (DB)"))
             
             # --- Cloud Sync Action Bar ---
             sync_card = tb.Labelframe(tab_remote, text=self._tr("Cloud Synchronization"), padding=12, bootstyle="primary")
@@ -17534,11 +17934,11 @@ if HAS_DEPS:
             self.btn_sync_now.pack(side=LEFT, padx=(0, 10))
 
             is_cloud = (get_db_mode() == "supabase")
-            sync_status_txt = "☁️ " + self._tr("Connected") + " (Live Cloud Database)" if is_cloud else "💻 Local Database Mode"
+            sync_status_txt = "☁️ " + self._tr("Connected") + " (Live Cloud DB)" if is_cloud else "💻 Local Database Mode"
             tb.Label(sync_card, text=sync_status_txt, font=("Segoe UI", 10, "bold"), bootstyle="info" if is_cloud else "secondary").pack(side=LEFT, padx=5)
 
             # --- Live 1 GB Free Tier Storage Meter ---
-            storage_card = tb.Labelframe(tab_remote, text=self._tr("📊 Supabase Cloud Storage (1 GB Free Tier)"), padding=12, bootstyle="info")
+            storage_card = tb.Labelframe(tab_remote, text=self._tr("📊 Cloud DB Storage (1 GB Free Tier)"), padding=12, bootstyle="info")
             storage_card.pack(fill=X, pady=(5, 12))
             
             lbl_storage_txt = tb.Label(storage_card, text=self._tr("Storage Used: Checking..."), font=("Segoe UI", 11, "bold"), bootstyle="primary")
@@ -17580,8 +17980,8 @@ if HAS_DEPS:
             except Exception:
                 pass
 
-            tb.Label(tab_remote, text=self._tr("Supabase DB Host / Project Endpoint:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
-            db_host_var = tk.StringVar(value=config_data.get("supabase_host") or "db.xxxx.supabase.co")
+            tb.Label(tab_remote, text=self._tr("DB Host / Endpoint:"), font=("Segoe UI", 10, "bold")).pack(anchor=W, pady=(5, 5))
+            db_host_var = tk.StringVar(value=config_data.get("supabase_host") or "")
             db_host_entry = tb.Entry(tab_remote, textvariable=db_host_var, width=45)
             db_host_entry.pack(pady=5, fill=X)
             
@@ -17599,7 +17999,7 @@ if HAS_DEPS:
             db_name_entry.grid(row=0, column=1, sticky=W)
             
             tb.Label(extra_frame, text=self._tr("Port:"), font=("Segoe UI", 10, "bold")).grid(row=0, column=2, sticky=W, padx=(20, 10))
-            db_port_var = tk.StringVar(value=config_data.get("supabase_port") or "5432")
+            db_port_var = tk.StringVar(value=config_data.get("supabase_port") or "6543")
             db_port_entry = tb.Entry(extra_frame, textvariable=db_port_var, width=10)
             db_port_entry.grid(row=0, column=3, sticky=W)
 
@@ -17661,7 +18061,7 @@ if HAS_DEPS:
                     db_port_var.set(str(port))
                     db_user_var.set(username)
                 except Exception as e:
-                    messagebox.showerror("Connection Failed", f"Could not connect: {e}", parent=dialog)
+                    messagebox.showerror("Connection Failed", f"Could not connect to DB: {e}", parent=dialog)
                     return
                     
                 default_dir = get_default_app_dir()
@@ -17678,7 +18078,7 @@ if HAS_DEPS:
                     with open(config_file, "w", encoding="utf-8") as f:
                         json.dump(new_config, f, indent=4)
                     refresh_storage_meter()
-                    messagebox.showinfo("Success", f"Supabase configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nPlease restart the app to activate Supabase mode.", parent=dialog)
+                    messagebox.showinfo("Success", f"DB configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nPlease restart the app to activate Cloud DB mode.", parent=dialog)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to save configuration: {e}", parent=dialog)
 
@@ -17729,8 +18129,8 @@ if HAS_DEPS:
                     refresh_storage_meter()
                     messagebox.showinfo(
                         "Upload Complete",
-                        f"Local database successfully uploaded to Supabase.\n\nStatus: {status.get('text')}\n\n"
-                        "Restart this app, then on the 2nd device enter the same Supabase settings and restart.",
+                        f"Local database successfully uploaded to Cloud DB.\n\nStatus: {status.get('text')}\n\n"
+                        "Restart this app, then on the 2nd device enter the same DB settings and restart.",
                         parent=dialog,
                     )
                 except Exception as e:
@@ -17757,7 +18157,7 @@ if HAS_DEPS:
             def do_cleanup_cloud():
                 if not messagebox.askyesno(
                     "Clean Up Cloud",
-                    "Remove duplicate Shop/config rows and clear sync history noise on Supabase?",
+                    "Remove duplicate Shop/config rows and clear sync history noise on Cloud DB?",
                     parent=dialog,
                 ):
                     return
@@ -17803,13 +18203,13 @@ if HAS_DEPS:
                 guide_lines = (
                     "📋 خطوات ربط ومزامنة جهاز جديد للمرة الأولى:\n\n"
                     "1️⃣ الجهاز الرئيسي (الجهاز الأول الذي يحتوي على البيانات الأصلية):\n"
-                    "   • أدخل بيانات Supabase: المضيف (Host)، كلمة مرور قاعدة البيانات، المنفذ (6543)، واسم المستخدم.\n"
+                    "   • أدخل بيانات قاعدة البيانات (DB): المضيف (Host)، كلمة مرور قاعدة البيانات، المنفذ (6543)، واسم المستخدم.\n"
                     "   • اضغط على 'التحقق وحفظ الإعدادات' للتأكد من الاتصال بنجاح.\n"
                     "   • اضغط على 'Upload Local → Cloud' لرفع كامل سجلات الرواتب والموظفين والمصروفات إلى السحابة.\n"
                     "   • اضغط على '📁 Sync Local Files → Cloud' لرفع مستندات وصور الموظفين.\n\n"
                     "2️⃣ الجهاز الثاني (الكمبيوتر المحمول أو الجهاز الإضافي):\n"
                     "   • افتح نفس هذه النافذة (إعدادات قاعدة البيانات والسحابة) على الجهاز الجديد.\n"
-                    "   • أدخل نفس إعدادات وبيانات Supabase تماماً واضغط 'التحقق وحفظ الإعدادات'.\n"
+                    "   • أدخل نفس إعدادات وبيانات قاعدة البيانات (DB) تماماً واضغط 'التحقق وحفظ الإعدادات'.\n"
                     "   • اضغط على زر '🔄 مزامنة السحابة الآن' لتحميل كامل قاعدة البيانات والملفات تلقائياً للجهاز.\n\n"
                     "3️⃣ الاستخدام اليومي والمزامنة التلقائية:\n"
                     "   • تتم مزامنة التغييرات تلقائياً في الخلفية بين كل الأجهزة المرتبطة.\n"
@@ -17819,13 +18219,13 @@ if HAS_DEPS:
                 guide_lines = (
                     "📋 Step-by-Step Multi-Device Integration Guide:\n\n"
                     "1️⃣ Primary PC (Source of Truth with Existing Data):\n"
-                    "   • Enter your Supabase credentials: Host, Database Password, Port (6543), Database (postgres), and User.\n"
-                    "   • Click 'Verify & Save Configuration' to confirm the cloud connection succeeds.\n"
-                    "   • Click 'Upload Local → Cloud' to push all existing payroll records, employees, and expenses to Supabase.\n"
+                    "   • Enter your DB credentials: Host, Database Password, Port (6543), Database (postgres), and User.\n"
+                    "   • Click 'Verify & Save Configuration' to confirm the cloud DB connection succeeds.\n"
+                    "   • Click 'Upload Local → Cloud' to push all existing payroll records, employees, and expenses to Cloud DB.\n"
                     "   • Click '📁 Sync Local Files → Cloud' to upload employee documents and photos.\n\n"
                     "2️⃣ Secondary Device (Laptop or Second Workstation):\n"
                     "   • Open this exact Database & Cloud Settings tab on the second device.\n"
-                    "   • Enter the identical Supabase credentials and click 'Verify & Save Configuration'.\n"
+                    "   • Enter the identical DB credentials and click 'Verify & Save Configuration'.\n"
                     "   • Click '🔄 Sync Cloud Now' at the top of this tab to download the entire database and documents.\n\n"
                     "3️⃣ Daily Continuous Synchronization:\n"
                     "   • All changes synchronize automatically in the background between active devices.\n"
@@ -18185,13 +18585,13 @@ if HAS_DEPS:
             tb.Button(btn_act_row, text=self._tr("⏮️ Roll Back to Previous Backup"), bootstyle="warning outline", command=_do_rollback_bak).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_act_row, text=self._tr("🏭 Revert to Factory Built-in"), bootstyle="danger outline", command=_do_revert_factory).pack(side=LEFT)
 
-            # --- 3. CENTRAL DEVICE VERSION ENFORCEMENT (SUPABASE MULTI-DEVICE) ---
-            policy_lf = tb.Labelframe(inner, text=self._tr("🛡️ Central Device Version Enforcement (Supabase)"), padding=14, bootstyle="secondary")
+            # --- 3. CENTRAL DEVICE VERSION ENFORCEMENT (MULTI-DEVICE DB) ---
+            policy_lf = tb.Labelframe(inner, text=self._tr("🛡️ Central Device Version Enforcement (DB)"), padding=14, bootstyle="secondary")
             policy_lf.pack(fill=X, pady=(0, 14))
 
             tb.Label(
                 policy_lf,
-                text=self._tr("When multiple devices connect to the same Supabase database, set a minimum required version below to prevent older versions from accessing the database with incompatible changes:"),
+                text=self._tr("When multiple devices connect to the same central DB, set a minimum required version below to prevent older versions from accessing the database with incompatible changes:"),
                 font=("Segoe UI", 9),
                 bootstyle="secondary",
                 wraplength=680,
@@ -18291,7 +18691,7 @@ if HAS_DEPS:
             tb.Button(pol_row, text=self._tr(f"Use Current App Version (v{APP_VERSION})"), bootstyle="secondary outline", command=_use_current_app_ver).pack(side=LEFT)
 
             # --- 4. UPDATE AUDIT & CLOUD LOGS ---
-            hist_lf = tb.Labelframe(inner, text=self._tr("📋 Supabase Update & Recovery Audit History"), padding=12, bootstyle="secondary")
+            hist_lf = tb.Labelframe(inner, text=self._tr("📋 DB Update & Recovery Audit History"), padding=12, bootstyle="secondary")
             hist_lf.pack(fill=BOTH, expand=True, pady=(0, 8))
 
             hist_cols = ("When", "User", "Action", "Summary")
@@ -18766,33 +19166,25 @@ if HAS_DEPS:
             comm_canvas.bind("<Configure>", _comm_canvas_width)
 
             def _comm_mousewheel(event):
-                try:
-                    delta = int(-1 * (event.delta / 120)) if platform.system() != "Darwin" else int(-1 * event.delta)
-                    if delta:
+                if _was_event_scrolled(event):
+                    return
+                delta = _scroll_delta(event)
+                if delta:
+                    try:
                         comm_canvas.yview_scroll(delta, "units")
-                except Exception:
-                    pass
+                        _mark_event_scrolled(event)
+                    except Exception:
+                        pass
 
             def _bind_comm_wheel(_e=None):
-                comm_canvas.bind_all("<MouseWheel>", _comm_mousewheel)
-                comm_canvas.bind_all("<Button-4>", lambda e: comm_canvas.yview_scroll(-1, "units"))
-                comm_canvas.bind_all("<Button-5>", lambda e: comm_canvas.yview_scroll(1, "units"))
+                pass
 
             def _unbind_comm_wheel(_e=None):
-                try:
-                    comm_canvas.unbind_all("<MouseWheel>")
-                    comm_canvas.unbind_all("<Button-4>")
-                    comm_canvas.unbind_all("<Button-5>")
-                except Exception:
-                    pass
+                pass
 
-            if platform.system() == "Darwin":
-                comm_canvas.bind("<MouseWheel>", _comm_mousewheel)
-            else:
-                comm_canvas.bind("<Enter>", _bind_comm_wheel)
-                comm_canvas.bind("<Leave>", _unbind_comm_wheel)
-                comm_inner.bind("<Enter>", _bind_comm_wheel)
-                comm_inner.bind("<Leave>", _unbind_comm_wheel)
+            comm_canvas.bind("<MouseWheel>", _comm_mousewheel, add="+")
+            comm_canvas.bind("<Button-4>", _comm_mousewheel, add="+")
+            comm_canvas.bind("<Button-5>", _comm_mousewheel, add="+")
 
             comm_scroll.pack(side=RIGHT, fill=Y)
             comm_canvas.pack(side=LEFT, fill=BOTH, expand=True)
@@ -19054,86 +19446,6 @@ if HAS_DEPS:
             _build_tier_editor(comm_inner, self._tr("Product sales commissions"), "product")
             dialog.bind("<Destroy>", lambda e: _unbind_comm_wheel() if getattr(e, "widget", None) is dialog else None, add="+")
 
-            tab_cols = tb.Frame(notebook, padding=24)
-            notebook.add(tab_cols, text=self._tr("📊 Table Columns"))
-            
-            tb.Label(tab_cols, text=self._tr("Select Columns to Display"), font=("Segoe UI", 15, "bold"), bootstyle="primary").pack(anchor=W, pady=(0, 6))
-            tb.Label(
-                tab_cols,
-                text=self._tr("Check the columns you want visible in the Shop Earnings table. Changes are saved automatically."),
-                font=("Segoe UI", 10),
-                bootstyle="secondary",
-                wraplength=720,
-                justify=LEFT,
-            ).pack(anchor=W, pady=(0, 15))
-            
-            cols_scroll_f = tb.Frame(tab_cols)
-            cols_scroll_f.pack(fill=BOTH, expand=True)
-            
-            cols_canvas = tk.Canvas(cols_scroll_f, highlightthickness=0)
-            cols_sb = tb.Scrollbar(cols_scroll_f, orient=VERTICAL, command=cols_canvas.yview)
-            cols_inner = tb.Frame(cols_canvas, padding=10)
-            cols_inner.bind("<Configure>", lambda e: cols_canvas.configure(scrollregion=cols_canvas.bbox("all")))
-            def _on_cols_cfg(e):
-                if getattr(cols_canvas, "_last_cfg_w", None) == e.width:
-                    return
-                cols_canvas._last_cfg_w = e.width
-                try:
-                    cols_canvas.itemconfigure(cols_c_win, width=e.width)
-                except Exception:
-                    pass
-            cols_canvas.bind("<Configure>", _on_cols_cfg)
-            cols_canvas.configure(yscrollcommand=cols_sb.set)
-            
-            cols_sb.pack(side=RIGHT, fill=Y)
-            cols_canvas.pack(side=LEFT, fill=BOTH, expand=True)
-            
-            settings_hidden_now = get_calendar_hidden_columns()
-            settings_check_vars = {}
-            
-            for col_key, desc in ALL_CALENDAR_COLUMNS:
-                col_tr = self._tr(col_key)
-                is_checked = (col_key not in settings_hidden_now and col_tr not in settings_hidden_now)
-                var = tk.BooleanVar(value=is_checked)
-                settings_check_vars[col_key] = var
-                
-                row_f = tb.Frame(cols_inner, padding=(4, 6))
-                row_f.pack(fill=X, expand=True)
-                
-                cb = tb.Checkbutton(
-                    row_f,
-                    text=f"{col_tr}   —   {desc}",
-                    variable=var,
-                    bootstyle="primary-round-toggle",
-                    cursor="hand2",
-                )
-                cb.pack(anchor=W)
-            
-            cols_btn_f = tb.Frame(tab_cols, padding=(0, 15, 0, 0))
-            cols_btn_f.pack(fill=X, side=BOTTOM)
-            
-            def _settings_save_cols():
-                new_hidden = {"Record ID", self._tr("Record ID")}
-                for col_key, var in settings_check_vars.items():
-                    if not var.get():
-                        new_hidden.add(col_key)
-                        new_hidden.add(self._tr(col_key))
-                save_calendar_hidden_columns(new_hidden)
-                self.refresh_calendar_column_visibility()
-                messagebox.showinfo(
-                    self._tr("Columns Updated"),
-                    self._tr("Table columns display updated successfully."),
-                    parent=dialog,
-                )
-
-            def _settings_select_all_cols(val):
-                for var in settings_check_vars.values():
-                    var.set(val)
-
-            tb.Button(cols_btn_f, text=self._tr("Save & Apply"), bootstyle="success", cursor="hand2", command=_settings_save_cols).pack(side=LEFT, padx=5)
-            tb.Button(cols_btn_f, text=self._tr("Select All"), bootstyle="secondary-outline", cursor="hand2", command=lambda: _settings_select_all_cols(True)).pack(side=LEFT, padx=5)
-            tb.Button(cols_btn_f, text=self._tr("Reset to Default"), bootstyle="warning-outline", cursor="hand2", command=lambda: (_settings_select_all_cols(True), settings_check_vars.get("Written Up", tk.BooleanVar()).set(False))).pack(side=LEFT, padx=5)
-
             # --- LAST TAB: DATABASE & CLOUD SYNC ---
             tab_db = tb.Frame(notebook)
             notebook.add(tab_db, text=self._tr("🗄️ Database & Cloud"))
@@ -19163,7 +19475,7 @@ if HAS_DEPS:
             elif default_tab in ("commissions", "tiers"):
                 notebook.select(tab_tools)
             elif default_tab == "columns":
-                notebook.select(tab_cols)
+                self.after(100, lambda: self.open_calendar_columns_dialog(parent=dialog))
 
             self._present_window(dialog)
 
