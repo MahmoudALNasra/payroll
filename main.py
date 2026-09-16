@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.51"
+APP_VERSION = "2.5.52"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1157,6 +1157,7 @@ ALL_CALENDAR_COLUMNS = [
     ("Total Calculation", "Total Payout Calculation ($)"),
     ("Notes", "Record Notes"),
     ("Written Up", "Written Up Status / Violations"),
+    ("Owner", "User Who Added Record"),
 ]
 
 def get_calendar_hidden_columns():
@@ -1544,6 +1545,25 @@ class PostgresConnectionProxy:
 
     def cursor(self):
         return PostgresCursorProxy(self.conn.cursor(), self.conn, shared=self._shared)
+
+    def execute(self, sql, parameters=()):
+        cur = self.cursor()
+        cur.execute(sql, parameters)
+        return cur
+
+    def executemany(self, sql, seq_of_parameters):
+        cur = self.cursor()
+        cur.executemany(sql, seq_of_parameters)
+        return cur
+
+    def executescript(self, sql_script):
+        cur = self.cursor()
+        if hasattr(cur, "executescript"):
+            return cur.executescript(sql_script)
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self.conn, name)
 
     def commit(self):
         with _SUPABASE_LOCK:
@@ -3477,6 +3497,11 @@ def ensure_offline_cache_open():
         cur = lite.cursor()
         # Build local (plaintext) schema — temporarily pretend we're not on live PG.
         _init_offline_schema(cur)
+        for _tbl_owner in ("expenses", "payroll_records", "shop_documents"):
+            try:
+                cur.execute(f"ALTER TABLE {_tbl_owner} ADD COLUMN owner TEXT DEFAULT ''")
+            except Exception:
+                pass
         lite.commit()
     finally:
         lite.close()
@@ -3742,9 +3767,12 @@ BACKUP_DUMP_TABLES = (
 
 def _session_user_name():
     try:
-        return plain_label(CURRENT_SESSION_USER) or "unknown"
+        u = plain_label(CURRENT_SESSION_USER)
+        if (not u or u == "unknown") and GLOBAL_APP_INSTANCE and getattr(GLOBAL_APP_INSTANCE, "current_user", None):
+            u = plain_label(GLOBAL_APP_INSTANCE.current_user)
+        return u or "admin"
     except Exception:
-        return "unknown"
+        return "admin"
 
 
 def _friendly_user_action(action, table=None, row=None, record_id=None):
@@ -5508,6 +5536,25 @@ class OfflineTrackingConnection:
     def cursor(self):
         return OfflineTrackingCursor(self._conn.cursor(), self._conn)
 
+    def execute(self, sql, parameters=()):
+        cur = self.cursor()
+        cur.execute(sql, parameters)
+        return cur
+
+    def executemany(self, sql, seq_of_parameters):
+        cur = self.cursor()
+        cur.executemany(sql, seq_of_parameters)
+        return cur
+
+    def executescript(self, sql_script):
+        cur = self.cursor()
+        if hasattr(cur, "executescript"):
+            return cur.executescript(sql_script)
+        return self._conn.executescript(sql_script)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
     def commit(self):
         self._conn.commit()
         _schedule_persist_offline_cache(0.15)
@@ -5672,6 +5719,15 @@ class OfflineTrackingCursor:
                     return self
                 lid = self._lastrowid or self._cur.lastrowid
                 if lid:
+                    if table.lower() in ("expenses", "payroll_records", "shop_documents"):
+                        try:
+                            cur_owner = _session_user_name()
+                            self._cur.execute(
+                                f"UPDATE {table} SET owner = ? WHERE id = ? AND (owner IS NULL OR TRIM(owner) = '')",
+                                (cur_owner, lid),
+                            )
+                        except Exception:
+                            pass
                     row = self._fetch_row_dict(table, lid)
                     if row:
                         self._enqueue({"op": "insert", "table": table, "row": row})
@@ -5679,12 +5735,28 @@ class OfflineTrackingCursor:
                     if table.lower() == "expenses":
                         protect_local_expense_id(lid)
             elif qu.startswith("UPDATE"):
+                m_in = re.match(
+                    r"UPDATE\s+(\w+)\s+SET.*WHERE\s+id\s+IN\s*\(([^)]+)\)",
+                    q,
+                    re.IGNORECASE | re.DOTALL,
+                )
                 m = re.match(
                     r"UPDATE\s+(\w+)\s+SET.*WHERE\s+id\s*=\s*\?",
                     q,
                     re.IGNORECASE | re.DOTALL,
                 )
-                if m and params:
+                if m_in and params:
+                    table = m_in.group(1)
+                    num_ph = m_in.group(2).count("?")
+                    id_vals = params[-num_ph:] if num_ph > 0 else params
+                    for id_v in id_vals:
+                        row = self._fetch_row_dict(table, id_v)
+                        if row:
+                            self._enqueue({"op": "upsert", "table": table, "row": row})
+                            self._log_change("update", table, row=row, record_id=id_v)
+                        if str(table).lower() == "expenses":
+                            protect_local_expense_id(id_v)
+                elif m and params:
                     table = m.group(1)
                     row = self._fetch_row_dict(table, params[-1])
                     if row:
@@ -5717,12 +5789,22 @@ class OfflineTrackingCursor:
                         )
                         self._log_change("update", None, row={"sql": q[:120]})
             elif qu.startswith("DELETE"):
+                m_in = re.match(
+                    r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+id\s+IN\s*\(([^)]+)\)",
+                    q,
+                    re.IGNORECASE,
+                )
                 m = re.match(
                     r"DELETE\s+FROM\s+(\w+)\s+WHERE\s+id\s*=\s*\?",
                     q,
                     re.IGNORECASE,
                 )
-                if m and params:
+                if m_in and params:
+                    table = m_in.group(1)
+                    for id_v in params:
+                        self._enqueue({"op": "delete", "table": table, "id": id_v})
+                        self._log_change("delete", table, record_id=id_v)
+                elif m and params:
                     self._enqueue(
                         {"op": "delete", "table": m.group(1), "id": params[0]}
                     )
@@ -8840,6 +8922,7 @@ def ensure_all_supabase_tables(db_conn):
         ("payroll_records", "hour_rate", "TEXT"),
         ("payroll_records", "percentage", "TEXT"),
         ("payroll_records", "cycle_key", "TEXT"),
+        ("payroll_records", "owner", "TEXT DEFAULT ''"),
         ("expenses", "payment_type", "TEXT"),
         ("expenses", "location", "TEXT"),
         ("expenses", "is_tip", "TEXT DEFAULT 'No'"),
@@ -8847,6 +8930,7 @@ def ensure_all_supabase_tables(db_conn):
         ("expenses", "document_path", "TEXT"),
         ("expenses", "tip_given", "TEXT DEFAULT '0'"),
         ("expenses", "cycle_key", "TEXT"),
+        ("expenses", "owner", "TEXT DEFAULT ''"),
         ("payout_tiers", "kind", "TEXT DEFAULT 'service'"),
         ("shop_documents", "category", "TEXT"),
         ("shop_documents", "date_entered", "TEXT"),
@@ -8854,6 +8938,7 @@ def ensure_all_supabase_tables(db_conn):
         ("shop_documents", "file_size", "INTEGER"),
         ("shop_documents", "file_type", "TEXT"),
         ("shop_documents", "filename", "TEXT"),
+        ("shop_documents", "owner", "TEXT DEFAULT ''"),
     ]
     for tbl, col, col_type in col_migrations:
         try:
@@ -9631,6 +9716,7 @@ def _init_db_schema(cursor, seed=True):
         ("document_path", "TEXT"),
         ("tip_given", f"{num} DEFAULT 0"),
         ("cycle_key", "TEXT"),
+        ("owner", "TEXT DEFAULT ''"),
     ])
     _commit_step()
 
@@ -9643,6 +9729,7 @@ def _init_db_schema(cursor, seed=True):
         ("hour_rate", "REAL"),
         ("percentage", "REAL"),
         ("cycle_key", "TEXT"),
+        ("owner", "TEXT DEFAULT ''"),
     ])
     _commit_step()
 
@@ -14598,6 +14685,7 @@ if HAS_DEPS:
                 "Total Calculation": 155,
                 "Notes": 180,
                 "Written Up": 120,
+                "Owner": 100,
             }
             saved_w = get_saved_column_widths("calendar_table")
 
@@ -15055,6 +15143,7 @@ if HAS_DEPS:
             perc_col = "r.percentage" if "percentage" in col_names else "NULL"
             has_cycle_key = "cycle_key" in col_names
             cyc_col = "r.cycle_key" if has_cycle_key else "NULL"
+            owner_col = "r.owner" if "owner" in col_names else "''"
             
             # Load employee name -> id mapping
             cursor2 = conn.cursor()
@@ -15071,7 +15160,7 @@ if HAS_DEPS:
             # Query all records for this entire year to populate both cards and table
             query_all = f'''
                 SELECT r.id, r.record_date, e.name, r.location, r.revenue, r.service_addon_sales, r.product_sales, r.tip, 
-                    {hr_col}, e.hour_rate, {perc_col}, e.percentage, r.hours, r.calculation, r.notes, r.written_up, e.use_tiered_payout, r.employee_id, {cyc_col}
+                    {hr_col}, e.hour_rate, {perc_col}, e.percentage, r.hours, r.calculation, r.notes, r.written_up, e.use_tiered_payout, r.employee_id, {cyc_col}, {owner_col}
                 FROM payroll_records r
                 JOIN employees e ON r.employee_id = e.id
                 WHERE 1=1
@@ -15315,6 +15404,7 @@ if HAS_DEPS:
                 elif is_hourly and hours_missing:
                     row_tags = ('missing_hours',)
 
+                owner_disp = plain_label(row[19]) if len(row) > 19 and row[19] else ""
                 tree_row = [
                     row[0],
                     row[1],
@@ -15332,6 +15422,7 @@ if HAS_DEPS:
                     calc_disp,
                     row[14] if row[14] else "",
                     row[15] if row[15] else "",
+                    owner_disp,
                 ]
                 iid = f"row_{row[0]}_{r_idx}"
                 cell_tags = ('col_bg',) + row_tags
@@ -15353,12 +15444,13 @@ if HAS_DEPS:
                     "Total Calculation": calc_disp,
                     "Notes": row[14] if row[14] else "",
                     "Written Up": row[15] if row[15] else "",
+                    "Owner": owner_disp,
                 }
                 for _ck, _ct in (getattr(self, "cal_col_trees", None) or {}).items():
                     if self._widget_alive(_ct):
                         _ct.insert('', tk.END, iid=iid, values=(col_val_map.get(_ck, ""),), tags=cell_tags)
 
-            self.tree_calendar.insert('', tk.END, iid='spacer_row', values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
+            self.tree_calendar.insert('', tk.END, iid='spacer_row', values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
             if hasattr(self, "tree_frozen") and self._widget_alive(self.tree_frozen):
                 self.tree_frozen.insert('', tk.END, iid='spacer_row', values=("",))
             for _ct in (getattr(self, "cal_col_trees", None) or {}).values():
@@ -15371,7 +15463,7 @@ if HAS_DEPS:
                 f"${total_addon:,.2f}", f"${total_prod:,.2f}", f"${total_tip:,.2f}",
                 "", "", f"{total_hrs:.1f}",
                 f"⭐ ${total_calc:,.2f} ⭐",
-                "", "",
+                "", "", "",
             ), tags=('totals',))
             self.tree_calendar.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
             self.tree_calendar.tag_configure('missing_rate', foreground='#e74c3c', font=('Segoe UI', 9, 'bold'))
@@ -17534,9 +17626,9 @@ if HAS_DEPS:
                     if not _cyc_to_save:
                         _cyc_to_save = cycle_for_date(date_val)
                     cursor.execute('''
-                        INSERT INTO payroll_records (employee_id, record_date, payment_amount, payment_type, revenue, service_addon_sales, hours, calculation, notes, written_up, written_up_desc, hour_rate, percentage, cycle_key)
-                        VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (emp_id, date_val, revenue, addon_sales_val, hours, calculation, notes, written_up, write_up_reason if written_up == "Yes" else "", hour_rate_val, perc_to_save, _cyc_to_save))
+                        INSERT INTO payroll_records (employee_id, record_date, payment_amount, payment_type, revenue, service_addon_sales, hours, calculation, notes, written_up, written_up_desc, hour_rate, percentage, cycle_key, owner)
+                        VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (emp_id, date_val, revenue, addon_sales_val, hours, calculation, notes, written_up, write_up_reason if written_up == "Yes" else "", hour_rate_val, perc_to_save, _cyc_to_save, _session_user_name()))
                     
                     commit_and_save(conn)
                 except Exception as e:
@@ -17679,7 +17771,7 @@ if HAS_DEPS:
             tree_frame = tb.Frame(main_content)
             tree_frame.pack(side=LEFT, fill=BOTH, expand=True)
             
-            cols = (self._tr("ID"), self._tr("Date"), self._tr("Cycle"), self._tr("Employee"), self._tr("Category"), self._tr("Payment Type"), self._tr("Amount"), self._tr("Status"))
+            cols = (self._tr("ID"), self._tr("Date"), self._tr("Cycle"), self._tr("Employee"), self._tr("Category"), self._tr("Payment Type"), self._tr("Amount"), self._tr("Status"), self._tr("Owner"))
             
             scroll_y = tb.Scrollbar(tree_frame, orient=VERTICAL)
             scroll_x = tb.Scrollbar(tree_frame, orient=HORIZONTAL)
@@ -18059,7 +18151,7 @@ if HAS_DEPS:
             status_val = self.exp_status_filter.get()
             
             query = '''
-                SELECT ex.id, ex.expense_date, ex.employee_id, e.name, ex.category, ex.amount, ex.status, ex.description, ex.payment_type, ex.assignee_id, e2.name AS assignee_name, ex.is_tip, ex.tip_given, ex.cycle_key
+                SELECT ex.id, ex.expense_date, ex.employee_id, e.name, ex.category, ex.amount, ex.status, ex.description, ex.payment_type, ex.assignee_id, e2.name AS assignee_name, ex.is_tip, ex.tip_given, ex.cycle_key, ex.owner
                 FROM expenses ex
                 LEFT JOIN employees e ON ex.employee_id = e.id
                 LEFT JOIN employees e2 ON ex.assignee_id = e2.id
@@ -18115,7 +18207,7 @@ if HAS_DEPS:
             
             if show_emp_rev:
                 query_emp_rev = '''
-                    SELECT r.id, r.record_date, r.employee_id, e.name, 'Employee Revenue' AS category, r.revenue, 'Approved' AS status, r.notes, NULL AS payment_type, NULL AS assignee_id, NULL AS assignee_name
+                    SELECT r.id, r.record_date, r.employee_id, e.name, 'Employee Revenue' AS category, r.revenue, 'Approved' AS status, r.notes, NULL AS payment_type, NULL AS assignee_id, NULL AS assignee_name, NULL AS is_tip, NULL AS tip_given, r.cycle_key, r.owner
                     FROM payroll_records r
                     JOIN employees e ON r.employee_id = e.id
                     WHERE r.record_date >= ? AND r.record_date <= ?
@@ -18168,6 +18260,7 @@ if HAS_DEPS:
                 if not self._exp_cycle_included(cycle_key_val):
                     continue
                 cycle_disp = cycle_label(cycle_key_val) if cycle_key_val else ""
+                owner_val = plain_label(row[14]) if len(row) > 14 and row[14] else ""
 
                 has_tip = is_tip_flag.lower() in ("yes", "true", "1") and tip_given_val > 0
                 if has_tip:
@@ -18200,7 +18293,8 @@ if HAS_DEPS:
                     self._tr(category),
                     p_type if p_type else "",
                     formatted_amt,
-                    self._tr(status)
+                    self._tr(status),
+                    owner_val,
                 )
                 self.tree_expenses.insert('', tk.END, values=formatted_row, tags=row_tag)
             
@@ -19071,9 +19165,9 @@ if HAS_DEPS:
                         ''', (dt, category, amount, emp_id, status, description, pay_type, location, is_tip, assignee_id, tip_given, cycle_key, expense_id))
                     else:
                         cursor.execute('''
-                            INSERT INTO expenses (expense_date, category, amount, employee_id, status, description, payment_type, location, is_tip, assignee_id, tip_given, cycle_key)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (dt, category, amount, emp_id, status, description, pay_type, location, is_tip, assignee_id, tip_given, cycle_key))
+                            INSERT INTO expenses (expense_date, category, amount, employee_id, status, description, payment_type, location, is_tip, assignee_id, tip_given, cycle_key, owner)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', (dt, category, amount, emp_id, status, description, pay_type, location, is_tip, assignee_id, tip_given, cycle_key, _session_user_name()))
                         saved_id = cursor.lastrowid
                     protect_local_expense_id(saved_id)
 
@@ -24003,6 +24097,7 @@ if HAS_DEPS:
                 self._tr("Status"),
                 self._tr("Location"),
                 self._tr("Description"),
+                self._tr("Owner"),
             )
             tree_holder = tb.Frame(popup)
             tree_holder.pack(fill=BOTH, expand=True, padx=20, pady=10)
@@ -24037,7 +24132,7 @@ if HAS_DEPS:
                     conn = sqlite3.connect(TEMP_DB_PATH, timeout=3)
                     cursor = conn.cursor()
                     cursor.execute('''
-                        SELECT ex.id, e.name, ex.amount, ex.status, ex.location, ex.description, ex.category, ex.expense_date
+                        SELECT ex.id, e.name, ex.amount, ex.status, ex.location, ex.description, ex.category, ex.expense_date, ex.owner
                         FROM expenses ex
                         LEFT JOIN employees e ON ex.assignee_id = e.id
                         WHERE CAST(ex.expense_date AS TEXT) = ?
@@ -24066,7 +24161,8 @@ if HAS_DEPS:
                         if loc:
                             present_locs.add(loc)
                         row_vals[5] = row_vals[5] if row_vals[5] else ""
-                        tree.insert('', tk.END, values=row_vals[:6])
+                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else ""
+                        tree.insert('', tk.END, values=(row_vals[0], row_vals[1], row_vals[2], row_vals[3], row_vals[4], row_vals[5], owner_v))
                     conn.close()
 
                     missing = [loc for loc in required_locations if loc not in present_locs]
@@ -24171,8 +24267,9 @@ if HAS_DEPS:
                     return
                 try:
                     conn = sqlite3.connect(TEMP_DB_PATH)
+                    cur = conn.cursor()
                     placeholders = ",".join("?" for _ in ids)
-                    conn.execute(f"UPDATE expenses SET status = 'Approved' WHERE id IN ({placeholders})", ids)
+                    cur.execute(f"UPDATE expenses SET status = 'Approved' WHERE id IN ({placeholders})", ids)
                     commit_and_save(conn)
                     conn.close()
                     load_day_data()
@@ -24191,8 +24288,9 @@ if HAS_DEPS:
                     return
                 try:
                     conn = sqlite3.connect(TEMP_DB_PATH)
+                    cur = conn.cursor()
                     placeholders = ",".join("?" for _ in ids)
-                    conn.execute(f"UPDATE expenses SET status = 'Pending' WHERE id IN ({placeholders})", ids)
+                    cur.execute(f"UPDATE expenses SET status = 'Pending' WHERE id IN ({placeholders})", ids)
                     commit_and_save(conn)
                     conn.close()
                     load_day_data()
@@ -24225,9 +24323,9 @@ if HAS_DEPS:
                 if messagebox.askyesno("Confirm Delete", confirm_msg, parent=popup):
                     try:
                         conn = sqlite3.connect(TEMP_DB_PATH)
+                        cur = conn.cursor()
                         placeholders = ",".join("?" for _ in ids)
                         try:
-                            cur = conn.cursor()
                             cur.execute(
                                 f"SELECT document_path FROM expenses WHERE id IN ({placeholders})",
                                 ids,
@@ -24237,7 +24335,7 @@ if HAS_DEPS:
                                     delete_expense_document_file(p)
                         except Exception:
                             pass
-                        conn.execute(f"DELETE FROM expenses WHERE id IN ({placeholders})", ids)
+                        cur.execute(f"DELETE FROM expenses WHERE id IN ({placeholders})", ids)
                         commit_and_save(conn)
                         conn.close()
                         load_day_data()
