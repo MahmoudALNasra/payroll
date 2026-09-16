@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.48"
+APP_VERSION = "2.5.49"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -910,9 +910,9 @@ def _scroll_delta(event):
             step = int(-1 * (d / 120))
             return step if step != 0 else (-1 if d > 0 else 1)
     num = getattr(event, "num", 0)
-    if num == 4:
+    if num in (4, 6):
         return -1
-    elif num == 5:
+    elif num in (5, 7):
         return 1
     return 0
 
@@ -9866,9 +9866,8 @@ if HAS_DEPS:
                 if not delta:
                     return
 
-                # Never check event.state & 0x0001 because macOS/Windows trackpad two-finger
-                # vertical gestures set bit 0x0001 in event.state! Only use force_horiz (Shift-MouseWheel).
-                is_horiz = bool(force_horiz)
+                num = getattr(event, "num", 0)
+                is_horiz = bool(force_horiz) or (num in (6, 7))
 
                 w = getattr(event, "widget", None)
                 if not w or isinstance(w, str):
@@ -9897,8 +9896,17 @@ if HAS_DEPS:
                     tf = getattr(self, "tree_frozen", None)
                     tc = getattr(self, "tree_calendar", None)
                     col_trees = list((getattr(self, "cal_col_trees", None) or {}).values())
+                    col_frames = list((getattr(self, "cal_col_frames", None) or {}).values())
                     cal_canvas = getattr(self, "cal_cols_canvas", None)
-                    if curr is tf or curr is tc or curr in col_trees or curr is cal_canvas:
+                    cal_inner = getattr(self, "cal_cols_inner", None)
+                    if (
+                        curr is tf
+                        or curr is tc
+                        or curr in col_trees
+                        or curr in col_frames
+                        or curr is cal_canvas
+                        or curr is cal_inner
+                    ):
                         try:
                             if is_horiz:
                                 if cal_canvas and self._widget_alive(cal_canvas):
@@ -9924,7 +9932,13 @@ if HAS_DEPS:
 
                     # Check if curr is a scrollable container (Canvas, Treeview, Listbox, Text)
                     if is_horiz:
-                        if hasattr(curr, "xview_scroll") and hasattr(curr, "xview"):
+                        # Never horizontally scroll an individual 1-column tree inside Shop Earnings
+                        if curr in col_trees or curr is tf:
+                            if cal_canvas and self._widget_alive(cal_canvas):
+                                cal_canvas.xview_scroll(delta, "units")
+                                _mark_event_scrolled(event)
+                                return "break"
+                        elif hasattr(curr, "xview_scroll") and hasattr(curr, "xview"):
                             try:
                                 xv = curr.xview()
                                 if xv and len(xv) == 2:
@@ -10025,6 +10039,13 @@ if HAS_DEPS:
             self.bind_all("<Shift-MouseWheel>", lambda e: _dispatch_scroll(e, True), add="+")
             self.bind_all("<Button-4>", lambda e: _dispatch_scroll(e, False), add="+")
             self.bind_all("<Button-5>", lambda e: _dispatch_scroll(e, False), add="+")
+            self.bind_all("<Shift-Button-4>", lambda e: _dispatch_scroll(e, True), add="+")
+            self.bind_all("<Shift-Button-5>", lambda e: _dispatch_scroll(e, True), add="+")
+            for opt_seq in ("<Button-6>", "<Button-7>"):
+                try:
+                    self.bind_all(opt_seq, lambda e: _dispatch_scroll(e, True), add="+")
+                except Exception:
+                    pass
 
             # Prevent comboboxes/spinboxes from hijacking scroll gestures when scrolling down forms
             for cls_tag in ("TCombobox", "Combobox", "TSpinbox", "Spinbox"):
@@ -14284,7 +14305,7 @@ if HAS_DEPS:
             )
 
             # Horizontally scrollable canvas hosting synchronized 1-column Treeviews for per-column custom colors
-            self.cal_cols_canvas = tk.Canvas(main_table_frame, highlightthickness=0)
+            self.cal_cols_canvas = tk.Canvas(main_table_frame, highlightthickness=0, xscrollincrement=30)
             self.cal_cols_canvas.pack(side=TOP, fill=BOTH, expand=True)
             self.cal_cols_canvas.configure(xscrollcommand=scroll_x.set)
             scroll_x.config(command=self.cal_cols_canvas.xview)
@@ -14308,6 +14329,68 @@ if HAS_DEPS:
 
             self.cal_cols_canvas.bind("<Configure>", _on_cols_canvas_cfg)
             self.cal_cols_inner.bind("<Configure>", _on_cols_inner_cfg)
+
+            def _scroll_cal_horiz(delta_units):
+                if not delta_units:
+                    return
+                try:
+                    if self._widget_alive(self.cal_cols_canvas):
+                        self.cal_cols_canvas.xview_scroll(int(delta_units), "units")
+                except Exception:
+                    pass
+
+            def _lock_column_horizontal_scroll(col_tv):
+                """Prevent an individual 1-column Treeview from ever scrolling its own cell text horizontally;
+                redirect any horizontal scroll intent directly to self.cal_cols_canvas (the table).
+                """
+                _orig_xview = col_tv.xview
+                _locking = [False]
+
+                def _on_col_xscroll(first, last):
+                    if _locking[0]:
+                        return
+                    try:
+                        f_val = float(first)
+                        if abs(f_val) > 0.0001:
+                            _locking[0] = True
+                            _orig_xview("moveto", 0.0)
+                            _scroll_cal_horiz(1 if f_val > 0 else -1)
+                    except Exception:
+                        pass
+                    finally:
+                        _locking[0] = False
+
+                try:
+                    col_tv.configure(xscrollcommand=_on_col_xscroll)
+                except Exception:
+                    pass
+
+                def _redir_xview(*args):
+                    if not args:
+                        return (0.0, 1.0)
+                    if args[0] == "scroll" and len(args) >= 2:
+                        try:
+                            _scroll_cal_horiz(int(args[1]))
+                        except Exception:
+                            pass
+                        try:
+                            _orig_xview("moveto", 0.0)
+                        except Exception:
+                            pass
+                        return
+                    if args[0] == "moveto":
+                        try:
+                            _orig_xview("moveto", 0.0)
+                        except Exception:
+                            pass
+                        return
+                    return _orig_xview(*args)
+
+                col_tv.xview = _redir_xview
+                col_tv.xview_scroll = lambda number, what="units": _scroll_cal_horiz(int(number))
+                col_tv.xview_moveto = lambda fraction: None
+
+            _lock_column_horizontal_scroll(self.tree_frozen)
 
             self.cal_col_frames = {}
             self.cal_col_trees = {}
@@ -14347,6 +14430,7 @@ if HAS_DEPS:
                 tv.heading(col_tr, text=col_tr)
                 tv.column(col_tr, width=init_w, stretch=True)
                 tv.pack(side=TOP, fill=BOTH, expand=True)
+                _lock_column_horizontal_scroll(tv)
                 self.cal_col_frames[col_key] = cf
                 self.cal_col_trees[col_key] = tv
 
@@ -14410,8 +14494,26 @@ if HAS_DEPS:
             for t in all_trees:
                 t.configure(yscrollcommand=_make_yscroll_handler(t))
 
-            # Synchronize mousewheel scrolling across all panes
+            # Synchronize vertical & horizontal mousewheel/touchpad scrolling across all panes
+            def _on_horiz_wheel(e):
+                if _was_event_scrolled(e):
+                    return "break"
+                num = getattr(e, "num", 0)
+                if num in (6, 4):
+                    delta = -2
+                elif num in (7, 5):
+                    delta = 2
+                else:
+                    delta = _scroll_delta(e)
+                if delta:
+                    _scroll_cal_horiz(delta)
+                    _mark_event_scrolled(e)
+                return "break"
+
             def _on_wheel(e):
+                # Route horizontal touchpad gestures (Shift-MouseWheel / state bit 0x0001) to horizontal table scroll
+                if getattr(e, "state", 0) & 0x0001:
+                    return _on_horiz_wheel(e)
                 if _was_event_scrolled(e):
                     return "break"
                 delta = _scroll_delta(e)
@@ -14425,10 +14527,55 @@ if HAS_DEPS:
                         pass
                 return "break"
 
-            for t in all_trees:
-                t.bind("<MouseWheel>", _on_wheel)
-                t.bind("<Button-4>", _on_wheel)
-                t.bind("<Button-5>", _on_wheel)
+            def _on_touchpad_scroll(e):
+                """macOS native 2D two-finger trackpad scroll handler (<TouchpadScroll>)."""
+                if _was_event_scrolled(e):
+                    return "break"
+                d = int(getattr(e, "delta", 0) or 0)
+                dx = (d >> 16) & 0xFFFF
+                if dx >= 0x8000:
+                    dx -= 0x10000
+                dy = d & 0xFFFF
+                if dy >= 0x8000:
+                    dy -= 0x10000
+                if dx != 0:
+                    step_x = -1 if dx > 0 else 1
+                    if abs(dx) > 3:
+                        step_x = max(-5, min(5, -int(dx // 2)))
+                    _scroll_cal_horiz(step_x)
+                if dy != 0:
+                    step_y = -1 if dy > 0 else 1
+                    if abs(dy) > 3:
+                        step_y = max(-5, min(5, -int(dy // 2)))
+                    for t in all_trees:
+                        if self._widget_alive(t):
+                            try:
+                                t.yview_scroll(step_y, "units")
+                            except Exception:
+                                pass
+                if dx != 0 or dy != 0:
+                    _mark_event_scrolled(e)
+                return "break"
+
+            cal_scroll_targets = list(all_trees) + [self.cal_cols_canvas, self.cal_cols_inner] + list(self.cal_col_frames.values())
+            for w_target in cal_scroll_targets:
+                w_target.bind("<Shift-MouseWheel>", _on_horiz_wheel)
+                w_target.bind("<MouseWheel>", _on_wheel)
+                w_target.bind("<Button-4>", _on_wheel)
+                w_target.bind("<Button-5>", _on_wheel)
+                w_target.bind("<Shift-Button-4>", _on_horiz_wheel)
+                w_target.bind("<Shift-Button-5>", _on_horiz_wheel)
+                w_target.bind("<Key-Left>", lambda e: (_scroll_cal_horiz(-2), "break")[1])
+                w_target.bind("<Key-Right>", lambda e: (_scroll_cal_horiz(2), "break")[1])
+                for opt_seq in ("<Button-6>", "<Button-7>"):
+                    try:
+                        w_target.bind(opt_seq, _on_horiz_wheel)
+                    except Exception:
+                        pass
+                try:
+                    w_target.bind("<TouchpadScroll>", _on_touchpad_scroll)
+                except Exception:
+                    pass
 
             # Synchronize row selection across frozen column, backing tree, and all column trees
             self._syncing_cal_sel = False
