@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.53"
+APP_VERSION = "2.5.56"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1295,13 +1295,17 @@ def decrypt_val(val):
     if not isinstance(val, str):
         return val
     cur = val
-    for _ in range(3):
+    for _ in range(15):
         if not isinstance(cur, str):
             return cur
+        s_trim = cur.strip()
         try:
-            if cur.startswith("denc:"):
+            if s_trim.startswith("str:"):
+                cur = s_trim[4:]
+                continue
+            if s_trim.startswith("denc:"):
                 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-                raw = base64.urlsafe_b64decode(cur[5:].encode("ascii"))
+                raw = base64.urlsafe_b64decode(s_trim[5:].encode("ascii"))
                 nonce, ct = raw[:12], raw[12:]
                 plain = AESGCM(_det_aes_key()).decrypt(nonce, ct, None).decode("utf-8")
                 if plain.startswith("num:"):
@@ -1312,9 +1316,9 @@ def decrypt_val(val):
                 else:
                     cur = plain
                 continue
-            if cur.startswith("enc:"):
+            if s_trim.startswith("enc:"):
                 init_supabase_cipher()
-                decrypted_bytes = CIPHER_SUITE.decrypt(cur[4:].encode())
+                decrypted_bytes = CIPHER_SUITE.decrypt(s_trim[4:].encode())
                 decrypted_str = decrypted_bytes.decode()
                 if decrypted_str.startswith("num:"):
                     s = decrypted_str[4:]
@@ -1469,6 +1473,8 @@ NUMERIC_TO_TEXT = dict(PLAIN_NUMERIC_COLS)
 def _encrypt_for_col(col, val):
     if val is None:
         return None
+    if isinstance(val, str) and (val.strip().startswith("enc:") or val.strip().startswith("denc:")):
+        val = decrypt_val(val)
     col = (col or "").lower()
     if col in DET_ENCRYPT_COLS:
         return encrypt_val_deterministic(val)
@@ -3668,6 +3674,10 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         if progress_cb:
             progress_cb("Downloading latest records…")
         refresh_offline_cache_from_cloud()
+        try:
+            run_one_time_admin_envelopes_to_moe_migration()
+        except Exception:
+            pass
         if offline_pending_count():
             flush_offline_queue_to_cloud()
         if progress_cb:
@@ -3684,6 +3694,201 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
             _SYNC_LOCK.release()
         except Exception:
             pass
+
+
+def run_one_time_admin_envelopes_to_moe_migration():
+    """One-time migration: reassign existing Cash Envelopes owned by 'admin' (or blank) to 'moe'."""
+    prefs = load_ui_column_preferences()
+    if prefs.get("migrated_admin_envelopes_to_moe_v1"):
+        return 0
+
+    updated_count = 0
+    # 1. Update local SQLite database / offline cache
+    try:
+        conn = sqlite3.connect(TEMP_DB_PATH)
+        cur = conn.cursor()
+        try:
+            cur.execute("ALTER TABLE expenses ADD COLUMN owner TEXT DEFAULT ''")
+        except Exception:
+            pass
+        # Ensure user 'moe' exists in users table without overwriting any custom password in Cloud
+        try:
+            cur.execute("SELECT username FROM users")
+            has_moe_local = any(str(decrypt_val(r[0]) if r and r[0] else "").strip().lower() == "moe" for r in (cur.fetchall() or []))
+            if not has_moe_local:
+                cloud_moe_pw = None
+                if get_db_mode() == "supabase":
+                    try:
+                        pg_c = _open_supabase_pg_conn(timeout=4)
+                        try:
+                            rc = pg_c.cursor()
+                            rc.execute("SELECT username, password FROM users")
+                            for ur in rc.fetchall() or []:
+                                if ur and str(decrypt_val(ur[0]) if ur[0] else "").strip().lower() == "moe":
+                                    cloud_moe_pw = str(decrypt_val(ur[1]) if ur[1] else "").strip()
+                                    if cloud_moe_pw:
+                                        break
+                            rc.close()
+                        finally:
+                            pg_c.close()
+                    except Exception:
+                        pass
+                pw_to_insert = cloud_moe_pw or hashlib.sha256(b"admin").hexdigest().lower()
+                cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", ("moe", pw_to_insert))
+        except Exception:
+            pass
+
+        cur.execute("SELECT id, category, owner FROM expenses")
+        rows = cur.fetchall() or []
+        target_ids = []
+        for r in rows:
+            if not r:
+                continue
+            exp_id, raw_cat, raw_owner = r[0], r[1], r[2] if len(r) > 2 else ""
+            cat_str = plain_label(raw_cat)
+            owner_str = plain_label(raw_owner).strip().lower() if raw_owner else ""
+            if is_envelope_category(cat_str) and owner_str in ("", "admin"):
+                target_ids.append(exp_id)
+
+        for eid in target_ids:
+            cur.execute("UPDATE expenses SET owner = ? WHERE id = ?", ("moe", eid))
+            updated_count += 1
+        if target_ids:
+            commit_and_save(conn)
+        conn.close()
+    except Exception:
+        pass
+
+    # 2. If in Supabase mode and online, also update directly in Cloud Postgres (with short 4s timeout)
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            pg_conn = _open_supabase_pg_conn(timeout=4)
+            try:
+                raw_cur = pg_conn.cursor()
+                try:
+                    raw_cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS owner TEXT DEFAULT ''")
+                    pg_conn.commit()
+                except Exception:
+                    try:
+                        pg_conn.rollback()
+                    except Exception:
+                        pass
+                raw_cur.execute("SELECT id, category, owner FROM expenses")
+                pg_rows = raw_cur.fetchall() or []
+                enc_moe = _encrypt_for_col("owner", "moe")
+                for pr in pg_rows:
+                    if not pr:
+                        continue
+                    p_id, p_cat, p_owner = pr[0], pr[1], pr[2] if len(pr) > 2 else ""
+                    if is_envelope_category(plain_label(p_cat)):
+                        p_owner_s = plain_label(p_owner).strip().lower() if p_owner else ""
+                        if p_owner_s in ("", "admin"):
+                            raw_cur.execute("UPDATE expenses SET owner = %s WHERE id = %s", (enc_moe, p_id))
+                            updated_count += 1
+                pg_conn.commit()
+                raw_cur.close()
+            finally:
+                try:
+                    pg_conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    prefs["migrated_admin_envelopes_to_moe_v1"] = True
+    save_ui_column_preferences(prefs)
+    try:
+        heal_encrypted_envelope_descriptions()
+    except Exception:
+        pass
+    try:
+        schedule_cloud_push(0.2)
+    except Exception:
+        pass
+
+    return updated_count
+
+
+def heal_encrypted_envelope_descriptions():
+    """Scan local SQLite and Cloud Postgres to peel any double/multi-encrypted or raw enc:/denc: descriptions."""
+    healed = 0
+    # 1. Heal local SQLite databases (offline cache & TEMP_DB_PATH)
+    for db_opener in (
+        lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=10),
+        lambda: _original_sqlite3_connect(TEMP_DB_PATH, timeout=10) if os.path.exists(str(TEMP_DB_PATH)) else None,
+    ):
+        try:
+            conn = db_opener()
+            if not conn:
+                continue
+            cur = conn.cursor()
+            cur.execute("SELECT id, description, location, status, payment_type, category FROM expenses")
+            updates = []
+            for r in cur.fetchall() or []:
+                if not r:
+                    continue
+                eid, raw_desc, raw_loc, raw_st, raw_pt, raw_cat = r
+                c_desc = plain_label(raw_desc)
+                c_loc = plain_label(raw_loc)
+                c_st = plain_label(raw_st)
+                c_pt = plain_label(raw_pt)
+                c_cat = plain_label(raw_cat)
+                if (
+                    (raw_desc and str(raw_desc).strip().startswith(("enc:", "denc:")))
+                    or (raw_loc and str(raw_loc).strip().startswith(("enc:", "denc:")))
+                    or (raw_st and str(raw_st).strip().startswith(("enc:", "denc:")))
+                    or (raw_pt and str(raw_pt).strip().startswith(("enc:", "denc:")))
+                ):
+                    updates.append((c_desc, c_loc, c_st, c_pt, c_cat, eid))
+            for u in updates:
+                cur.execute(
+                    "UPDATE expenses SET description=?, location=?, status=?, payment_type=?, category=? WHERE id=?",
+                    u,
+                )
+                healed += 1
+            if updates:
+                conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    # 2. Heal double-encrypted descriptions in Supabase Cloud Postgres
+    if get_db_mode() == "supabase" and not is_supabase_offline():
+        try:
+            pg_conn = _open_supabase_pg_conn(timeout=4)
+            try:
+                raw_cur = pg_conn.cursor()
+                raw_cur.execute("SELECT id, description FROM expenses WHERE description IS NOT NULL AND description != ''")
+                pg_updates = []
+                for eid, raw_d in raw_cur.fetchall() or []:
+                    if not raw_d or not isinstance(raw_d, str):
+                        continue
+                    # Check if decrypting once still yields enc: or denc: (double-encrypted)
+                    s_trim = raw_d.strip()
+                    if s_trim.startswith("enc:"):
+                        try:
+                            init_supabase_cipher()
+                            first_pass = CIPHER_SUITE.decrypt(s_trim[4:].encode()).decode()
+                            if first_pass.strip().startswith(("enc:", "denc:", "str:enc:", "str:denc:")):
+                                clean_plain = plain_label(raw_d)
+                                re_enc = _encrypt_for_col("description", clean_plain)
+                                pg_updates.append((re_enc, eid))
+                        except Exception:
+                            pass
+                for re_enc, eid in pg_updates:
+                    raw_cur.execute("UPDATE expenses SET description = %s WHERE id = %s", (re_enc, eid))
+                    healed += 1
+                if pg_updates:
+                    pg_conn.commit()
+                raw_cur.close()
+            finally:
+                try:
+                    pg_conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return healed
 
 
 def _queue_offline_op(payload, raw_conn=None):
@@ -6002,6 +6207,26 @@ def _cloud_upsert_by_key(pg_cur, table, key, row):
     if not row or key not in row:
         return
     cols = list(row.keys())
+    if str(table).lower() == "users" and key == "username":
+        target_u = str(decrypt_val(row[key]) if row[key] else "").strip().lower()
+        target_set = {"zad", "ziad"} if target_u in ("zad", "ziad") else {target_u}
+        try:
+            raw_cur = pg_cur._cur if hasattr(pg_cur, "_cur") else pg_cur
+            raw_cur.execute("SELECT username FROM users")
+            matching_raw = []
+            for (ru,) in raw_cur.fetchall() or []:
+                if ru is not None and str(decrypt_val(ru)).strip().lower() in target_set:
+                    matching_raw.append(ru)
+            for ru in matching_raw:
+                raw_cur.execute("DELETE FROM users WHERE username = %s", (ru,))
+        except Exception:
+            pass
+        col_list = ", ".join(cols)
+        placeholders = ", ".join(["?"] * len(cols))
+        vals = [row[c] for c in cols]
+        pg_cur.execute(f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})", vals)
+        return
+
     pg_cur.execute(f"SELECT {key} FROM {table} WHERE {key} = ?", (row[key],))
     if pg_cur.fetchone():
         set_cols = [c for c in cols if c != key]
@@ -6841,7 +7066,7 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
 def update_user_password_everywhere(username, new_password_or_hash):
     """
     Update a user's password across active DB (TEMP_DB_PATH), raw Supabase Postgres,
-    and local SQLite offline cache, deduplicating any stale or differently-encoded rows.
+    and local SQLite offline cache, deduplicating all stale or differently-encoded rows.
     """
     if not username or new_password_or_hash is None:
         return False
@@ -6855,7 +7080,50 @@ def update_user_password_everywhere(username, new_password_or_hash):
         new_hash = hashlib.sha256(val_str.encode("utf-8")).hexdigest().lower()
     now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 1. Update Local SQLite Offline Cache
+    # 1. Update Raw Supabase Postgres directly first (always attempt if in supabase mode)
+    cloud_updated = False
+    if get_db_mode() == "supabase":
+        try:
+            pg_conn = _open_supabase_pg_conn(timeout=6)
+            try:
+                leave_supabase_offline_mode()
+                raw_cur = pg_conn.cursor()
+                try:
+                    raw_cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
+                    pg_conn.commit()
+                except Exception:
+                    try:
+                        pg_conn.rollback()
+                    except Exception:
+                        pass
+                raw_cur.execute("SELECT username FROM users")
+                for (pg_u,) in raw_cur.fetchall() or []:
+                    if pg_u is not None and str(decrypt_val(pg_u)).strip().lower() in target_names:
+                        raw_cur.execute("DELETE FROM users WHERE username = %s", (pg_u,))
+                enc_u = _encrypt_for_col("username", uname_clean)
+                enc_pw = _encrypt_for_col("password", new_hash)
+                try:
+                    raw_cur.execute(
+                        "INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)",
+                        (enc_u, enc_pw, now_ts),
+                    )
+                except Exception:
+                    raw_cur.execute(
+                        "INSERT INTO users (username, password) VALUES (%s, %s)",
+                        (enc_u, enc_pw),
+                    )
+                pg_conn.commit()
+                raw_cur.close()
+                cloud_updated = True
+            finally:
+                try:
+                    pg_conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 2. Update Local SQLite Offline Cache (deduplicate all rows for this user)
     try:
         lite_path = ensure_offline_cache_open()
         if lite_path and os.path.exists(lite_path):
@@ -6867,26 +7135,33 @@ def update_user_password_everywhere(username, new_password_or_hash):
                 except Exception:
                     pass
                 lcur.execute("SELECT username FROM users")
-                matching_raw_u = []
-                for r in lcur.fetchall() or []:
-                    if r and r[0] is not None:
-                        dec_u = str(decrypt_val(r[0])).strip().lower()
-                        if dec_u in target_names:
-                            matching_raw_u.append(r[0])
-                if matching_raw_u:
-                    primary_u = matching_raw_u[0]
-                    try:
-                        lcur.execute("UPDATE users SET password=?, updated_at=? WHERE username=?", (new_hash, now_ts, primary_u))
-                    except Exception:
-                        lcur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, primary_u))
-                    for extra_u in matching_raw_u[1:]:
-                        if extra_u != primary_u:
-                            lcur.execute("DELETE FROM users WHERE username=?", (extra_u,))
-                else:
-                    try:
-                        lcur.execute("INSERT INTO users (username, password, updated_at) VALUES (?, ?, ?)", (uname_clean, new_hash, now_ts))
-                    except Exception:
-                        lcur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
+                for (lu,) in lcur.fetchall() or []:
+                    if lu is not None and str(decrypt_val(lu)).strip().lower() in target_names:
+                        lcur.execute("DELETE FROM users WHERE username = ?", (lu,))
+                try:
+                    lcur.execute(
+                        "INSERT INTO users (username, password, updated_at) VALUES (?, ?, ?)",
+                        (uname_clean, new_hash, now_ts),
+                    )
+                except Exception:
+                    lcur.execute(
+                        "INSERT INTO users (username, password) VALUES (?, ?)",
+                        (uname_clean, new_hash),
+                    )
+                # Remove any stale queued ops for this user from offline_sync_queue
+                try:
+                    lcur.execute("SELECT id, payload FROM offline_sync_queue")
+                    for qid, qpay in lcur.fetchall() or []:
+                        try:
+                            pobj = json.loads(qpay)
+                            if str(pobj.get("table", "")).lower() == "users":
+                                r_u = str(decrypt_val((pobj.get("row") or {}).get("username", ""))).strip().lower()
+                                if r_u in target_names:
+                                    lcur.execute("DELETE FROM offline_sync_queue WHERE id = ?", (qid,))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 lconn.commit()
             finally:
                 try:
@@ -6896,52 +7171,9 @@ def update_user_password_everywhere(username, new_password_or_hash):
     except Exception:
         pass
 
-    # 2. Update Raw Supabase Postgres directly (if in supabase mode and online)
-    if get_db_mode() == "supabase" and not is_supabase_offline():
-        try:
-            pg_proxy = get_shared_supabase_conn()
-            raw_cur = pg_proxy.conn.cursor()
-            try:
-                try:
-                    raw_cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
-                    pg_proxy.commit()
-                except Exception:
-                    try:
-                        pg_proxy.rollback()
-                    except Exception:
-                        pass
-                raw_cur.execute("SELECT username FROM users")
-                matching_pg_u = []
-                for r in raw_cur.fetchall() or []:
-                    if r and r[0] is not None:
-                        dec_u = str(decrypt_val(r[0])).strip().lower()
-                        if dec_u in target_names:
-                            matching_pg_u.append(r[0])
-                enc_pw = _encrypt_for_col("password", new_hash)
-                if matching_pg_u:
-                    for pg_u in matching_pg_u:
-                        try:
-                            raw_cur.execute("UPDATE users SET password = %s, updated_at = %s WHERE username = %s", (enc_pw, now_ts, pg_u))
-                        except Exception:
-                            raw_cur.execute("UPDATE users SET password = %s WHERE username = %s", (enc_pw, pg_u))
-                else:
-                    enc_u = _encrypt_for_col("username", uname_clean)
-                    try:
-                        raw_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_pw, now_ts))
-                    except Exception:
-                        raw_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_pw))
-                pg_proxy.commit()
-            finally:
-                try:
-                    raw_cur.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # 3. Update via standard TEMP_DB_PATH connection + queue cloud sync
+    # 3. Update via standard TEMP_DB_PATH connection
     try:
-        conn = sqlite3.connect(TEMP_DB_PATH)
+        conn = _original_sqlite3_connect(TEMP_DB_PATH, timeout=10) if os.path.exists(str(TEMP_DB_PATH)) else sqlite3.connect(TEMP_DB_PATH)
         cur = conn.cursor()
         try:
             try:
@@ -6949,22 +7181,20 @@ def update_user_password_everywhere(username, new_password_or_hash):
             except Exception:
                 pass
             cur.execute("SELECT username FROM users")
-            found = False
-            for r in cur.fetchall() or []:
-                if r and r[0] is not None:
-                    dec_u = str(decrypt_val(r[0])).strip().lower()
-                    if dec_u in target_names:
-                        found = True
-                        try:
-                            cur.execute("UPDATE users SET password=?, updated_at=? WHERE username=?", (new_hash, now_ts, r[0]))
-                        except Exception:
-                            cur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, r[0]))
-            if not found:
-                try:
-                    cur.execute("INSERT INTO users (username, password, updated_at) VALUES (?, ?, ?)", (uname_clean, new_hash, now_ts))
-                except Exception:
-                    cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
-            commit_and_save(conn)
+            for (tu,) in cur.fetchall() or []:
+                if tu is not None and str(decrypt_val(tu)).strip().lower() in target_names:
+                    cur.execute("DELETE FROM users WHERE username = ?", (tu,))
+            try:
+                cur.execute(
+                    "INSERT INTO users (username, password, updated_at) VALUES (?, ?, ?)",
+                    (uname_clean, new_hash, now_ts),
+                )
+            except Exception:
+                cur.execute(
+                    "INSERT INTO users (username, password) VALUES (?, ?)",
+                    (uname_clean, new_hash),
+                )
+            conn.commit()
         finally:
             try:
                 conn.close()
@@ -6973,26 +7203,27 @@ def update_user_password_everywhere(username, new_password_or_hash):
     except Exception:
         pass
 
-    try:
-        _queue_offline_op({
-            "op": "upsert_key",
-            "table": "users",
-            "key": "username",
-            "row": {"username": uname_clean, "password": new_hash, "updated_at": now_ts},
-        })
-        schedule_cloud_push(0.1)
-    except Exception:
-        pass
+    # 4. If cloud was unreachable, queue clean upsert_key op
+    if get_db_mode() == "supabase" and not cloud_updated:
+        try:
+            _queue_offline_op({
+                "op": "upsert_key",
+                "table": "users",
+                "key": "username",
+                "row": {"username": uname_clean, "password": new_hash, "updated_at": now_ts},
+            })
+            schedule_cloud_push(0.2)
+        except Exception:
+            pass
 
     return True
 
 
 def verify_user_password_everywhere(username, entered_password):
     """
-    Verify a user's password across active DB, local SQLite cache, raw Postgres, and local snapshots.
-    Handles users who changed their password from 'admin' (custom passwords),
-    ensuring custom passwords always take precedence over stale 'admin' seeds
-    and automatically syncing/healing both databases when matched.
+    Verify a user's password across Supabase Cloud Postgres, active DB, local SQLite cache, and local snapshots.
+    Always checks Supabase Cloud Postgres live when in supabase mode so password changes made on another device
+    work immediately on first login attempt.
     """
     if not username or entered_password is None:
         return False
@@ -7033,72 +7264,74 @@ def verify_user_password_everywhere(username, entered_password):
             return False
         return s.lower() not in (default_admin_hash, "admin")
 
-    all_stored = []
+    cloud_stored = []
+    local_stored = []
 
-    # 1. Active DB (TEMP_DB_PATH)
-    try:
-        conn = sqlite3.connect(TEMP_DB_PATH)
-        cur = conn.cursor()
+    # 1. Always check live Supabase Cloud Postgres first when in supabase mode (even if previously marked offline)
+    if get_db_mode() == "supabase":
         try:
-            cur.execute("SELECT username, password FROM users")
-            for row in cur.fetchall() or []:
-                if row and len(row) >= 2:
-                    u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
-                    if u_dec in target_names and row[1] is not None:
-                        all_stored.append(row[1])
-        finally:
+            pg_conn = _open_supabase_pg_conn(timeout=5)
             try:
-                conn.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # 2. Local SQLite offline cache
-    try:
-        lite_path = ensure_offline_cache_open()
-        if lite_path and os.path.exists(lite_path):
-            lconn = _original_sqlite3_connect(lite_path, timeout=5)
-            try:
-                lcur = lconn.cursor()
-                lcur.execute("SELECT username, password FROM users")
-                for row in lcur.fetchall() or []:
-                    if row and len(row) >= 2:
-                        u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
-                        if u_dec in target_names and row[1] is not None:
-                            all_stored.append(row[1])
-            finally:
-                try:
-                    lconn.close()
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    # 3. Raw Postgres check
-    if get_db_mode() == "supabase" and not is_supabase_offline():
-        try:
-            pg_proxy = get_shared_supabase_conn()
-            raw_cur = pg_proxy.conn.cursor()
-            try:
+                leave_supabase_offline_mode()
+                raw_cur = pg_conn.cursor()
                 raw_cur.execute("SELECT username, password FROM users")
                 for row in raw_cur.fetchall() or []:
                     if row and len(row) >= 2:
                         u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
                         if u_dec in target_names and row[1] is not None:
-                            all_stored.append(row[1])
+                            cloud_stored.append(row[1])
+                raw_cur.close()
             finally:
                 try:
-                    raw_cur.close()
+                    pg_conn.close()
                 except Exception:
                     pass
         except Exception:
             pass
 
+    # If Cloud has a matching password (custom or default), heal local cache and succeed immediately!
+    if cloud_stored:
+        cloud_custom = [p for p in cloud_stored if _is_custom_pw(p)]
+        if any(_pw_matches(p) for p in cloud_custom):
+            try:
+                update_user_password_everywhere(username, hash_strip)
+            except Exception:
+                pass
+            return True
+        if not cloud_custom and any(_pw_matches(p) for p in cloud_stored):
+            try:
+                update_user_password_everywhere(username, hash_strip)
+            except Exception:
+                pass
+            return True
+
+    # 2. Local SQLite offline cache & Active DB
+    for db_opener in (
+        lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
+        lambda: sqlite3.connect(TEMP_DB_PATH),
+    ):
+        try:
+            conn = db_opener()
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT username, password FROM users")
+                for row in cur.fetchall() or []:
+                    if row and len(row) >= 2:
+                        u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
+                        if u_dec in target_names and row[1] is not None:
+                            local_stored.append(row[1])
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    all_stored = cloud_stored + local_stored
     custom_candidates = [p for p in all_stored if _is_custom_pw(p)]
     default_candidates = [p for p in all_stored if not _is_custom_pw(p)]
 
-    # 1. Check if entered password matches ANY stored custom password in live DBs
     if any(_pw_matches(p) for p in custom_candidates):
         try:
             update_user_password_everywhere(username, hash_strip)
@@ -7106,7 +7339,7 @@ def verify_user_password_everywhere(username, entered_password):
             pass
         return True
 
-    # 2. Check local snapshot backups ONLY for CUSTOM passwords (never for default 'admin')
+    # 3. Check local snapshot backups ONLY for CUSTOM passwords
     if hash_strip != default_admin_hash and entered_strip.lower() != "admin":
         try:
             b_dir = get_local_backups_dir()
@@ -7136,7 +7369,7 @@ def verify_user_password_everywhere(username, entered_password):
         except Exception:
             pass
 
-    # 3. If the user has NO custom password set anywhere in live DBs (still default 'admin'):
+    # 4. If the user has NO custom password set anywhere (still default 'admin'):
     if not custom_candidates:
         if any(_pw_matches(p) for p in default_candidates):
             return True
@@ -7147,7 +7380,7 @@ def verify_user_password_everywhere(username, entered_password):
 
 
 def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed):
-    """Bi-directional merge of users table preserving custom passwords and syncing password changes by updated_at timestamp."""
+    """Bi-directional merge of users table preserving custom passwords and syncing password changes."""
     default_admin_hash = hashlib.sha256("admin".encode()).hexdigest().lower()
     try:
         lcur.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT ''")
@@ -7223,15 +7456,17 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
 
             # Determine which side wins:
             # 1) Custom beats default 'admin'
-            # 2) If both custom, newer updated_at beats older updated_at
+            # 2) If both custom, Cloud wins unless Local has a strictly newer non-empty updated_at AND Cloud also has updated_at
             local_wins = False
             if l_is_cust and not c_is_cust:
                 local_wins = True
             elif l_is_cust and c_is_cust:
-                if l_upd and (not c_upd or l_upd > c_upd) and l_dec_p != c_dec_p:
+                if l_upd and c_upd and l_upd > c_upd and l_dec_p != c_dec_p:
                     local_wins = True
 
+            clean_u = str(decrypt_val(c_row_list[u_idx]) if c_row_list[u_idx] else dec_u).strip()
             if local_wins:
+                c_row_list[u_idx] = clean_u
                 c_row_list[p_idx] = l_dec_p
                 if upd_idx != -1 and len(c_row_list) > upd_idx:
                     c_row_list[upd_idx] = l_upd
@@ -7240,49 +7475,37 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
                     raw_pg_cur.execute("SELECT username FROM users")
                     for pr in raw_pg_cur.fetchall() or []:
                         if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
-                            try:
-                                raw_pg_cur.execute(
-                                    "UPDATE users SET password = %s, updated_at = %s WHERE username = %s",
-                                    (_encrypt_for_col("password", l_dec_p), l_upd, pr[0]),
-                                )
-                            except Exception:
-                                raw_pg_cur.execute(
-                                    "UPDATE users SET password = %s WHERE username = %s",
-                                    (_encrypt_for_col("password", l_dec_p), pr[0]),
-                                )
+                            raw_pg_cur.execute("DELETE FROM users WHERE username = %s", (pr[0],))
+                    enc_u = _encrypt_for_col("username", clean_u)
+                    enc_p = _encrypt_for_col("password", l_dec_p)
+                    try:
+                        raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
+                    except Exception:
+                        raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
                     raw_pg_cur.close()
                 except Exception:
                     pass
                 final_rows.append(tuple(c_row_list))
             else:
-                # Cloud wins (has newer custom password or equal)
-                if c_is_cust:
-                    try:
-                        raw_pg_cur = pg_cur.conn.cursor()
-                        raw_pg_cur.execute("SELECT username FROM users")
-                        for pr in raw_pg_cur.fetchall() or []:
-                            if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
-                                try:
-                                    raw_pg_cur.execute(
-                                        "UPDATE users SET password = %s, updated_at = %s WHERE username = %s",
-                                        (_encrypt_for_col("password", c_dec_p), c_upd, pr[0]),
-                                    )
-                                except Exception:
-                                    raw_pg_cur.execute(
-                                        "UPDATE users SET password = %s WHERE username = %s",
-                                        (_encrypt_for_col("password", c_dec_p), pr[0]),
-                                    )
-                        raw_pg_cur.close()
-                    except Exception:
-                        pass
+                # Cloud wins -> store clean decrypted username and password locally, and deduplicate Postgres
+                c_row_list[u_idx] = clean_u
+                c_row_list[p_idx] = c_dec_p
+                if upd_idx != -1 and len(c_row_list) > upd_idx:
+                    c_row_list[upd_idx] = c_upd
                 final_rows.append(tuple(c_row_list))
         elif c_info:
             c_row_list, c_dec_p, c_is_cust, c_upd = c_info
+            clean_u = str(decrypt_val(c_row_list[u_idx]) if c_row_list[u_idx] else dec_u).strip()
+            c_row_list[u_idx] = clean_u
+            c_row_list[p_idx] = c_dec_p
+            if upd_idx != -1 and len(c_row_list) > upd_idx:
+                c_row_list[upd_idx] = c_upd
             final_rows.append(tuple(c_row_list))
         elif l_info:
             l_raw_u, l_raw_p, l_dec_p, l_is_cust, l_upd = l_info
+            clean_u = str(decrypt_val(l_raw_u)).strip()
             new_row = [None] * len(use_cols)
-            new_row[u_idx] = str(decrypt_val(l_raw_u)).strip()
+            new_row[u_idx] = clean_u
             new_row[p_idx] = l_dec_p
             if upd_idx != -1 and len(new_row) > upd_idx:
                 new_row[upd_idx] = l_upd
@@ -7290,7 +7513,7 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
             # Push local-only user to Cloud
             try:
                 raw_pg_cur = pg_cur.conn.cursor()
-                enc_u = _encrypt_for_col("username", new_row[u_idx])
+                enc_u = _encrypt_for_col("username", clean_u)
                 enc_p = _encrypt_for_col("password", l_dec_p)
                 try:
                     raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
@@ -10164,6 +10387,19 @@ if HAS_DEPS:
                     pass
 
             self._apply_custom_widget_styles()
+            def _startup_maintenance():
+                try:
+                    run_one_time_admin_envelopes_to_moe_migration()
+                except Exception:
+                    pass
+                try:
+                    heal_encrypted_envelope_descriptions()
+                except Exception:
+                    pass
+            try:
+                threading.Thread(target=_startup_maintenance, daemon=True).start()
+            except Exception:
+                pass
 
             # Initialize Vagaro Sync Variables
             self.sync_employees_var = tk.BooleanVar(value=True)
@@ -18820,7 +19056,8 @@ if HAS_DEPS:
             emp_list = [gen_txt]
             emp_id_map = {gen_txt: None}
             for e_id, e_name in employees:
-                display_str = f"{e_name} (ID: {e_id})"
+                dec_ename = plain_label(e_name) or str(e_name or "")
+                display_str = f"{dec_ename} (ID: {e_id})"
                 emp_list.append(display_str)
                 emp_id_map[display_str] = e_id
                 
@@ -18916,8 +19153,9 @@ if HAS_DEPS:
             assignee_list = [self._tr("General/None")]
             assignee_id_map = {self._tr("General/None"): None}
             for e_id, e_name in employees:
-                if e_name.lower() != "shop":
-                    display_str = f"{e_name} (ID: {e_id})"
+                dec_ename = plain_label(e_name) or str(e_name or "")
+                if dec_ename.lower() != "shop":
+                    display_str = f"{dec_ename} (ID: {e_id})"
                     assignee_list.append(display_str)
                     assignee_id_map[display_str] = e_id
             assignee_cbo['values'] = assignee_list
@@ -18943,8 +19181,8 @@ if HAS_DEPS:
 
             lbl_status = tb.Label(form, text=self._tr("Status:"), font=("Segoe UI", 10, "bold"))
             status_cbo = tb.Combobox(form, width=28, state="readonly", values=["Pending", "Approved", "Rejected"])
-            if data:
-                status_cbo.set(data[4])
+            if data and len(data) > 4:
+                status_cbo.set(plain_label(data[4]) or "Pending")
             else:
                 status_cbo.set("Pending")
 
@@ -18952,7 +19190,7 @@ if HAS_DEPS:
             pts = self.get_db_payments()
             pay_type_cbo = tb.Combobox(form, width=28, state="readonly", values=pts)
             if data and len(data) > 6 and data[6]:
-                pay_type_cbo.set(data[6])
+                pay_type_cbo.set(plain_label(data[6]) or data[6])
             else:
                 pay_type_cbo.set("Cash" if "Cash" in pts else (pts[0] if pts else ""))
 
@@ -18960,14 +19198,14 @@ if HAS_DEPS:
             locs = [""] + self.get_db_locations()
             loc_cbo = tb.Combobox(form, width=28, state="readonly", values=locs)
             if data and len(data) > 7 and data[7]:
-                loc_cbo.set(data[7])
+                loc_cbo.set(plain_label(data[7]) or "")
             else:
                 loc_cbo.set("")
 
             lbl_desc = tb.Label(form, text=self._tr("Description:"), font=("Segoe UI", 10, "bold"))
             desc_ent = tb.Entry(form, width=30)
-            if data:
-                desc_ent.insert(0, data[5] if data[5] else "")
+            if data and len(data) > 5:
+                desc_ent.insert(0, plain_label(data[5]) if data[5] else "")
 
             lbl_doc = tb.Label(form, text=self._tr("Document / Receipt:"), font=("Segoe UI", 10, "bold"))
             doc_outer = tb.Frame(form)
@@ -19239,10 +19477,10 @@ if HAS_DEPS:
                                     pass
                                 return
                         
-                    status = status_cbo.get() or "Pending"
-                    description = desc_ent.get().strip()
-                    pay_type = pay_type_cbo.get()
-                    location = loc_cbo.get()
+                    status = plain_label(status_cbo.get() or "Pending") or "Pending"
+                    description = plain_label(desc_ent.get().strip())
+                    pay_type = plain_label(pay_type_cbo.get())
+                    location = plain_label(loc_cbo.get())
                     # Resolve cycle_key from combobox selection with fallback to date
                     cycle_val = str(cycle_cbo.get() or "").strip()
                     cycle_key = cycle_key_map.get(cycle_val)
@@ -23098,6 +23336,11 @@ if HAS_DEPS:
             def load_users():
                 users_list.delete(0, tk.END)
                 seen = set()
+                if get_db_mode() == "supabase":
+                    try:
+                        refresh_offline_cache_from_cloud()
+                    except Exception:
+                        pass
                 for db_fetch in (
                     lambda: sqlite3.connect(TEMP_DB_PATH),
                     lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
@@ -23116,26 +23359,72 @@ if HAS_DEPS:
                         pass
 
             add_row = tb.Frame(tab_users)
-            add_row.pack(fill=X, pady=10)
-            tb.Label(add_row, text=self._tr("New username"), font=("Segoe UI", 10, "bold")).pack(side=LEFT)
-            new_user_ent = tb.Entry(add_row, width=22)
-            new_user_ent.pack(side=LEFT, padx=8)
+            add_row.pack(fill=X, pady=8)
+            tb.Label(add_row, text=self._tr("New username:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT)
+            new_user_ent = tb.Entry(add_row, width=18)
+            new_user_ent.pack(side=LEFT, padx=6)
+            tb.Label(add_row, text=self._tr("Password:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(8, 0))
+            new_user_pw_ent = tb.Entry(add_row, width=18)
+            new_user_pw_ent.insert(0, "admin")
+            new_user_pw_ent.pack(side=LEFT, padx=6)
 
             def add_user():
                 uname = new_user_ent.get().strip()
+                pw_val = (new_user_pw_ent.get() or "").strip() or "admin"
                 if not uname:
                     return
                 try:
-                    update_user_password_everywhere(uname, "admin")
+                    update_user_password_everywhere(uname, pw_val)
                     new_user_ent.delete(0, tk.END)
+                    new_user_pw_ent.delete(0, tk.END)
+                    new_user_pw_ent.insert(0, "admin")
                     load_users()
                     messagebox.showinfo(
                         "Users",
-                        self._tr("Username added. Default password is admin until they change it."),
+                        f"User '{uname}' added and synced to Cloud with password '{pw_val}'.",
                         parent=dialog,
                     )
                 except Exception as e:
                     messagebox.showerror("Error", str(e), parent=dialog)
+
+            tb.Button(add_row, text=self._tr("+ Add User"), bootstyle="success", command=add_user).pack(side=LEFT, padx=6)
+
+            pw_row = tb.Frame(tab_users)
+            pw_row.pack(fill=X, pady=6)
+            tb.Label(pw_row, text=self._tr("Set password for selected user:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT)
+            set_user_pw_ent = tb.Entry(pw_row, width=20)
+            set_user_pw_ent.pack(side=LEFT, padx=8)
+
+            def set_selected_user_password():
+                sel = users_list.curselection()
+                if not sel:
+                    messagebox.showwarning("Select", "Please select a user from the list first.", parent=dialog)
+                    return
+                target_u = users_list.get(sel[0])
+                new_p = (set_user_pw_ent.get() or "").strip()
+                if not new_p:
+                    messagebox.showwarning("Password", "Please enter a new password.", parent=dialog)
+                    return
+                update_user_password_everywhere(target_u, new_p)
+                set_user_pw_ent.delete(0, tk.END)
+                messagebox.showinfo(
+                    "Password Synced",
+                    f"✅ Password for '{target_u}' has been updated locally and synced to Cloud!",
+                    parent=dialog,
+                )
+
+            tb.Button(
+                pw_row,
+                text=self._tr("🔑 Set Password & Sync"),
+                bootstyle="warning",
+                command=set_selected_user_password,
+            ).pack(side=LEFT, padx=6)
+
+            rename_row = tb.Frame(tab_users)
+            rename_row.pack(fill=X, pady=6)
+            tb.Label(rename_row, text=self._tr("Rename selected to:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT)
+            rename_user_ent = tb.Entry(rename_row, width=20)
+            rename_user_ent.pack(side=LEFT, padx=8)
 
             def rename_user():
                 sel = users_list.curselection()
@@ -23154,6 +23443,13 @@ if HAS_DEPS:
                         new_uname_ent.insert(0, who)
                     except Exception:
                         pass
+
+            tb.Button(
+                rename_row,
+                text=self._tr("Rename Selected"),
+                bootstyle="info",
+                command=rename_user,
+            ).pack(side=LEFT, padx=6)
 
             def delete_user():
                 sel = users_list.curselection()
@@ -23178,20 +23474,6 @@ if HAS_DEPS:
                 conn.close()
                 load_users()
 
-            tb.Button(add_row, text=self._tr("Add User"), bootstyle="success", command=add_user).pack(side=LEFT, padx=6)
-
-            rename_row = tb.Frame(tab_users)
-            rename_row.pack(fill=X, pady=(0, 8))
-            tb.Label(rename_row, text=self._tr("New username:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT)
-            rename_user_ent = tb.Entry(rename_row, width=22)
-            rename_user_ent.pack(side=LEFT, padx=8)
-            tb.Button(
-                rename_row,
-                text=self._tr("Rename Selected"),
-                bootstyle="info",
-                command=rename_user,
-            ).pack(side=LEFT, padx=6)
-
             def _fill_rename(_e=None):
                 sel = users_list.curselection()
                 if not sel:
@@ -23200,7 +23482,21 @@ if HAS_DEPS:
                 rename_user_ent.insert(0, users_list.get(sel[0]))
 
             users_list.bind("<<ListboxSelect>>", _fill_rename)
-            tb.Button(tab_users, text=self._tr("🗑️ Delete Selected"), bootstyle="danger outline", command=delete_user).pack(anchor=W, pady=6)
+
+            bot_user_actions = tb.Frame(tab_users)
+            bot_user_actions.pack(fill=X, pady=8)
+            tb.Button(
+                bot_user_actions,
+                text=self._tr("🗑️ Delete Selected"),
+                bootstyle="danger outline",
+                command=delete_user,
+            ).pack(side=LEFT, padx=(0, 10))
+            tb.Button(
+                bot_user_actions,
+                text=self._tr("☁️ Sync Users with Cloud Now"),
+                bootstyle="primary outline",
+                command=lambda: (load_users(), messagebox.showinfo("Synced", "✅ Users and passwords synced with Cloud!", parent=dialog)),
+            ).pack(side=LEFT)
             load_users()
 
             tab_act = tb.Frame(notebook)
@@ -24117,8 +24413,10 @@ if HAS_DEPS:
                         continue
                     day = dt.day
                     amt_f = to_float(amt, 0.0)
-                    status_s = str(decrypt_val(status) if status is not None else "").strip()
-                    desc_s = str(decrypt_val(desc) if desc is not None else "").strip()
+                    status_s = plain_label(status)
+                    desc_s = plain_label(desc)
+                    assignee_s = plain_label(assignee) or "Unassigned"
+                    loc_s = plain_label(loc)
                     if desc_s:
                         notes_by_day.setdefault(day, []).append(desc_s)
 
@@ -24128,9 +24426,9 @@ if HAS_DEPS:
                         "id": exp_id,
                         "amount": amt_f,
                         "status": status_s,
-                        "assignee": assignee if assignee else "Unassigned",
+                        "assignee": assignee_s,
                         "description": desc_s,
-                        "location": loc if loc else "",
+                        "location": loc_s,
                         "owner": owner_s,
                     })
                     total_count += 1
@@ -24535,16 +24833,16 @@ if HAS_DEPS:
                         owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else "admin"
                         if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
                             continue
-                        row_vals[1] = row_vals[1] if row_vals[1] else "General/None"
+                        row_vals[1] = plain_label(row_vals[1]) or "General/None"
                         amt = to_float(row_vals[2], 0.0)
                         row_vals[2] = f"${amt:,.2f}"
-                        st_v = str(decrypt_val(row_vals[3]) if row_vals[3] is not None else "").strip()
+                        st_v = plain_label(row_vals[3])
                         row_vals[3] = st_v
-                        loc = str(decrypt_val(row_vals[4]) if row_vals[4] is not None else "").strip()
+                        loc = plain_label(row_vals[4])
                         row_vals[4] = loc
                         if loc:
                             present_locs.add(loc)
-                        row_vals[5] = row_vals[5] if row_vals[5] else ""
+                        row_vals[5] = plain_label(row_vals[5])
                         day_cnt += 1
                         day_tot += amt
                         if st_v == "Approved":
