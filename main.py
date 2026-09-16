@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.50"
+APP_VERSION = "2.5.51"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1826,19 +1826,43 @@ class PostgresCursorProxy:
                                         self.conn.rollback()
                                     except Exception:
                                         pass
-                                if is_db_compatibility_or_schema_error(inner_e):
+                                if is_db_compatibility_or_schema_error(inner_e) and _is_app_actually_outdated():
                                     try:
                                         trigger_db_update_required_popup(inner_e)
                                     except Exception:
                                         pass
                                 raise inner_e
                     else:
-                        if is_db_compatibility_or_schema_error(inner_e):
+                        err_l = str(inner_e).lower()
+                        if any(m in err_l for m in ("does not exist", "undefinedtable", "undefinedcolumn", "no such table", "no such column")):
                             try:
-                                trigger_db_update_required_popup(inner_e)
+                                self.conn.rollback()
                             except Exception:
                                 pass
-                        raise
+                            try:
+                                ensure_all_supabase_tables(self.conn)
+                                self.cursor.execute(f"SAVEPOINT {sp_name}_fix")
+                                self.cursor.execute(translated_query, encrypted_p or ())
+                                _buffer_results()
+                                self.cursor.execute(f"RELEASE SAVEPOINT {sp_name}_fix")
+                            except Exception as retry_e2:
+                                try:
+                                    self.conn.rollback()
+                                except Exception:
+                                    pass
+                                if is_db_compatibility_or_schema_error(retry_e2) and _is_app_actually_outdated():
+                                    try:
+                                        trigger_db_update_required_popup(retry_e2)
+                                    except Exception:
+                                        pass
+                                raise retry_e2
+                        else:
+                            if is_db_compatibility_or_schema_error(inner_e) and _is_app_actually_outdated():
+                                try:
+                                    trigger_db_update_required_popup(inner_e)
+                                except Exception:
+                                    pass
+                            raise
             finally:
                 pass
         else:
@@ -1852,12 +1876,42 @@ class PostgresCursorProxy:
                 except Exception:
                     pass
             except Exception as inner_e:
-                if is_db_compatibility_or_schema_error(inner_e):
+                err_l = str(inner_e).lower()
+                if any(m in err_l for m in ("does not exist", "undefinedtable", "undefinedcolumn", "no such table", "no such column")):
                     try:
-                        trigger_db_update_required_popup(inner_e)
+                        self.conn.rollback()
                     except Exception:
                         pass
-                raise
+                    try:
+                        ensure_all_supabase_tables(self.conn)
+                        self.cursor.execute(translated_query, encrypted_p or ())
+                        _buffer_results()
+                        try:
+                            self._description = self.cursor.description
+                        except Exception:
+                            pass
+                    except Exception as retry_e2:
+                        try:
+                            self.conn.rollback()
+                        except Exception:
+                            pass
+                        if is_db_compatibility_or_schema_error(retry_e2) and _is_app_actually_outdated():
+                            try:
+                                trigger_db_update_required_popup(retry_e2)
+                            except Exception:
+                                pass
+                        raise retry_e2
+                else:
+                    try:
+                        self.conn.rollback()
+                    except Exception:
+                        pass
+                    if is_db_compatibility_or_schema_error(inner_e) and _is_app_actually_outdated():
+                        try:
+                            trigger_db_update_required_popup(inner_e)
+                        except Exception:
+                            pass
+                    raise
         if needs_savepoint:
             self._description = None
 
@@ -9831,6 +9885,26 @@ def is_db_compatibility_or_schema_error(err, title=""):
     return any(m in msg for m in db_text_markers)
 
 
+def _is_app_actually_outdated(app_inst=None):
+    """Return True ONLY if the running app version is genuinely older than MIN_REQUIRED_VERSION or a verified newer remote release."""
+    try:
+        cur_ver = get_active_code_info().get("version", APP_VERSION)
+        cur_tuple = _parse_version_tuple(cur_ver)
+        min_req = get_central_min_required_version()
+        if cur_tuple < _parse_version_tuple(min_req):
+            return True
+        if app_inst is not None:
+            det_ver = getattr(app_inst, "_update_detected_version", None) or getattr(app_inst, "_cached_bottom_remote_ver", None)
+            if det_ver and _parse_version_tuple(det_ver) > cur_tuple:
+                return True
+        has_upd, rem_ver, _ = check_for_cloud_update(force_network=False)
+        if has_upd and rem_ver and _parse_version_tuple(rem_ver) > cur_tuple:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def trigger_db_update_required_popup(err=None, title="", parent=None):
     """Thread-safe trigger to show the Update Required popup and Bottom Yellow Update Button."""
     global _LAST_DB_UPDATE_POPUP_TIME
@@ -9838,8 +9912,10 @@ def trigger_db_update_required_popup(err=None, title="", parent=None):
     now = _t.time()
     if now - _LAST_DB_UPDATE_POPUP_TIME < 2.0:
         return
-    _LAST_DB_UPDATE_POPUP_TIME = now
     app_inst = GLOBAL_APP_INSTANCE
+    if not _is_app_actually_outdated(app_inst):
+        return
+    _LAST_DB_UPDATE_POPUP_TIME = now
     if app_inst is not None:
         try:
             app_inst.after(0, lambda: app_inst.show_db_update_required_popup(error_details=err, title=title, parent=parent))
@@ -10785,8 +10861,8 @@ if HAS_DEPS:
 
             def _wrapped_showerror(title, message, **kwargs):
                 try:
-                    if is_db_compatibility_or_schema_error(message, title):
-                        app = GLOBAL_APP_INSTANCE or self
+                    app = GLOBAL_APP_INSTANCE or self
+                    if is_db_compatibility_or_schema_error(message, title) and _is_app_actually_outdated(app):
                         if app is not None:
                             parent = kwargs.get("parent", app)
                             app.after(
@@ -10809,7 +10885,7 @@ if HAS_DEPS:
             """Tkinter hook for unhandled exceptions in widget callbacks."""
             import traceback as _tb
             detail = "".join(_tb.format_exception(exc, val, tb_obj))
-            if is_db_compatibility_or_schema_error(val) or is_db_compatibility_or_schema_error(detail):
+            if (is_db_compatibility_or_schema_error(val) or is_db_compatibility_or_schema_error(detail)) and _is_app_actually_outdated(self):
                 self.show_db_update_required_popup(
                     error_details=detail,
                     title="Database Error — Update Required",
@@ -11039,6 +11115,8 @@ if HAS_DEPS:
 
         def show_db_update_required_popup(self, error_details=None, title="", parent=None):
             """Pops out a dedicated modal window informing the user they need to update due to missed updates / DB error."""
+            if not _is_app_actually_outdated(self):
+                return
             try:
                 self._db_error_update_needed = True
                 self.ensure_bottom_yellow_update_bar(force_show=True)
@@ -11062,7 +11140,7 @@ if HAS_DEPS:
             win.geometry("600x470")
             win.minsize(540, 430)
             win.transient(parent_win)
-            _safe_grab_set(win)
+            self._safe_grab_set(win)
 
             def _close_popup():
                 self._active_db_update_popup = None
@@ -11070,7 +11148,7 @@ if HAS_DEPS:
                     self.ensure_bottom_yellow_update_bar(force_show=True)
                 except Exception:
                     pass
-                _safe_grab_release(win, parent_win)
+                self._safe_grab_release(win, parent_win)
                 try:
                     win.destroy()
                 except Exception:
@@ -11180,7 +11258,7 @@ if HAS_DEPS:
 
         def show_app_error(self, title, error, parent=None):
             """Error popup with optional Save-to-file for support/debugging."""
-            if is_db_compatibility_or_schema_error(error, title):
+            if is_db_compatibility_or_schema_error(error, title) and _is_app_actually_outdated(self):
                 return self.show_db_update_required_popup(
                     error_details=error,
                     title=title or "Database Error",
@@ -21563,6 +21641,10 @@ if HAS_DEPS:
                     )
                     cursor = conn.cursor()
                     cursor.execute("SELECT 1")
+                    try:
+                        ensure_all_supabase_tables(conn)
+                    except Exception:
+                        pass
                     conn.close()
                     # Update variables with working auto-discovered IPv4 pooler parameters
                     host = active_host
@@ -21574,7 +21656,8 @@ if HAS_DEPS:
                 except Exception as e:
                     messagebox.showerror("Connection Failed", f"Could not connect to DB: {e}", parent=dialog)
                     return
-                    
+
+                global _DB_CONFIG_MEM, _SUPABASE_OFFLINE
                 default_dir = get_default_app_dir()
                 config_file = os.path.join(default_dir, "location_config.json")
                 try:
@@ -21586,15 +21669,19 @@ if HAS_DEPS:
                     new_config["supabase_port"] = str(port)
                     new_config["supabase_database"] = database
                     new_config["supabase_user"] = username
+                    _DB_CONFIG_MEM = dict(new_config)
                     with open(config_file, "w", encoding="utf-8") as f:
                         json.dump(new_config, f, indent=4)
-                    global _SUPABASE_OFFLINE
                     _SUPABASE_OFFLINE = False
                     close_shared_supabase_conn()
                     enable_local_first_mode()
+                    threading.Thread(
+                        target=lambda: sync_local_cache_with_cloud(backfill=True, init_schema=True),
+                        daemon=True,
+                    ).start()
                     self.start_live_sync()
                     refresh_storage_meter()
-                    messagebox.showinfo("Success", f"DB configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nCloud DB live sync (every 30s) is now active!", parent=dialog)
+                    messagebox.showinfo("Success", f"DB configuration verified and saved!\n\nActive Host: {host}\nActive Port: {port}\nActive User: {username}\n\nAll cloud tables initialized & live sync is now active!", parent=dialog)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to save configuration: {e}", parent=dialog)
 
