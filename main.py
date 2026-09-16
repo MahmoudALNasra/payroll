@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.49"
+APP_VERSION = "2.5.50"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -996,7 +996,10 @@ def get_app_dir():
             
     return default_dir
 
+_DB_CONFIG_MEM = None
+
 def get_db_config():
+    global _DB_CONFIG_MEM
     default_dir = get_default_app_dir()
     config_file = os.path.join(default_dir, "location_config.json")
     if os.path.exists(config_file):
@@ -1005,10 +1008,12 @@ def get_db_config():
             with open(config_file, "r", encoding="utf-8") as f:
                 res = json.load(f)
                 if isinstance(res, dict):
+                    if _DB_CONFIG_MEM:
+                        res.update(_DB_CONFIG_MEM)
                     return res
         except Exception:
             pass
-    return {}
+    return dict(_DB_CONFIG_MEM) if _DB_CONFIG_MEM else {}
 
 def get_db_mode():
     return get_db_config().get("mode", "local")
@@ -3192,34 +3197,53 @@ def _sync_log(msg):
 
 
 def _persist_offline_cache():
-    """Encrypt the offline working SQLite file to disk and update daily local snapshot."""
-    global _OFFLINE_CACHE_CIPHER, _OFFLINE_CACHE_SALT
-    path = OFFLINE_TEMP_DB_PATH
-    if not path or not os.path.exists(path):
+    """Encrypt the working SQLite file to disk (both CLOUD_CACHE_FILE and DB_FILE) and update daily local snapshot."""
+    global _OFFLINE_CACHE_CIPHER, _OFFLINE_CACHE_SALT, CIPHER_SUITE, SALT
+    path = OFFLINE_TEMP_DB_PATH or TEMP_DB_PATH
+    if not path or path == SUPABASE_DB_SENTINEL or not os.path.exists(str(path)):
         return
-    if _OFFLINE_CACHE_CIPHER is None or _OFFLINE_CACHE_SALT is None:
-        return
+    password = DEFAULT_ENCRYPTION_PASSWORD
+    if _OFFLINE_CACHE_SALT is None or _OFFLINE_CACHE_CIPHER is None:
+        _OFFLINE_CACHE_SALT = SALT if SALT else os.urandom(16)
+        _OFFLINE_CACHE_CIPHER = get_cipher(password, _OFFLINE_CACHE_SALT)
+    SALT = _OFFLINE_CACHE_SALT
+    CIPHER_SUITE = _OFFLINE_CACHE_CIPHER
     try:
         try:
-            ck = _original_sqlite3_connect(path, timeout=5)
+            ck = _original_sqlite3_connect(str(path), timeout=5)
             try:
                 ck.execute("PRAGMA wal_checkpoint(PASSIVE)")
             finally:
                 ck.close()
         except Exception:
             pass
-        with open(path, "rb") as f:
+        with open(str(path), "rb") as f:
             data = f.read()
         encrypted = _OFFLINE_CACHE_CIPHER.encrypt(data)
-        with open(CLOUD_CACHE_FILE, "wb") as f:
-            f.write(_OFFLINE_CACHE_SALT + encrypted)
+        payload = _OFFLINE_CACHE_SALT + encrypted
+        # Write atomically to both CLOUD_CACHE_FILE and DB_FILE so Local DB is always 100% up-to-date in any mode
+        for target_file in (CLOUD_CACHE_FILE, DB_FILE):
+            if not target_file:
+                continue
+            try:
+                os.makedirs(os.path.dirname(target_file), exist_ok=True)
+                tmp_target = f"{target_file}.tmp"
+                with open(tmp_target, "wb") as f:
+                    f.write(payload)
+                os.replace(tmp_target, target_file)
+            except Exception:
+                try:
+                    with open(target_file, "wb") as f:
+                        f.write(payload)
+                except Exception:
+                    pass
         # Save timestamped daily snapshot on disk
         save_local_daily_snapshot()
     except Exception:
         pass
 
 
-def _schedule_persist_offline_cache(delay=1.25):
+def _schedule_persist_offline_cache(delay=0.25):
     """Encrypt the cache in the background so Save stays instant."""
     global _persist_timer
     def _run():
@@ -3287,6 +3311,8 @@ def schedule_cloud_push(delay=0.08):
 
 def cloud_sync_status_label(ok=True):
     """Short status for the live-sync label."""
+    if get_db_mode() != "supabase":
+        return "💾 Local DB Active (Cloud Discharged)"
     pending = offline_pending_count()
     err = (_LAST_SYNC_ERROR or "").strip()
     if pending:
@@ -3309,30 +3335,77 @@ def _close_offline_temp(remove_file=True):
             pass
 
 
+def _score_encrypted_db_candidate(enc_path, password):
+    """Decrypt candidate DB file and score it by total user rows and modification time so we never load an empty DB over a populated one."""
+    if not enc_path or not os.path.exists(enc_path):
+        return (-1, 0.0, None, None, b"")
+    try:
+        with open(enc_path, "rb") as f:
+            content = f.read()
+        if len(content) < 17:
+            return (-1, 0.0, None, None, b"")
+        salt = content[:16]
+        cipher = get_cipher(password, salt)
+        decrypted = cipher.decrypt(content[16:])
+        fd, tmp_p = tempfile.mkstemp(suffix="_score.db")
+        os.close(fd)
+        total_rows = 0
+        try:
+            with open(tmp_p, "wb") as tf:
+                tf.write(decrypted)
+            conn = _original_sqlite3_connect(tmp_p, timeout=5)
+            try:
+                cur = conn.cursor()
+                for tbl in ("payroll_records", "expenses", "employees"):
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                        total_rows += int((cur.fetchone() or [0])[0] or 0)
+                    except Exception:
+                        pass
+            finally:
+                conn.close()
+        finally:
+            try:
+                os.remove(tmp_p)
+            except Exception:
+                pass
+        mtime = os.path.getmtime(enc_path)
+        return (total_rows, mtime, salt, cipher, decrypted)
+    except Exception:
+        return (-1, 0.0, None, None, b"")
+
+
 def ensure_offline_cache_open():
-    """Decrypt or create the local cloud-cache SQLite and return its temp path."""
-    global OFFLINE_TEMP_DB_PATH, _OFFLINE_CACHE_SALT, _OFFLINE_CACHE_CIPHER
+    """Decrypt or create the unified local working SQLite DB and return its temp path."""
+    global OFFLINE_TEMP_DB_PATH, TEMP_DB_PATH, _OFFLINE_CACHE_SALT, _OFFLINE_CACHE_CIPHER, SALT, CIPHER_SUITE
     if OFFLINE_TEMP_DB_PATH and os.path.exists(OFFLINE_TEMP_DB_PATH):
+        if not TEMP_DB_PATH or TEMP_DB_PATH == SUPABASE_DB_SENTINEL:
+            TEMP_DB_PATH = OFFLINE_TEMP_DB_PATH
         return OFFLINE_TEMP_DB_PATH
 
     password = DEFAULT_ENCRYPTION_PASSWORD
+    # Evaluate both CLOUD_CACHE_FILE and DB_FILE so whichever has the user's records is loaded
+    candidates = []
+    for c_path in (CLOUD_CACHE_FILE, DB_FILE):
+        score = _score_encrypted_db_candidate(c_path, password)
+        if score[0] >= 0:
+            candidates.append(score)
+
     decrypted = b""
-    if os.path.exists(CLOUD_CACHE_FILE):
-        try:
-            with open(CLOUD_CACHE_FILE, "rb") as f:
-                content = f.read()
-            if len(content) >= 17:
-                _OFFLINE_CACHE_SALT = content[:16]
-                _OFFLINE_CACHE_CIPHER = get_cipher(password, _OFFLINE_CACHE_SALT)
-                decrypted = _OFFLINE_CACHE_CIPHER.decrypt(content[16:])
-        except Exception:
-            decrypted = b""
-            _OFFLINE_CACHE_SALT = None
-            _OFFLINE_CACHE_CIPHER = None
+    if candidates:
+        # Sort by (total_rows, mtime) descending so we never pick an empty DB over a populated DB
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best = candidates[0]
+        _OFFLINE_CACHE_SALT = best[2]
+        _OFFLINE_CACHE_CIPHER = best[3]
+        decrypted = best[4]
 
     if _OFFLINE_CACHE_SALT is None or _OFFLINE_CACHE_CIPHER is None:
         _OFFLINE_CACHE_SALT = os.urandom(16)
         _OFFLINE_CACHE_CIPHER = get_cipher(password, _OFFLINE_CACHE_SALT)
+
+    SALT = _OFFLINE_CACHE_SALT
+    CIPHER_SUITE = _OFFLINE_CACHE_CIPHER
 
     fd, path = tempfile.mkstemp(suffix="_cloud_cache.db")
     os.close(fd)
@@ -3341,6 +3414,7 @@ def ensure_offline_cache_open():
             f.write(decrypted)
 
     OFFLINE_TEMP_DB_PATH = path
+    TEMP_DB_PATH = path
     lite = _original_sqlite3_connect(path, timeout=15)
     try:
         lite.execute("PRAGMA journal_mode=WAL")
@@ -3352,7 +3426,59 @@ def ensure_offline_cache_open():
         lite.commit()
     finally:
         lite.close()
+    # Immediately mirror to both DB_FILE and CLOUD_CACHE_FILE so both are synchronized
+    _persist_offline_cache()
     return path
+
+
+def discharge_cloud_database_keep_local():
+    """Discharge/disconnect the Cloud Database while keeping 100% of the Local Database records intact on this PC."""
+    global _push_timer, _SUPABASE_OFFLINE, _LAST_SYNC_ERROR, TEMP_DB_PATH
+    try:
+        if _push_timer is not None:
+            _push_timer.cancel()
+            _push_timer = None
+    except Exception:
+        pass
+    close_shared_supabase_conn()
+    _SUPABASE_OFFLINE = False
+    _LAST_SYNC_ERROR = ""
+
+    path = ensure_offline_cache_open()
+    TEMP_DB_PATH = path
+    try:
+        lconn = _original_sqlite3_connect(path, timeout=15)
+        try:
+            lcur = lconn.cursor()
+            lcur.execute("DELETE FROM offline_sync_queue")
+            lconn.commit()
+        finally:
+            lconn.close()
+    except Exception:
+        pass
+
+    _persist_offline_cache()
+
+    global _DB_CONFIG_MEM
+    default_dir = get_default_app_dir()
+    config_file = os.path.join(default_dir, "location_config.json")
+    clean_config = get_db_config().copy()
+    clean_config["mode"] = "local"
+    clean_config["supabase_host"] = ""
+    clean_config["supabase_password"] = ""
+    clean_config["supabase_port"] = "6543"
+    clean_config["supabase_database"] = "postgres"
+    clean_config["supabase_user"] = "postgres"
+    _DB_CONFIG_MEM = dict(clean_config)
+    try:
+        os.makedirs(os.path.dirname(config_file), exist_ok=True)
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(clean_config, f, indent=4)
+    except Exception:
+        pass
+
+    enable_local_first_mode()
+    return True
 
 
 def _init_offline_schema(cursor):
@@ -5330,8 +5456,8 @@ class OfflineTrackingConnection:
 
     def commit(self):
         self._conn.commit()
+        _schedule_persist_offline_cache(0.15)
         if get_db_mode() == "supabase":
-            _schedule_persist_offline_cache()
             schedule_cloud_push()
 
     def rollback(self):
@@ -5340,6 +5466,7 @@ class OfflineTrackingConnection:
     def close(self):
         try:
             self._conn.commit()
+            _schedule_persist_offline_cache(0.15)
         except Exception:
             pass
         try:
@@ -7273,8 +7400,16 @@ def db_connect(database, *args, **kwargs):
                     raise sqlite3.OperationalError(
                         f"Failed to connect to DB: {str(e)}"
                     )
-    if database is None:
-        database = ensure_offline_cache_open()
+    if database is None or database == SUPABASE_DB_SENTINEL or _same_db_path(database, TEMP_DB_PATH) or _same_db_path(database, OFFLINE_TEMP_DB_PATH):
+        path = ensure_offline_cache_open()
+        conn = _original_sqlite3_connect(path, *args, **kwargs)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=8000")
+        except Exception:
+            pass
+        return OfflineTrackingConnection(conn)
     return _original_sqlite3_connect(database, *args, **kwargs)
 
 sqlite3.connect = db_connect
@@ -7990,33 +8125,28 @@ def get_cipher(password, salt):
     key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
     return Fernet(key)
 
-def commit_and_save(conn):
-    """Commits to the temp SQLite database, then encrypts it to the permanent file."""
+def commit_and_save(conn=None):
+    """Commits to the working SQLite database, then encrypts and saves it to both DB_FILE and CLOUD_CACHE_FILE."""
     try:
         _record_action_for_auto_backup("commit")
     except Exception:
         pass
+    if conn is not None:
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    _persist_offline_cache()
     if get_db_mode() == "supabase":
-        conn.commit()
-        if is_supabase_offline() or using_local_cache():
-            _schedule_persist_offline_cache()
-            schedule_cloud_push(0.05)
-        return
-    conn.commit()
-    
-    # Read the decrypted temporary database
-    with open(TEMP_DB_PATH, "rb") as f:
-        data = f.read()
-        
-    # Encrypt the raw bytes
-    encrypted = CIPHER_SUITE.encrypt(data)
-    
-    # Write the Salt + Encrypted Data to the portable file
-    with open(DB_FILE, "wb") as f:
-        f.write(SALT + encrypted)
+        schedule_cloud_push(0.05)
+
+
+def save_database(conn=None):
+    commit_and_save(conn)
+
 
 def cleanup():
-    """Securely deletes the temporary decrypted database when the app closes and releases directory locks."""
+    """Securely saves the active local database to disk, then deletes temporary files when the app closes."""
     try:
         if getattr(sys, "frozen", False):
             app_dir = os.path.dirname(sys.executable)
@@ -8024,17 +8154,25 @@ def cleanup():
                 os.chdir(app_dir)
     except Exception:
         pass
-    if get_db_mode() == "supabase":
+    try:
         close_shared_supabase_conn()
+    except Exception:
+        pass
+    try:
         _persist_offline_cache()
+    except Exception:
+        pass
+    try:
         _close_offline_temp(remove_file=True)
-        return
-    if TEMP_DB_PATH and os.path.exists(TEMP_DB_PATH):
+    except Exception:
+        pass
+    if TEMP_DB_PATH and os.path.exists(str(TEMP_DB_PATH)):
         try:
-            os.remove(TEMP_DB_PATH)
-        except:
+            os.remove(str(TEMP_DB_PATH))
+        except Exception:
             pass
-            
+
+
 atexit.register(cleanup)
 
 
@@ -10283,40 +10421,13 @@ if HAS_DEPS:
             
         def unlock_database_silently(self):
             global TEMP_DB_PATH, CIPHER_SUITE, SALT
-            
             if get_db_mode() == "supabase":
                 init_supabase_cipher()
-                # Work from the local cache immediately for instantaneous startup.
-                enable_local_first_mode()
-                return
-
-            password = DEFAULT_ENCRYPTION_PASSWORD
-            
-            if os.path.exists(DB_FILE):
-                with open(DB_FILE, "rb") as f:
-                    content = f.read()
-                SALT = content[:16]
-                encrypted_data = content[16:]
-                CIPHER_SUITE = get_cipher(password, SALT)
-                
-                try:
-                    decrypted = CIPHER_SUITE.decrypt(encrypted_data)
-                except Exception:
-                    messagebox.showerror("Access Denied", "Failed to decrypt database. It may be corrupted or encrypted with a different key.")
-                    sys.exit(1)
-            else:
-                # New Database
-                SALT = os.urandom(16)
-                CIPHER_SUITE = get_cipher(password, SALT)
-                decrypted = b""
-                
-            # Create isolated temporary file for sqlite to use
-            fd, TEMP_DB_PATH = tempfile.mkstemp(suffix=".db")
-            os.close(fd)
-            
-            if decrypted:
-                with open(TEMP_DB_PATH, "wb") as f:
-                    f.write(decrypted)
+            path = enable_local_first_mode()
+            TEMP_DB_PATH = path
+            SALT = _OFFLINE_CACHE_SALT
+            CIPHER_SUITE = _OFFLINE_CACHE_CIPHER
+            _persist_offline_cache()
 
         def clear_window(self):
             """Safely tear down the main UI. Ignores Tcl destroy races (DateEntry/ToolTip/busy)."""
@@ -21598,6 +21709,52 @@ if HAS_DEPS:
             tb.Button(btn_row, text="Upload Local → Cloud", bootstyle="warning", command=do_upload_local_to_cloud).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="📁 Sync Local Files → Cloud", bootstyle="info", command=do_sync_files).pack(side=LEFT, padx=(0, 8))
             tb.Button(btn_row, text="Clean Up Cloud Duplicates", bootstyle="secondary", command=do_cleanup_cloud).pack(side=LEFT)
+
+            # --- Discharge Cloud DB (Keep 100% Local DB) Card ---
+            discharge_card = tb.Labelframe(
+                tab_remote,
+                text=self._tr("💾 Discharge Cloud DB & Use Local Database Only"),
+                padding=12,
+                bootstyle="warning",
+            )
+            discharge_card.pack(fill=X, pady=(12, 6))
+
+            tb.Label(
+                discharge_card,
+                text=self._tr(
+                    "Want to disconnect from the Cloud Database and run purely on your Local Database on this PC?\n"
+                    "This keeps 100% of your existing Payroll, Expenses, Employees, and Settings safely saved on disk "
+                    "and permanently stops cloud syncing."
+                ),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+                justify=LEFT,
+                wraplength=680,
+            ).pack(anchor=W, pady=(0, 8))
+
+            def do_discharge_cloud_keep_local():
+                self.stop_live_sync()
+                discharge_cloud_database_keep_local()
+                db_host_var.set("")
+                db_password_var.set("")
+                self.invalidate_config_caches()
+                self._schedule_soft_ui_refresh(full=True)
+                messagebox.showinfo(
+                    "Cloud DB Discharged — Local DB Active",
+                    "The Cloud Database has been discharged!\n\n"
+                    "• Your Local Database is permanently active on this PC.\n"
+                    "• 100% of your Payroll, Expenses, and Employee records are preserved.\n"
+                    "• Every new record you enter is automatically saved to your Local Database.",
+                    parent=dialog,
+                )
+
+            tb.Button(
+                discharge_card,
+                text="☁️🚫 " + self._tr("Discharge Cloud DB (Keep Local DB Only)"),
+                bootstyle="warning",
+                cursor="hand2",
+                command=do_discharge_cloud_keep_local,
+            ).pack(anchor=W)
 
             # --- Detach PC & Wipe Local Data Card (Switch from Testing DB to Production DB) ---
             detach_card = tb.Labelframe(
