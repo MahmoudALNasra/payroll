@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.56"
+APP_VERSION = "2.5.57"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -3164,7 +3164,7 @@ OFFLINE_SYNC_TABLES = (
     "user_action_log",
     "database_history_log",
 )
-_LOCAL_FIRST = False
+_LOCAL_FIRST = True
 _SYNC_IN_PROGRESS = False
 _SYNC_LOCK = threading.Lock()
 _persist_timer = None
@@ -3598,16 +3598,12 @@ def enter_supabase_offline_mode(reason=""):
 
 
 def leave_supabase_offline_mode():
-    """Switch working DB back to the shared Postgres connection."""
+    """Mark Supabase online while keeping UI reads/writes on local SQLite cache for speed and thread safety."""
     global _SUPABASE_OFFLINE, TEMP_DB_PATH
     _persist_offline_cache()
     _SUPABASE_OFFLINE = False
-    if _LOCAL_FIRST:
-        # Stay on the local cache for UI speed; cloud is only used by background sync.
-        path = ensure_offline_cache_open()
-        TEMP_DB_PATH = path
-        return
-    TEMP_DB_PATH = SUPABASE_DB_SENTINEL
+    path = ensure_offline_cache_open()
+    TEMP_DB_PATH = path
 
 
 def using_local_cache():
@@ -3699,71 +3695,17 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
 def run_one_time_admin_envelopes_to_moe_migration():
     """One-time migration: reassign existing Cash Envelopes owned by 'admin' (or blank) to 'moe'."""
     prefs = load_ui_column_preferences()
-    if prefs.get("migrated_admin_envelopes_to_moe_v1"):
+    if prefs.get("migrated_admin_envelopes_to_moe_v2"):
         return 0
 
     updated_count = 0
-    # 1. Update local SQLite database / offline cache
-    try:
-        conn = sqlite3.connect(TEMP_DB_PATH)
-        cur = conn.cursor()
+    # 1. If in Supabase mode, ALWAYS attempt to update Cloud Postgres directly FIRST so cloud pulls don't overwrite local
+    cloud_ok = (get_db_mode() != "supabase")
+    if get_db_mode() == "supabase":
         try:
-            cur.execute("ALTER TABLE expenses ADD COLUMN owner TEXT DEFAULT ''")
-        except Exception:
-            pass
-        # Ensure user 'moe' exists in users table without overwriting any custom password in Cloud
-        try:
-            cur.execute("SELECT username FROM users")
-            has_moe_local = any(str(decrypt_val(r[0]) if r and r[0] else "").strip().lower() == "moe" for r in (cur.fetchall() or []))
-            if not has_moe_local:
-                cloud_moe_pw = None
-                if get_db_mode() == "supabase":
-                    try:
-                        pg_c = _open_supabase_pg_conn(timeout=4)
-                        try:
-                            rc = pg_c.cursor()
-                            rc.execute("SELECT username, password FROM users")
-                            for ur in rc.fetchall() or []:
-                                if ur and str(decrypt_val(ur[0]) if ur[0] else "").strip().lower() == "moe":
-                                    cloud_moe_pw = str(decrypt_val(ur[1]) if ur[1] else "").strip()
-                                    if cloud_moe_pw:
-                                        break
-                            rc.close()
-                        finally:
-                            pg_c.close()
-                    except Exception:
-                        pass
-                pw_to_insert = cloud_moe_pw or hashlib.sha256(b"admin").hexdigest().lower()
-                cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", ("moe", pw_to_insert))
-        except Exception:
-            pass
-
-        cur.execute("SELECT id, category, owner FROM expenses")
-        rows = cur.fetchall() or []
-        target_ids = []
-        for r in rows:
-            if not r:
-                continue
-            exp_id, raw_cat, raw_owner = r[0], r[1], r[2] if len(r) > 2 else ""
-            cat_str = plain_label(raw_cat)
-            owner_str = plain_label(raw_owner).strip().lower() if raw_owner else ""
-            if is_envelope_category(cat_str) and owner_str in ("", "admin"):
-                target_ids.append(exp_id)
-
-        for eid in target_ids:
-            cur.execute("UPDATE expenses SET owner = ? WHERE id = ?", ("moe", eid))
-            updated_count += 1
-        if target_ids:
-            commit_and_save(conn)
-        conn.close()
-    except Exception:
-        pass
-
-    # 2. If in Supabase mode and online, also update directly in Cloud Postgres (with short 4s timeout)
-    if get_db_mode() == "supabase" and not is_supabase_offline():
-        try:
-            pg_conn = _open_supabase_pg_conn(timeout=4)
+            pg_conn = _open_supabase_pg_conn(timeout=6)
             try:
+                leave_supabase_offline_mode()
                 raw_cur = pg_conn.cursor()
                 try:
                     raw_cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS owner TEXT DEFAULT ''")
@@ -3782,21 +3724,73 @@ def run_one_time_admin_envelopes_to_moe_migration():
                     p_id, p_cat, p_owner = pr[0], pr[1], pr[2] if len(pr) > 2 else ""
                     if is_envelope_category(plain_label(p_cat)):
                         p_owner_s = plain_label(p_owner).strip().lower() if p_owner else ""
-                        if p_owner_s in ("", "admin"):
+                        if p_owner_s in ("", "admin", "none"):
                             raw_cur.execute("UPDATE expenses SET owner = %s WHERE id = %s", (enc_moe, p_id))
                             updated_count += 1
                 pg_conn.commit()
                 raw_cur.close()
+                cloud_ok = True
             finally:
                 try:
                     pg_conn.close()
                 except Exception:
                     pass
         except Exception:
+            cloud_ok = False
+
+    # 2. Update all local SQLite databases (offline cache & TEMP_DB_PATH)
+    for db_opener in (
+        lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=10),
+        lambda: sqlite3.connect(TEMP_DB_PATH),
+    ):
+        try:
+            conn = db_opener()
+            if not conn:
+                continue
+            cur = conn.cursor()
+            try:
+                cur.execute("ALTER TABLE expenses ADD COLUMN owner TEXT DEFAULT ''")
+            except Exception:
+                pass
+            # Ensure user 'moe' exists in users table without overwriting any custom password
+            try:
+                cur.execute("SELECT username FROM users")
+                has_moe_local = any(str(decrypt_val(r[0]) if r and r[0] else "").strip().lower() == "moe" for r in (cur.fetchall() or []))
+                if not has_moe_local:
+                    default_pw = hashlib.sha256(b"admin").hexdigest().lower()
+                    cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", ("moe", default_pw))
+            except Exception:
+                pass
+
+            cur.execute("SELECT id, category, owner FROM expenses")
+            rows = cur.fetchall() or []
+            target_ids = []
+            for r in rows:
+                if not r:
+                    continue
+                exp_id, raw_cat, raw_owner = r[0], r[1], r[2] if len(r) > 2 else ""
+                cat_str = plain_label(raw_cat)
+                owner_str = plain_label(raw_owner).strip().lower() if raw_owner else ""
+                if is_envelope_category(cat_str) and owner_str in ("", "admin", "none"):
+                    target_ids.append(exp_id)
+
+            for eid in target_ids:
+                cur.execute("UPDATE expenses SET owner = ? WHERE id = ?", ("moe", eid))
+                updated_count += 1
+            if target_ids:
+                try:
+                    commit_and_save(conn)
+                except Exception:
+                    conn.commit()
+            conn.close()
+        except Exception:
             pass
 
-    prefs["migrated_admin_envelopes_to_moe_v1"] = True
-    save_ui_column_preferences(prefs)
+    # Only mark one-time migration complete if Cloud Postgres update succeeded (or not in supabase mode)
+    if cloud_ok:
+        prefs["migrated_admin_envelopes_to_moe_v2"] = True
+        save_ui_column_preferences(prefs)
+
     try:
         heal_encrypted_envelope_descriptions()
     except Exception:
@@ -7534,6 +7528,10 @@ def refresh_offline_cache_from_cloud():
     """Copy decrypted cloud tables into the local offline cache (for future offline use)."""
     if get_db_mode() != "supabase":
         return False
+    try:
+        run_one_time_admin_envelopes_to_moe_migration()
+    except Exception:
+        pass
     path = ensure_offline_cache_open()
     try:
         pg_proxy = get_shared_supabase_conn()
@@ -7813,19 +7811,7 @@ def db_connect(database, *args, **kwargs):
         else:
             database = TEMP_DB_PATH or ensure_offline_cache_open()
     if get_db_mode() == "supabase":
-        is_sentinel = database == SUPABASE_DB_SENTINEL or (
-            TEMP_DB_PATH == SUPABASE_DB_SENTINEL and database == TEMP_DB_PATH
-        )
-        use_local_cache = (not is_sentinel) and (
-            _SUPABASE_OFFLINE
-            or _same_db_path(database, OFFLINE_TEMP_DB_PATH)
-            or (
-                TEMP_DB_PATH
-                and TEMP_DB_PATH != SUPABASE_DB_SENTINEL
-                and _same_db_path(database, TEMP_DB_PATH)
-            )
-        )
-        if use_local_cache:
+        if _LOCAL_FIRST or _SUPABASE_OFFLINE:
             path = ensure_offline_cache_open()
             conn = _original_sqlite3_connect(path, timeout=15)
             try:
@@ -8930,10 +8916,8 @@ def cleanup_supabase_duplicates():
     if get_db_mode() != "supabase":
         return
 
-    global TEMP_DB_PATH, SUPABASE_HISTORY_ENABLED
-    if TEMP_DB_PATH != SUPABASE_DB_SENTINEL:
-        TEMP_DB_PATH = SUPABASE_DB_SENTINEL
-        init_supabase_cipher()
+    global SUPABASE_HISTORY_ENABLED
+    init_supabase_cipher()
 
     history_prev = SUPABASE_HISTORY_ENABLED
     SUPABASE_HISTORY_ENABLED = False
@@ -23334,13 +23318,13 @@ if HAS_DEPS:
             users_list.config(yscrollcommand=users_scroll.set)
 
             def load_users():
+                try:
+                    if not users_list.winfo_exists():
+                        return
+                except Exception:
+                    return
                 users_list.delete(0, tk.END)
                 seen = set()
-                if get_db_mode() == "supabase":
-                    try:
-                        refresh_offline_cache_from_cloud()
-                    except Exception:
-                        pass
                 for db_fetch in (
                     lambda: sqlite3.connect(TEMP_DB_PATH),
                     lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
@@ -23357,6 +23341,26 @@ if HAS_DEPS:
                         conn.close()
                     except Exception:
                         pass
+
+            def sync_users_with_cloud_async(show_msg=False):
+                def _worker():
+                    try:
+                        if get_db_mode() == "supabase":
+                            refresh_offline_cache_from_cloud()
+                    except Exception:
+                        pass
+                    def _done():
+                        load_users()
+                        if show_msg:
+                            try:
+                                messagebox.showinfo("Synced", "✅ Users and passwords synced with Cloud!", parent=dialog)
+                            except Exception:
+                                pass
+                    try:
+                        self.after(0, _done)
+                    except Exception:
+                        pass
+                threading.Thread(target=_worker, daemon=True).start()
 
             add_row = tb.Frame(tab_users)
             add_row.pack(fill=X, pady=8)
@@ -23495,9 +23499,10 @@ if HAS_DEPS:
                 bot_user_actions,
                 text=self._tr("☁️ Sync Users with Cloud Now"),
                 bootstyle="primary outline",
-                command=lambda: (load_users(), messagebox.showinfo("Synced", "✅ Users and passwords synced with Cloud!", parent=dialog)),
+                command=lambda: sync_users_with_cloud_async(show_msg=True),
             ).pack(side=LEFT)
             load_users()
+            sync_users_with_cloud_async(show_msg=False)
 
             tab_act = tb.Frame(notebook)
             notebook.add(tab_act, text=self._tr("Activity & Backups"))
@@ -24048,7 +24053,8 @@ if HAS_DEPS:
                         dt_s = normalize_iso_date(decrypt_val(r[1]) if r[1] else "") or normalize_iso_date(r[1])
                         if scope == "current_month" and (not dt_s or not dt_s.startswith(ym_prefix)):
                             continue
-                        owner_v = plain_label(r[3]) if r[3] else "admin"
+                        owner_v = plain_label(r[3]) if r[3] else "moe"
+                        owner_v = owner_v or "moe"
                         if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
                             continue
                         rec_from = plain_label(r[2]) or "General/None"
@@ -24346,6 +24352,11 @@ if HAS_DEPS:
             
             rows = []
             try:
+                if not load_ui_column_preferences().get("migrated_admin_envelopes_to_moe_v2"):
+                    try:
+                        run_one_time_admin_envelopes_to_moe_migration()
+                    except Exception:
+                        pass
                 conn = sqlite3.connect(TEMP_DB_PATH)
                 cursor = conn.cursor()
                 # Fetch by date only, then filter category in Python so plaintext and
@@ -24396,7 +24407,8 @@ if HAS_DEPS:
                 try:
                     exp_id, dt_str, amt, status, assignee, desc, loc, category = row[:8]
                     raw_owner = row[8] if len(row) > 8 else ""
-                    owner_s = plain_label(raw_owner) if raw_owner else "admin"
+                    owner_s = plain_label(raw_owner) if raw_owner else "moe"
+                    owner_s = owner_s or "moe"
                     cat = plain_label(category)
                     if not is_envelope_category(cat):
                         continue
@@ -24801,6 +24813,11 @@ if HAS_DEPS:
                     ]
                     required_locations = [n for n in required_locations if n]
 
+                    if not load_ui_column_preferences().get("migrated_admin_envelopes_to_moe_v2"):
+                        try:
+                            run_one_time_admin_envelopes_to_moe_migration()
+                        except Exception:
+                            pass
                     sel_u = (day_owner_cb.get() or "All Users").strip()
                     day = str(date_str)[:10]
                     conn = sqlite3.connect(TEMP_DB_PATH, timeout=3)
@@ -24830,7 +24847,8 @@ if HAS_DEPS:
                         cat = plain_label(row_vals[6])
                         if not is_envelope_category(cat):
                             continue
-                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else "admin"
+                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else "moe"
+                        owner_v = owner_v or "moe"
                         if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
                             continue
                         row_vals[1] = plain_label(row_vals[1]) or "General/None"
