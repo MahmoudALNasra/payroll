@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.52"
+APP_VERSION = "2.5.53"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1144,6 +1144,7 @@ def save_table_column_widths(table_key, tree, columns):
 ALL_CALENDAR_COLUMNS = [
     ("Date", "Record Date (e.g. 2026-08-20)"),
     ("Cycle", "Pay Cycle & Range (e.g. August - Cycle 2)"),
+    ("Owner", "User Who Added Record"),
     ("Name", "Employee / Barber Name"),
     ("Location", "Branch / Location"),
     ("Service Sales", "Gross Service Revenue ($)"),
@@ -1157,7 +1158,6 @@ ALL_CALENDAR_COLUMNS = [
     ("Total Calculation", "Total Payout Calculation ($)"),
     ("Notes", "Record Notes"),
     ("Written Up", "Written Up Status / Violations"),
-    ("Owner", "User Who Added Record"),
 ]
 
 def get_calendar_hidden_columns():
@@ -6853,6 +6853,7 @@ def update_user_password_everywhere(username, new_password_or_hash):
         new_hash = val_str.lower()
     else:
         new_hash = hashlib.sha256(val_str.encode("utf-8")).hexdigest().lower()
+    now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 1. Update Local SQLite Offline Cache
     try:
@@ -6861,6 +6862,10 @@ def update_user_password_everywhere(username, new_password_or_hash):
             lconn = _original_sqlite3_connect(lite_path, timeout=10)
             try:
                 lcur = lconn.cursor()
+                try:
+                    lcur.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT ''")
+                except Exception:
+                    pass
                 lcur.execute("SELECT username FROM users")
                 matching_raw_u = []
                 for r in lcur.fetchall() or []:
@@ -6870,12 +6875,18 @@ def update_user_password_everywhere(username, new_password_or_hash):
                             matching_raw_u.append(r[0])
                 if matching_raw_u:
                     primary_u = matching_raw_u[0]
-                    lcur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, primary_u))
+                    try:
+                        lcur.execute("UPDATE users SET password=?, updated_at=? WHERE username=?", (new_hash, now_ts, primary_u))
+                    except Exception:
+                        lcur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, primary_u))
                     for extra_u in matching_raw_u[1:]:
                         if extra_u != primary_u:
                             lcur.execute("DELETE FROM users WHERE username=?", (extra_u,))
                 else:
-                    lcur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
+                    try:
+                        lcur.execute("INSERT INTO users (username, password, updated_at) VALUES (?, ?, ?)", (uname_clean, new_hash, now_ts))
+                    except Exception:
+                        lcur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
                 lconn.commit()
             finally:
                 try:
@@ -6891,6 +6902,14 @@ def update_user_password_everywhere(username, new_password_or_hash):
             pg_proxy = get_shared_supabase_conn()
             raw_cur = pg_proxy.conn.cursor()
             try:
+                try:
+                    raw_cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
+                    pg_proxy.commit()
+                except Exception:
+                    try:
+                        pg_proxy.rollback()
+                    except Exception:
+                        pass
                 raw_cur.execute("SELECT username FROM users")
                 matching_pg_u = []
                 for r in raw_cur.fetchall() or []:
@@ -6901,10 +6920,16 @@ def update_user_password_everywhere(username, new_password_or_hash):
                 enc_pw = _encrypt_for_col("password", new_hash)
                 if matching_pg_u:
                     for pg_u in matching_pg_u:
-                        raw_cur.execute("UPDATE users SET password = %s WHERE username = %s", (enc_pw, pg_u))
+                        try:
+                            raw_cur.execute("UPDATE users SET password = %s, updated_at = %s WHERE username = %s", (enc_pw, now_ts, pg_u))
+                        except Exception:
+                            raw_cur.execute("UPDATE users SET password = %s WHERE username = %s", (enc_pw, pg_u))
                 else:
                     enc_u = _encrypt_for_col("username", uname_clean)
-                    raw_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_pw))
+                    try:
+                        raw_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_pw, now_ts))
+                    except Exception:
+                        raw_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_pw))
                 pg_proxy.commit()
             finally:
                 try:
@@ -6914,11 +6939,15 @@ def update_user_password_everywhere(username, new_password_or_hash):
         except Exception:
             pass
 
-    # 3. Update via standard TEMP_DB_PATH connection
+    # 3. Update via standard TEMP_DB_PATH connection + queue cloud sync
     try:
         conn = sqlite3.connect(TEMP_DB_PATH)
         cur = conn.cursor()
         try:
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT ''")
+            except Exception:
+                pass
             cur.execute("SELECT username FROM users")
             found = False
             for r in cur.fetchall() or []:
@@ -6926,15 +6955,32 @@ def update_user_password_everywhere(username, new_password_or_hash):
                     dec_u = str(decrypt_val(r[0])).strip().lower()
                     if dec_u in target_names:
                         found = True
-                        cur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, r[0]))
+                        try:
+                            cur.execute("UPDATE users SET password=?, updated_at=? WHERE username=?", (new_hash, now_ts, r[0]))
+                        except Exception:
+                            cur.execute("UPDATE users SET password=? WHERE username=?", (new_hash, r[0]))
             if not found:
-                cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
+                try:
+                    cur.execute("INSERT INTO users (username, password, updated_at) VALUES (?, ?, ?)", (uname_clean, new_hash, now_ts))
+                except Exception:
+                    cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (uname_clean, new_hash))
             commit_and_save(conn)
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+    except Exception:
+        pass
+
+    try:
+        _queue_offline_op({
+            "op": "upsert_key",
+            "table": "users",
+            "key": "username",
+            "row": {"username": uname_clean, "password": new_hash, "updated_at": now_ts},
+        })
+        schedule_cloud_push(0.1)
     except Exception:
         pass
 
@@ -7101,26 +7147,45 @@ def verify_user_password_everywhere(username, entered_password):
 
 
 def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed):
-    """Never overwrite a user's custom password with the factory default 'admin' seed during cloud sync."""
+    """Bi-directional merge of users table preserving custom passwords and syncing password changes by updated_at timestamp."""
     default_admin_hash = hashlib.sha256("admin".encode()).hexdigest().lower()
+    try:
+        lcur.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        raw_pg_cur = pg_cur.conn.cursor()
+        raw_pg_cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
+        pg_cur.conn.commit()
+        raw_pg_cur.close()
+    except Exception:
+        pass
+
     local_users = {}
     try:
-        lcur.execute("SELECT username, password FROM users")
+        lcur.execute("PRAGMA table_info(users)")
+        l_cols = [c[1] for c in (lcur.fetchall() or [])]
+        has_l_upd = "updated_at" in l_cols
+        sel_sql = "SELECT username, password, updated_at FROM users" if has_l_upd else "SELECT username, password FROM users"
+        lcur.execute(sel_sql)
         for r in lcur.fetchall() or []:
             if not r:
                 continue
             raw_u, raw_p = r[0], r[1]
+            raw_upd = str(r[2] or "").strip() if len(r) > 2 else ""
             dec_u = str(decrypt_val(raw_u) if raw_u is not None else "").strip().lower()
             dec_p = str(decrypt_val(raw_p) if raw_p is not None else "").strip()
             if dec_u:
                 is_cust = bool(dec_p and dec_p.lower() not in (default_admin_hash, "admin") and not dec_p.startswith(("enc:", "denc:")))
-                if dec_u not in local_users or is_cust:
-                    local_users[dec_u] = (raw_u, raw_p, dec_p, is_cust)
+                prev = local_users.get(dec_u)
+                if not prev or (is_cust and not prev[3]) or (raw_upd and raw_upd > prev[4]):
+                    local_users[dec_u] = (raw_u, raw_p, dec_p, is_cust, raw_upd)
     except Exception:
         pass
 
     u_idx = use_cols.index("username") if "username" in use_cols else -1
     p_idx = use_cols.index("password") if "password" in use_cols else -1
+    upd_idx = use_cols.index("updated_at") if "updated_at" in use_cols else -1
     if u_idx == -1 or p_idx == -1:
         lcur.execute("DELETE FROM users")
         if packed:
@@ -7129,19 +7194,21 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
             lcur.executemany(f"INSERT INTO users ({col_list}) VALUES ({placeholders})", packed)
         return
 
-    # Group cloud rows by normalized username, preferring custom passwords over 'admin'
+    # Group cloud rows by normalized username, preferring custom passwords over 'admin' and newer updated_at
     cloud_by_user = {}
     for row in packed:
         row_list = list(row)
         c_raw_u = row_list[u_idx]
         c_raw_p = row_list[p_idx]
+        c_upd = str(row_list[upd_idx] or "").strip() if upd_idx != -1 and len(row_list) > upd_idx else ""
         c_dec_u = str(decrypt_val(c_raw_u) if c_raw_u is not None else "").strip().lower()
         c_dec_p = str(decrypt_val(c_raw_p) if c_raw_p is not None else "").strip()
         if not c_dec_u:
             continue
         is_cust = bool(c_dec_p and c_dec_p.lower() not in (default_admin_hash, "admin") and not c_dec_p.startswith(("enc:", "denc:")))
-        if c_dec_u not in cloud_by_user or is_cust:
-            cloud_by_user[c_dec_u] = (row_list, c_dec_p, is_cust)
+        prev = cloud_by_user.get(c_dec_u)
+        if not prev or (is_cust and not prev[2]) or (c_upd and c_upd > prev[3]):
+            cloud_by_user[c_dec_u] = (row_list, c_dec_p, is_cust, c_upd)
 
     all_usernames = set(local_users.keys()) | set(cloud_by_user.keys())
     final_rows = []
@@ -7151,56 +7218,84 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
         l_info = local_users.get(dec_u)
 
         if c_info and l_info:
-            c_row_list, c_dec_p, c_is_cust = c_info
-            l_raw_u, l_raw_p, l_dec_p, l_is_cust = l_info
+            c_row_list, c_dec_p, c_is_cust, c_upd = c_info
+            l_raw_u, l_raw_p, l_dec_p, l_is_cust, l_upd = l_info
+
+            # Determine which side wins:
+            # 1) Custom beats default 'admin'
+            # 2) If both custom, newer updated_at beats older updated_at
+            local_wins = False
             if l_is_cust and not c_is_cust:
-                # Local has custom password, Cloud has default 'admin' -> preserve local and push to Cloud
+                local_wins = True
+            elif l_is_cust and c_is_cust:
+                if l_upd and (not c_upd or l_upd > c_upd) and l_dec_p != c_dec_p:
+                    local_wins = True
+
+            if local_wins:
                 c_row_list[p_idx] = l_dec_p
+                if upd_idx != -1 and len(c_row_list) > upd_idx:
+                    c_row_list[upd_idx] = l_upd
                 try:
                     raw_pg_cur = pg_cur.conn.cursor()
                     raw_pg_cur.execute("SELECT username FROM users")
                     for pr in raw_pg_cur.fetchall() or []:
                         if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
-                            raw_pg_cur.execute(
-                                "UPDATE users SET password = %s WHERE username = %s",
-                                (_encrypt_for_col("password", l_dec_p), pr[0]),
-                            )
+                            try:
+                                raw_pg_cur.execute(
+                                    "UPDATE users SET password = %s, updated_at = %s WHERE username = %s",
+                                    (_encrypt_for_col("password", l_dec_p), l_upd, pr[0]),
+                                )
+                            except Exception:
+                                raw_pg_cur.execute(
+                                    "UPDATE users SET password = %s WHERE username = %s",
+                                    (_encrypt_for_col("password", l_dec_p), pr[0]),
+                                )
                     raw_pg_cur.close()
                 except Exception:
                     pass
                 final_rows.append(tuple(c_row_list))
             else:
-                # Cloud has custom password (or both are default) -> use Cloud password
+                # Cloud wins (has newer custom password or equal)
                 if c_is_cust:
-                    # Also ensure all duplicate rows in Postgres for this user have the custom password
                     try:
                         raw_pg_cur = pg_cur.conn.cursor()
                         raw_pg_cur.execute("SELECT username FROM users")
                         for pr in raw_pg_cur.fetchall() or []:
                             if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
-                                raw_pg_cur.execute(
-                                    "UPDATE users SET password = %s WHERE username = %s",
-                                    (_encrypt_for_col("password", c_dec_p), pr[0]),
-                                )
+                                try:
+                                    raw_pg_cur.execute(
+                                        "UPDATE users SET password = %s, updated_at = %s WHERE username = %s",
+                                        (_encrypt_for_col("password", c_dec_p), c_upd, pr[0]),
+                                    )
+                                except Exception:
+                                    raw_pg_cur.execute(
+                                        "UPDATE users SET password = %s WHERE username = %s",
+                                        (_encrypt_for_col("password", c_dec_p), pr[0]),
+                                    )
                         raw_pg_cur.close()
                     except Exception:
                         pass
                 final_rows.append(tuple(c_row_list))
         elif c_info:
-            c_row_list, c_dec_p, c_is_cust = c_info
+            c_row_list, c_dec_p, c_is_cust, c_upd = c_info
             final_rows.append(tuple(c_row_list))
         elif l_info:
-            l_raw_u, l_raw_p, l_dec_p, l_is_cust = l_info
+            l_raw_u, l_raw_p, l_dec_p, l_is_cust, l_upd = l_info
             new_row = [None] * len(use_cols)
             new_row[u_idx] = str(decrypt_val(l_raw_u)).strip()
             new_row[p_idx] = l_dec_p
+            if upd_idx != -1 and len(new_row) > upd_idx:
+                new_row[upd_idx] = l_upd
             final_rows.append(tuple(new_row))
             # Push local-only user to Cloud
             try:
                 raw_pg_cur = pg_cur.conn.cursor()
                 enc_u = _encrypt_for_col("username", new_row[u_idx])
                 enc_p = _encrypt_for_col("password", l_dec_p)
-                raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
+                try:
+                    raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
+                except Exception:
+                    raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
                 raw_pg_cur.close()
             except Exception:
                 pass
@@ -8901,6 +8996,7 @@ def ensure_all_supabase_tables(db_conn):
                 pass
 
     col_migrations = [
+        ("users", "updated_at", "TEXT DEFAULT ''"),
         ("employees", "first_name", "TEXT"),
         ("employees", "last_name", "TEXT"),
         ("employees", "phone", "TEXT"),
@@ -9717,6 +9813,11 @@ def _init_db_schema(cursor, seed=True):
         ("tip_given", f"{num} DEFAULT 0"),
         ("cycle_key", "TEXT"),
         ("owner", "TEXT DEFAULT ''"),
+    ])
+    _commit_step()
+
+    _add_missing_columns(cursor, "users", [
+        ("updated_at", "TEXT DEFAULT ''"),
     ])
     _commit_step()
 
@@ -11519,6 +11620,11 @@ if HAS_DEPS:
             """Checks for cloud software updates in the background on startup and displays an install badge or mandatory update blocker."""
             def _bg():
                 try:
+                    if get_db_mode() == "supabase":
+                        try:
+                            refresh_offline_cache_from_cloud()
+                        except Exception:
+                            pass
                     status, data = check_for_cloud_update()
                     r_ver = data.get("remote_version", "Latest")
                     is_forced = bool(data.get("is_forced", False))
@@ -15409,6 +15515,7 @@ if HAS_DEPS:
                     row[0],
                     row[1],
                     cyc_display,
+                    owner_disp,
                     row[2],
                     loc_v,
                     f"${rev_v:,.2f}",
@@ -15422,7 +15529,6 @@ if HAS_DEPS:
                     calc_disp,
                     row[14] if row[14] else "",
                     row[15] if row[15] else "",
-                    owner_disp,
                 ]
                 iid = f"row_{row[0]}_{r_idx}"
                 cell_tags = ('col_bg',) + row_tags
@@ -15432,6 +15538,7 @@ if HAS_DEPS:
                 col_val_map = {
                     "Date": row[1],
                     "Cycle": cyc_display,
+                    "Owner": owner_disp,
                     "Location": loc_v,
                     "Service Sales": f"${rev_v:,.2f}",
                     "Service Sales Calculations": f"${svc_calc:,.2f}",
@@ -15444,7 +15551,6 @@ if HAS_DEPS:
                     "Total Calculation": calc_disp,
                     "Notes": row[14] if row[14] else "",
                     "Written Up": row[15] if row[15] else "",
-                    "Owner": owner_disp,
                 }
                 for _ck, _ct in (getattr(self, "cal_col_trees", None) or {}).items():
                     if self._widget_alive(_ct):
@@ -15458,12 +15564,12 @@ if HAS_DEPS:
                     _ct.insert('', tk.END, iid='spacer_row', values=("",))
 
             self.tree_calendar.insert('', tk.END, iid='totals_row', values=(
-                "", "", "", "=== TOTALS ===", "",
+                "", "", "", "", "=== TOTALS ===", "",
                 f"${total_rev:,.2f}", f"${total_svc_calc:,.2f}",
                 f"${total_addon:,.2f}", f"${total_prod:,.2f}", f"${total_tip:,.2f}",
                 "", "", f"{total_hrs:.1f}",
                 f"⭐ ${total_calc:,.2f} ⭐",
-                "", "", "",
+                "", "",
             ), tags=('totals',))
             self.tree_calendar.tag_configure('totals', background='#375a7f', foreground='white', font=('Segoe UI', 11, 'bold'))
             self.tree_calendar.tag_configure('missing_rate', foreground='#e74c3c', font=('Segoe UI', 9, 'bold'))
@@ -17771,7 +17877,7 @@ if HAS_DEPS:
             tree_frame = tb.Frame(main_content)
             tree_frame.pack(side=LEFT, fill=BOTH, expand=True)
             
-            cols = (self._tr("ID"), self._tr("Date"), self._tr("Cycle"), self._tr("Employee"), self._tr("Category"), self._tr("Payment Type"), self._tr("Amount"), self._tr("Status"), self._tr("Owner"))
+            cols = (self._tr("ID"), self._tr("Date"), self._tr("Cycle"), self._tr("Owner"), self._tr("Employee"), self._tr("Category"), self._tr("Payment Type"), self._tr("Amount"), self._tr("Status"))
             
             scroll_y = tb.Scrollbar(tree_frame, orient=VERTICAL)
             scroll_x = tb.Scrollbar(tree_frame, orient=HORIZONTAL)
@@ -18289,12 +18395,12 @@ if HAS_DEPS:
                     exp_id,
                     date_val,
                     cycle_disp,
+                    owner_val,
                     emp_disp,
                     self._tr(category),
                     p_type if p_type else "",
                     formatted_amt,
                     self._tr(status),
-                    owner_val,
                 )
                 self.tree_expenses.insert('', tk.END, values=formatted_row, tags=row_tag)
             
@@ -18316,10 +18422,10 @@ if HAS_DEPS:
             cat_totals = {}
             for item in self.tree_expenses.get_children():
                 values = self.tree_expenses.item(item)['values']
-                if not values or len(values) < 7:
+                if not values or len(values) < 8:
                     continue
-                cat = values[4]
-                raw_amt = values[6]
+                cat = values[5]
+                raw_amt = values[7]
                 
                 # Exclude cash envelopes and employee revenues (both are incoming gains, not expense costs)
                 if cat == self._tr("Cash Envelope Received") or cat == "Cash Envelope Received":
@@ -19348,7 +19454,7 @@ if HAS_DEPS:
                 
             item_vals = self.tree_expenses.item(selected[0])['values']
             exp_id = item_vals[0]
-            category = item_vals[4]
+            category = item_vals[5] if len(item_vals) > 5 else (item_vals[4] if len(item_vals) > 4 else "")
             if not exp_id:
                 return
                 
@@ -19398,7 +19504,7 @@ if HAS_DEPS:
                     continue
                 exp_id = item_vals[0]
                 exp_date = item_vals[1] if len(item_vals) > 1 else ""
-                category = item_vals[4] if len(item_vals) > 4 else ""
+                category = item_vals[5] if len(item_vals) > 5 else (item_vals[4] if len(item_vals) > 4 else "")
                 if not exp_id:
                     continue
                 if category == "Employee Revenue" or category == self._tr("Employee Revenue"):
@@ -19478,7 +19584,7 @@ if HAS_DEPS:
                     wb = openpyxl.Workbook()
                     ws = wb.active
                     ws.title = "Expenses"
-                    headers = [self._tr(c) for c in ["Date", "Cycle", "Employee", "Category", "Payment Type", "Amount", "Status"]]
+                    headers = [self._tr(c) for c in ["Date", "Cycle", "Owner", "Employee", "Category", "Payment Type", "Amount", "Status"]]
                     ws.append(headers)
                     for item in rows:
                         ws.append(list(self.tree_expenses.item(item)['values'][1:]))
@@ -23439,6 +23545,34 @@ if HAS_DEPS:
 
             self._present_window(dialog)
 
+        def get_all_cash_envelope_owners(self):
+            owners = set()
+            try:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT username FROM users")
+                    for (u,) in cur.fetchall() or []:
+                        dec_u = str(decrypt_val(u) if u is not None else "").strip()
+                        if dec_u:
+                            owners.add(dec_u)
+                except Exception:
+                    pass
+                try:
+                    cur.execute("SELECT DISTINCT owner FROM expenses WHERE owner IS NOT NULL AND TRIM(owner) != ''")
+                    for (o,) in cur.fetchall() or []:
+                        dec_o = plain_label(o)
+                        if dec_o:
+                            owners.add(dec_o)
+                except Exception:
+                    pass
+                conn.close()
+            except Exception:
+                pass
+            if not owners:
+                owners.add("admin")
+            return ["All Users"] + sorted(owners, key=lambda x: x.lower())
+
         def setup_cash_calendar_tab(self):
             import calendar
             self.cash_cal_year = datetime.today().year
@@ -23448,7 +23582,7 @@ if HAS_DEPS:
             self.cash_cal_container.pack(fill=BOTH, expand=True)
             
             ctrl_frame = tb.Frame(self.cash_cal_container)
-            ctrl_frame.pack(fill=X, pady=(4, 6))
+            ctrl_frame.pack(fill=X, pady=(2, 4))
             
             tb.Button(ctrl_frame, text="◀ Prev", bootstyle="outline-primary", command=self.prev_cash_month).pack(side=LEFT, padx=6)
             self.lbl_cash_month_year = tb.Label(ctrl_frame, text="", font=("Segoe UI", 15, "bold"))
@@ -23470,13 +23604,180 @@ if HAS_DEPS:
                 command=self.delete_month_envelopes,
             ).pack(side=LEFT, padx=6)
             
-            self.lbl_cash_cal_summary = tb.Label(ctrl_frame, text="", font=("Segoe UI", 11, "italic"), bootstyle="secondary")
+            self.lbl_cash_cal_summary = tb.Label(ctrl_frame, text="", font=("Segoe UI", 10, "italic"), bootstyle="secondary")
             self.lbl_cash_cal_summary.pack(side=RIGHT, padx=10)
+
+            # Responsive User Filter & Analytics Bar
+            self.cash_filter_bar = tb.Labelframe(
+                self.cash_cal_container,
+                text=self._tr(" 👤 Filter by User (Owner) & Envelope Analytics "),
+                bootstyle="info",
+                padding=(10, 6),
+            )
+            self.cash_filter_bar.pack(fill=X, pady=(2, 6))
+
+            filter_left = tb.Frame(self.cash_filter_bar)
+            filter_left.pack(side=LEFT, fill=Y)
+
+            tb.Label(filter_left, text=self._tr("User / Owner:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(2, 6))
+            self.cash_owner_filter = tb.Combobox(
+                filter_left,
+                values=self.get_all_cash_envelope_owners(),
+                state="readonly",
+                width=16,
+                font=("Segoe UI", 10),
+            )
+            self.cash_owner_filter.set("All Users")
+            self.cash_owner_filter.pack(side=LEFT, padx=(0, 8))
+            self.cash_owner_filter.bind("<<ComboboxSelected>>", lambda e: self.load_cash_calendar_data(quiet=True))
+
+            tb.Button(
+                filter_left,
+                text=self._tr("📋 View Filtered Envelopes List"),
+                bootstyle="info outline",
+                cursor="hand2",
+                command=self.open_owner_envelopes_list_dialog,
+            ).pack(side=LEFT, padx=(4, 12))
+
+            kpi_strip = tb.Frame(self.cash_filter_bar)
+            kpi_strip.pack(side=RIGHT, fill=X, expand=True)
+
+            self.lbl_cash_kpi_count = tb.Label(
+                kpi_strip,
+                text="✉️ Envelopes: 0",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="inverse-primary",
+                padding=(10, 4),
+            )
+            self.lbl_cash_kpi_count.pack(side=LEFT, padx=4)
+
+            self.lbl_cash_kpi_total = tb.Label(
+                kpi_strip,
+                text="💰 Total: $0.00",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="inverse-info",
+                padding=(10, 4),
+            )
+            self.lbl_cash_kpi_total.pack(side=LEFT, padx=4)
+
+            self.lbl_cash_kpi_approved = tb.Label(
+                kpi_strip,
+                text="✅ Approved: $0.00",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="inverse-success",
+                padding=(10, 4),
+            )
+            self.lbl_cash_kpi_approved.pack(side=LEFT, padx=4)
+
+            self.lbl_cash_kpi_pending = tb.Label(
+                kpi_strip,
+                text="⏳ Pending: $0.00",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="inverse-warning",
+                padding=(10, 4),
+            )
+            self.lbl_cash_kpi_pending.pack(side=LEFT, padx=4)
 
             self.calendar_grid_frame = tb.Frame(self.cash_cal_container)
             self.calendar_grid_frame.pack(fill=BOTH, expand=True)
             
             self.load_cash_calendar_data()
+
+        def open_owner_envelopes_list_dialog(self):
+            dlg = self._open_sheet(self, self._tr("Cash Envelopes Filtered by User (Owner)"), "1050x640")
+            top_bar = tb.Frame(dlg, padding=(15, 12))
+            top_bar.pack(fill=X)
+
+            tb.Label(top_bar, text=self._tr("👤 User / Owner:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
+            owner_cb = tb.Combobox(top_bar, values=self.get_all_cash_envelope_owners(), state="readonly", width=16, font=("Segoe UI", 10))
+            cur_sel = getattr(self, "cash_owner_filter", None)
+            init_owner = cur_sel.get() if cur_sel else "All Users"
+            owner_cb.set(init_owner if init_owner else "All Users")
+            owner_cb.pack(side=LEFT, padx=(0, 12))
+
+            scope_var = tk.StringVar(value="current_month")
+            tb.Radiobutton(top_bar, text=self._tr("Current Month Only"), variable=scope_var, value="current_month", bootstyle="primary-toolbutton").pack(side=LEFT, padx=4)
+            tb.Radiobutton(top_bar, text=self._tr("All Dates"), variable=scope_var, value="all", bootstyle="primary-toolbutton").pack(side=LEFT, padx=4)
+
+            kpi_frame = tb.Frame(top_bar)
+            kpi_frame.pack(side=RIGHT)
+            lbl_cnt = tb.Label(kpi_frame, text="✉️ Envelopes: 0", font=("Segoe UI", 10, "bold"), bootstyle="inverse-primary", padding=(8, 3))
+            lbl_cnt.pack(side=LEFT, padx=3)
+            lbl_tot = tb.Label(kpi_frame, text="💰 Total: $0.00", font=("Segoe UI", 10, "bold"), bootstyle="inverse-info", padding=(8, 3))
+            lbl_tot.pack(side=LEFT, padx=3)
+            lbl_app = tb.Label(kpi_frame, text="✅ Approved: $0.00", font=("Segoe UI", 10, "bold"), bootstyle="inverse-success", padding=(8, 3))
+            lbl_app.pack(side=LEFT, padx=3)
+            lbl_pnd = tb.Label(kpi_frame, text="⏳ Pending: $0.00", font=("Segoe UI", 10, "bold"), bootstyle="inverse-warning", padding=(8, 3))
+            lbl_pnd.pack(side=LEFT, padx=3)
+
+            cols = (
+                self._tr("ID"),
+                self._tr("Date"),
+                self._tr("Received From"),
+                self._tr("Owner"),
+                self._tr("Amount"),
+                self._tr("Status"),
+                self._tr("Location"),
+                self._tr("Description"),
+            )
+            tree_holder = tb.Frame(dlg, padding=(15, 6))
+            tree_holder.pack(fill=BOTH, expand=True)
+            tree = tb.Treeview(tree_holder, columns=cols, show="headings", bootstyle="primary", selectmode="extended")
+            self.apply_and_memorize_column_widths("owner_envelopes_modal_table", tree, cols, hidden_cols=[self._tr("ID")])
+            self._attach_tree_scrollbars(tree_holder, tree)
+
+            def _refresh_list(*_):
+                for item in tree.get_children():
+                    tree.delete(item)
+                sel_u = (owner_cb.get() or "All Users").strip()
+                scope = scope_var.get()
+                ym_prefix = f"{self.cash_cal_year:04d}-{self.cash_cal_month:02d}-"
+                cnt = 0
+                tot = 0.0
+                app_tot = 0.0
+                pnd_tot = 0.0
+                try:
+                    conn = sqlite3.connect(TEMP_DB_PATH)
+                    cur = conn.cursor()
+                    cur.execute('''
+                        SELECT ex.id, ex.expense_date, e.name, ex.owner, ex.amount, ex.status, ex.location, ex.description, ex.category
+                        FROM expenses ex
+                        LEFT JOIN employees e ON ex.assignee_id = e.id
+                        ORDER BY ex.expense_date DESC
+                    ''')
+                    for r in cur.fetchall() or []:
+                        cat = plain_label(r[8])
+                        if not is_envelope_category(cat):
+                            continue
+                        dt_s = normalize_iso_date(decrypt_val(r[1]) if r[1] else "") or normalize_iso_date(r[1])
+                        if scope == "current_month" and (not dt_s or not dt_s.startswith(ym_prefix)):
+                            continue
+                        owner_v = plain_label(r[3]) if r[3] else "admin"
+                        if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
+                            continue
+                        rec_from = plain_label(r[2]) or "General/None"
+                        amt_f = to_float(r[4], 0.0)
+                        st_v = plain_label(r[5]) or "Pending"
+                        loc_v = plain_label(r[6]) or ""
+                        desc_v = plain_label(r[7]) or ""
+                        cnt += 1
+                        tot += amt_f
+                        if st_v == "Approved":
+                            app_tot += amt_f
+                        else:
+                            pnd_tot += amt_f
+                        tree.insert("", tk.END, values=(r[0], dt_s, rec_from, owner_v, f"${amt_f:,.2f}", st_v, loc_v, desc_v))
+                    conn.close()
+                except Exception:
+                    pass
+                lbl_cnt.config(text=f"✉️ Envelopes: {cnt}")
+                lbl_tot.config(text=f"💰 Total: ${tot:,.2f}")
+                lbl_app.config(text=f"✅ Approved: ${app_tot:,.2f}")
+                lbl_pnd.config(text=f"⏳ Pending: ${pnd_tot:,.2f}")
+
+            owner_cb.bind("<<ComboboxSelected>>", _refresh_list)
+            scope_var.trace_add("write", _refresh_list)
+            _refresh_list()
 
         def cash_year_month(self, year=None, month=None):
             y = self.cash_cal_year if year is None else year
@@ -23755,7 +24056,7 @@ if HAS_DEPS:
                 # legacy encrypted category values both show up.
                 cursor.execute('''
                     SELECT ex.id, ex.expense_date, ex.amount, ex.status, e2.name AS assignee_name,
-                        ex.description, ex.location, ex.category
+                        ex.description, ex.location, ex.category, ex.owner
                     FROM expenses ex
                     LEFT JOIN employees e2 ON ex.assignee_id = e2.id
                 ''')
@@ -23768,6 +24069,21 @@ if HAS_DEPS:
                     pass
                 return
 
+            sel_owner = "All Users"
+            try:
+                if hasattr(self, "cash_owner_filter") and self._widget_alive(self.cash_owner_filter):
+                    cur_val = self.cash_owner_filter.get() or "All Users"
+                    all_owners = self.get_all_cash_envelope_owners()
+                    self.cash_owner_filter.config(values=all_owners)
+                    if cur_val in all_owners:
+                        self.cash_owner_filter.set(cur_val)
+                        sel_owner = cur_val
+                    else:
+                        self.cash_owner_filter.set("All Users")
+                        sel_owner = "All Users"
+            except Exception:
+                pass
+
             try:
                 self.lbl_cash_month_year.config(text=title)
                 self.update_cash_lock_button()
@@ -23776,12 +24092,15 @@ if HAS_DEPS:
             
             envelopes_by_day = {}
             notes_by_day = {}
+            total_count = 0
             total_amt = 0.0
             total_approved = 0.0
             total_pending = 0.0
             for row in rows:
                 try:
-                    exp_id, dt_str, amt, status, assignee, desc, loc, category = row
+                    exp_id, dt_str, amt, status, assignee, desc, loc, category = row[:8]
+                    raw_owner = row[8] if len(row) > 8 else ""
+                    owner_s = plain_label(raw_owner) if raw_owner else "admin"
                     cat = plain_label(category)
                     if not is_envelope_category(cat):
                         continue
@@ -23793,6 +24112,8 @@ if HAS_DEPS:
                     except ValueError:
                         continue
                     if dt.year != year or dt.month != month:
+                        continue
+                    if sel_owner and sel_owner != "All Users" and owner_s.strip().lower() != sel_owner.strip().lower():
                         continue
                     day = dt.day
                     amt_f = to_float(amt, 0.0)
@@ -23809,8 +24130,10 @@ if HAS_DEPS:
                         "status": status_s,
                         "assignee": assignee if assignee else "Unassigned",
                         "description": desc_s,
-                        "location": loc if loc else ""
+                        "location": loc if loc else "",
+                        "owner": owner_s,
                     })
+                    total_count += 1
                     total_amt += amt_f
                     if status_s == "Approved":
                         total_approved += amt_f
@@ -23841,8 +24164,21 @@ if HAS_DEPS:
             except Exception:
                 pass
             
+            try:
+                if hasattr(self, "lbl_cash_kpi_count") and self._widget_alive(self.lbl_cash_kpi_count):
+                    self.lbl_cash_kpi_count.config(text=f"✉️ Envelopes: {total_count}")
+                if hasattr(self, "lbl_cash_kpi_total") and self._widget_alive(self.lbl_cash_kpi_total):
+                    self.lbl_cash_kpi_total.config(text=f"💰 Total: ${total_amt:,.2f}")
+                if hasattr(self, "lbl_cash_kpi_approved") and self._widget_alive(self.lbl_cash_kpi_approved):
+                    self.lbl_cash_kpi_approved.config(text=f"✅ Approved: ${total_approved:,.2f}")
+                if hasattr(self, "lbl_cash_kpi_pending") and self._widget_alive(self.lbl_cash_kpi_pending):
+                    self.lbl_cash_kpi_pending.config(text=f"⏳ Pending: ${total_pending:,.2f}")
+            except Exception:
+                pass
+
+            owner_tag = f"  |  Owner: {sel_owner}" if sel_owner != "All Users" else ""
             self.lbl_cash_cal_summary.config(
-                text=f"Total: ${total_amt:,.2f}  |  Approved: ${total_approved:,.2f}  |  Pending/Not Approved: ${total_pending:,.2f}"
+                text=f"Envelopes: {total_count}  |  Total: ${total_amt:,.2f}  |  Approved: ${total_approved:,.2f}  |  Pending: ${total_pending:,.2f}{owner_tag}"
                 + (f"  |  {self._tr('LOCKED')}" if locked else "")
             )
             
@@ -24082,9 +24418,48 @@ if HAS_DEPS:
             self._envelope_popup_date = date_str
             self._envelope_opening = False
             
-            tb.Label(popup, text=f"Cash Envelopes for {date_str}", font=("Segoe UI", 14, "bold"), bootstyle="primary").pack(pady=(15, 5))
+            tb.Label(popup, text=f"Cash Envelopes for {date_str}", font=("Segoe UI", 14, "bold"), bootstyle="primary").pack(pady=(12, 4))
             loc_hint = tb.Label(popup, text="", font=("Segoe UI", 10), bootstyle="secondary")
-            loc_hint.pack(pady=(0, 8))
+            loc_hint.pack(pady=(0, 6))
+
+            # Responsive User Filter & Analytics Bar inside Day Popup
+            day_filter_bar = tb.Labelframe(
+                popup,
+                text=self._tr(" 👤 Filter Day Envelopes by User (Owner) & Analytics "),
+                bootstyle="info",
+                padding=(10, 6),
+            )
+            day_filter_bar.pack(fill=X, padx=20, pady=(2, 6))
+
+            df_left = tb.Frame(day_filter_bar)
+            df_left.pack(side=LEFT)
+            tb.Label(df_left, text=self._tr("User / Owner:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(2, 6))
+            day_owner_cb = tb.Combobox(
+                df_left,
+                values=self.get_all_cash_envelope_owners(),
+                state="readonly",
+                width=16,
+                font=("Segoe UI", 10),
+            )
+            init_u = "All Users"
+            try:
+                if hasattr(self, "cash_owner_filter") and self._widget_alive(self.cash_owner_filter):
+                    init_u = self.cash_owner_filter.get() or "All Users"
+            except Exception:
+                pass
+            day_owner_cb.set(init_u)
+            day_owner_cb.pack(side=LEFT, padx=(0, 8))
+
+            df_kpi = tb.Frame(day_filter_bar)
+            df_kpi.pack(side=RIGHT, fill=X, expand=True)
+            lbl_day_cnt = tb.Label(df_kpi, text="✉️ Envelopes: 0", font=("Segoe UI", 10, "bold"), bootstyle="inverse-primary", padding=(8, 3))
+            lbl_day_cnt.pack(side=LEFT, padx=3)
+            lbl_day_tot = tb.Label(df_kpi, text="💰 Total: $0.00", font=("Segoe UI", 10, "bold"), bootstyle="inverse-info", padding=(8, 3))
+            lbl_day_tot.pack(side=LEFT, padx=3)
+            lbl_day_app = tb.Label(df_kpi, text="✅ Approved: $0.00", font=("Segoe UI", 10, "bold"), bootstyle="inverse-success", padding=(8, 3))
+            lbl_day_app.pack(side=LEFT, padx=3)
+            lbl_day_pnd = tb.Label(df_kpi, text="⏳ Pending: $0.00", font=("Segoe UI", 10, "bold"), bootstyle="inverse-warning", padding=(8, 3))
+            lbl_day_pnd.pack(side=LEFT, padx=3)
             
             # Pack buttons first at bottom so they never get pushed off-screen
             btn_frame = tb.Frame(popup)
@@ -24094,10 +24469,10 @@ if HAS_DEPS:
                 self._tr("ID"),
                 self._tr("Received From"),
                 self._tr("Amount"),
+                self._tr("Owner"),
                 self._tr("Status"),
                 self._tr("Location"),
                 self._tr("Description"),
-                self._tr("Owner"),
             )
             tree_holder = tb.Frame(popup)
             tree_holder.pack(fill=BOTH, expand=True, padx=20, pady=10)
@@ -24111,7 +24486,7 @@ if HAS_DEPS:
 
             self._attach_tree_scrollbars(tree_holder, tree)
             
-            def load_day_data():
+            def load_day_data(*_):
                 if not self._widget_alive(popup):
                     return
                 try:
@@ -24128,6 +24503,7 @@ if HAS_DEPS:
                     ]
                     required_locations = [n for n in required_locations if n]
 
+                    sel_u = (day_owner_cb.get() or "All Users").strip()
                     day = str(date_str)[:10]
                     conn = sqlite3.connect(TEMP_DB_PATH, timeout=3)
                     cursor = conn.cursor()
@@ -24141,6 +24517,10 @@ if HAS_DEPS:
                            OR CAST(ex.expense_date AS TEXT) LIKE 'denc:%'
                     ''', (day, day + "%"))
                     present_locs = set()
+                    day_cnt = 0
+                    day_tot = 0.0
+                    day_app = 0.0
+                    day_pnd = 0.0
                     for row in cursor.fetchall() or []:
                         row_vals = list(row)
                         raw_dt = row_vals[7] if len(row_vals) > 7 else ""
@@ -24152,18 +24532,31 @@ if HAS_DEPS:
                         cat = plain_label(row_vals[6])
                         if not is_envelope_category(cat):
                             continue
+                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else "admin"
+                        if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
+                            continue
                         row_vals[1] = row_vals[1] if row_vals[1] else "General/None"
                         amt = to_float(row_vals[2], 0.0)
                         row_vals[2] = f"${amt:,.2f}"
-                        row_vals[3] = row_vals[3] if row_vals[3] else ""
+                        st_v = str(decrypt_val(row_vals[3]) if row_vals[3] is not None else "").strip()
+                        row_vals[3] = st_v
                         loc = str(decrypt_val(row_vals[4]) if row_vals[4] is not None else "").strip()
                         row_vals[4] = loc
                         if loc:
                             present_locs.add(loc)
                         row_vals[5] = row_vals[5] if row_vals[5] else ""
-                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else ""
-                        tree.insert('', tk.END, values=(row_vals[0], row_vals[1], row_vals[2], row_vals[3], row_vals[4], row_vals[5], owner_v))
+                        day_cnt += 1
+                        day_tot += amt
+                        if st_v == "Approved":
+                            day_app += amt
+                        else:
+                            day_pnd += amt
+                        tree.insert('', tk.END, values=(row_vals[0], row_vals[1], row_vals[2], owner_v, row_vals[3], row_vals[4], row_vals[5]))
                     conn.close()
+                    lbl_day_cnt.config(text=f"✉️ Envelopes: {day_cnt}")
+                    lbl_day_tot.config(text=f"💰 Total: ${day_tot:,.2f}")
+                    lbl_day_app.config(text=f"✅ Approved: ${day_app:,.2f}")
+                    lbl_day_pnd.config(text=f"⏳ Pending: ${day_pnd:,.2f}")
 
                     missing = [loc for loc in required_locations if loc not in present_locs]
                     if required_locations:
@@ -24185,6 +24578,7 @@ if HAS_DEPS:
                     except Exception:
                         pass
                 
+            day_owner_cb.bind("<<ComboboxSelected>>", load_day_data)
             self._envelope_popup_reload = load_day_data
             popup.after(30, load_day_data)
 
