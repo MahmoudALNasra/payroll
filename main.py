@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.57"
+APP_VERSION = "2.5.58"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -3693,114 +3693,12 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
 
 
 def run_one_time_admin_envelopes_to_moe_migration():
-    """One-time migration: reassign existing Cash Envelopes owned by 'admin' (or blank) to 'moe'."""
-    prefs = load_ui_column_preferences()
-    if prefs.get("migrated_admin_envelopes_to_moe_v2"):
-        return 0
-
-    updated_count = 0
-    # 1. If in Supabase mode, ALWAYS attempt to update Cloud Postgres directly FIRST so cloud pulls don't overwrite local
-    cloud_ok = (get_db_mode() != "supabase")
-    if get_db_mode() == "supabase":
-        try:
-            pg_conn = _open_supabase_pg_conn(timeout=6)
-            try:
-                leave_supabase_offline_mode()
-                raw_cur = pg_conn.cursor()
-                try:
-                    raw_cur.execute("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS owner TEXT DEFAULT ''")
-                    pg_conn.commit()
-                except Exception:
-                    try:
-                        pg_conn.rollback()
-                    except Exception:
-                        pass
-                raw_cur.execute("SELECT id, category, owner FROM expenses")
-                pg_rows = raw_cur.fetchall() or []
-                enc_moe = _encrypt_for_col("owner", "moe")
-                for pr in pg_rows:
-                    if not pr:
-                        continue
-                    p_id, p_cat, p_owner = pr[0], pr[1], pr[2] if len(pr) > 2 else ""
-                    if is_envelope_category(plain_label(p_cat)):
-                        p_owner_s = plain_label(p_owner).strip().lower() if p_owner else ""
-                        if p_owner_s in ("", "admin", "none"):
-                            raw_cur.execute("UPDATE expenses SET owner = %s WHERE id = %s", (enc_moe, p_id))
-                            updated_count += 1
-                pg_conn.commit()
-                raw_cur.close()
-                cloud_ok = True
-            finally:
-                try:
-                    pg_conn.close()
-                except Exception:
-                    pass
-        except Exception:
-            cloud_ok = False
-
-    # 2. Update all local SQLite databases (offline cache & TEMP_DB_PATH)
-    for db_opener in (
-        lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=10),
-        lambda: sqlite3.connect(TEMP_DB_PATH),
-    ):
-        try:
-            conn = db_opener()
-            if not conn:
-                continue
-            cur = conn.cursor()
-            try:
-                cur.execute("ALTER TABLE expenses ADD COLUMN owner TEXT DEFAULT ''")
-            except Exception:
-                pass
-            # Ensure user 'moe' exists in users table without overwriting any custom password
-            try:
-                cur.execute("SELECT username FROM users")
-                has_moe_local = any(str(decrypt_val(r[0]) if r and r[0] else "").strip().lower() == "moe" for r in (cur.fetchall() or []))
-                if not has_moe_local:
-                    default_pw = hashlib.sha256(b"admin").hexdigest().lower()
-                    cur.execute("INSERT INTO users (username, password) VALUES (?, ?)", ("moe", default_pw))
-            except Exception:
-                pass
-
-            cur.execute("SELECT id, category, owner FROM expenses")
-            rows = cur.fetchall() or []
-            target_ids = []
-            for r in rows:
-                if not r:
-                    continue
-                exp_id, raw_cat, raw_owner = r[0], r[1], r[2] if len(r) > 2 else ""
-                cat_str = plain_label(raw_cat)
-                owner_str = plain_label(raw_owner).strip().lower() if raw_owner else ""
-                if is_envelope_category(cat_str) and owner_str in ("", "admin", "none"):
-                    target_ids.append(exp_id)
-
-            for eid in target_ids:
-                cur.execute("UPDATE expenses SET owner = ? WHERE id = ?", ("moe", eid))
-                updated_count += 1
-            if target_ids:
-                try:
-                    commit_and_save(conn)
-                except Exception:
-                    conn.commit()
-            conn.close()
-        except Exception:
-            pass
-
-    # Only mark one-time migration complete if Cloud Postgres update succeeded (or not in supabase mode)
-    if cloud_ok:
-        prefs["migrated_admin_envelopes_to_moe_v2"] = True
-        save_ui_column_preferences(prefs)
-
+    """Retired one-time migration (disabled per user request so no other PCs/runs alter envelope owners)."""
     try:
         heal_encrypted_envelope_descriptions()
     except Exception:
         pass
-    try:
-        schedule_cloud_push(0.2)
-    except Exception:
-        pass
-
-    return updated_count
+    return 0
 
 
 def heal_encrypted_envelope_descriptions():
@@ -23346,7 +23244,32 @@ if HAS_DEPS:
                 def _worker():
                     try:
                         if get_db_mode() == "supabase":
-                            refresh_offline_cache_from_cloud()
+                            pg_c = _open_supabase_pg_conn(timeout=4)
+                            try:
+                                rc = pg_c.cursor()
+                                rc.execute("SELECT username, password FROM users")
+                                cloud_users = rc.fetchall() or []
+                                rc.close()
+                                if cloud_users:
+                                    lconn = _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5)
+                                    lcur = lconn.cursor()
+                                    lcur.execute("SELECT username FROM users")
+                                    local_names = {plain_label(r[0]).lower() for r in (lcur.fetchall() or []) if r and r[0]}
+                                    for cu in cloud_users:
+                                        if not cu or not cu[0]:
+                                            continue
+                                        u_name = str(decrypt_val(cu[0])).strip()
+                                        u_pw = str(decrypt_val(cu[1]) if cu[1] else "").strip()
+                                        if u_name and u_name.lower() not in local_names:
+                                            lcur.execute("INSERT INTO users (username, password) VALUES (?, ?)", (u_name, u_pw))
+                                            local_names.add(u_name.lower())
+                                    lconn.commit()
+                                    lconn.close()
+                            finally:
+                                try:
+                                    pg_c.close()
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     def _done():
@@ -24053,8 +23976,7 @@ if HAS_DEPS:
                         dt_s = normalize_iso_date(decrypt_val(r[1]) if r[1] else "") or normalize_iso_date(r[1])
                         if scope == "current_month" and (not dt_s or not dt_s.startswith(ym_prefix)):
                             continue
-                        owner_v = plain_label(r[3]) if r[3] else "moe"
-                        owner_v = owner_v or "moe"
+                        owner_v = plain_label(r[3]) if r[3] else "admin"
                         if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
                             continue
                         rec_from = plain_label(r[2]) or "General/None"
@@ -24352,11 +24274,6 @@ if HAS_DEPS:
             
             rows = []
             try:
-                if not load_ui_column_preferences().get("migrated_admin_envelopes_to_moe_v2"):
-                    try:
-                        run_one_time_admin_envelopes_to_moe_migration()
-                    except Exception:
-                        pass
                 conn = sqlite3.connect(TEMP_DB_PATH)
                 cursor = conn.cursor()
                 # Fetch by date only, then filter category in Python so plaintext and
@@ -24407,8 +24324,7 @@ if HAS_DEPS:
                 try:
                     exp_id, dt_str, amt, status, assignee, desc, loc, category = row[:8]
                     raw_owner = row[8] if len(row) > 8 else ""
-                    owner_s = plain_label(raw_owner) if raw_owner else "moe"
-                    owner_s = owner_s or "moe"
+                    owner_s = plain_label(raw_owner) if raw_owner else "admin"
                     cat = plain_label(category)
                     if not is_envelope_category(cat):
                         continue
@@ -24813,11 +24729,6 @@ if HAS_DEPS:
                     ]
                     required_locations = [n for n in required_locations if n]
 
-                    if not load_ui_column_preferences().get("migrated_admin_envelopes_to_moe_v2"):
-                        try:
-                            run_one_time_admin_envelopes_to_moe_migration()
-                        except Exception:
-                            pass
                     sel_u = (day_owner_cb.get() or "All Users").strip()
                     day = str(date_str)[:10]
                     conn = sqlite3.connect(TEMP_DB_PATH, timeout=3)
@@ -24847,8 +24758,7 @@ if HAS_DEPS:
                         cat = plain_label(row_vals[6])
                         if not is_envelope_category(cat):
                             continue
-                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else "moe"
-                        owner_v = owner_v or "moe"
+                        owner_v = plain_label(row_vals[8]) if len(row_vals) > 8 and row_vals[8] else "admin"
                         if sel_u != "All Users" and owner_v.strip().lower() != sel_u.lower():
                             continue
                         row_vals[1] = plain_label(row_vals[1]) or "General/None"
