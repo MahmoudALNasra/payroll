@@ -868,7 +868,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.58"
+APP_VERSION = "2.5.60"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1187,26 +1187,42 @@ def save_calendar_column_colors(colors_dict):
 
 CURRENT_SESSION_USER = "admin"
 SUPABASE_SALT = b"\x80\xa7\xbf\xcc\xa3\x12\xcc\x81\xf2\x93\xb4\x37\x13\xc3\xb4\x3a"
+_SUPABASE_SHARED_CIPHER = None
+_EXTRA_DEC_CIPHERS = []
 
 def init_supabase_cipher():
-    global CIPHER_SUITE, SALT
-    if CIPHER_SUITE is None:
-        SALT = SUPABASE_SALT
-        CIPHER_SUITE = get_cipher(DEFAULT_ENCRYPTION_PASSWORD, SUPABASE_SALT)
+    global CIPHER_SUITE, SALT, _SUPABASE_SHARED_CIPHER
+    if _SUPABASE_SHARED_CIPHER is None:
+        _SUPABASE_SHARED_CIPHER = get_cipher(DEFAULT_ENCRYPTION_PASSWORD, SUPABASE_SALT)
+    SALT = SUPABASE_SALT
+    CIPHER_SUITE = _SUPABASE_SHARED_CIPHER
+    return _SUPABASE_SHARED_CIPHER
+
+def _get_all_decryption_ciphers():
+    """Return [_SUPABASE_SHARED_CIPHER, _OFFLINE_CACHE_CIPHER, ...] so legacy device-salted enc: values also decrypt cleanly."""
+    init_supabase_cipher()
+    ciphers = [_SUPABASE_SHARED_CIPHER]
+    if _OFFLINE_CACHE_CIPHER is not None and _OFFLINE_CACHE_CIPHER not in ciphers:
+        ciphers.append(_OFFLINE_CACHE_CIPHER)
+    if CIPHER_SUITE is not None and CIPHER_SUITE not in ciphers:
+        ciphers.append(CIPHER_SUITE)
+    for c in _EXTRA_DEC_CIPHERS:
+        if c is not None and c not in ciphers:
+            ciphers.append(c)
+    return ciphers
 
 def encrypt_val(val):
-    """Non-deterministic Fernet encryption (prefix enc:)."""
+    """Cross-device Fernet encryption using the shared SUPABASE_SALT key (prefix enc:)."""
     if val is None:
         return None
     if isinstance(val, str) and (val.startswith("enc:") or val.startswith("denc:")):
-        return val
-    init_supabase_cipher()
-    val_str = str(val)
+        val = decrypt_val(val)
+    shared_cipher = init_supabase_cipher()
     if isinstance(val, (int, float)) and not isinstance(val, bool):
         val_str = f"num:{val}"
     else:
         val_str = f"str:{val}"
-    return "enc:" + CIPHER_SUITE.encrypt(val_str.encode()).decode()
+    return "enc:" + shared_cipher.encrypt(val_str.encode("utf-8")).decode("ascii")
 
 
 def _det_aes_key():
@@ -1217,12 +1233,12 @@ def _det_aes_key():
 def encrypt_val_deterministic(val):
     """
     Deterministic AES-GCM encryption (prefix denc:).
-    Same plaintext -> same ciphertext, so WHERE/UNIQUE lookups still work.
+    Same plaintext -> same ciphertext across all devices using SUPABASE_SALT.
     """
     if val is None:
         return None
     if isinstance(val, str) and (val.startswith("enc:") or val.startswith("denc:")):
-        return val
+        val = decrypt_val(val)
     try:
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError:
@@ -1317,9 +1333,16 @@ def decrypt_val(val):
                     cur = plain
                 continue
             if s_trim.startswith("enc:"):
-                init_supabase_cipher()
-                decrypted_bytes = CIPHER_SUITE.decrypt(s_trim[4:].encode())
-                decrypted_str = decrypted_bytes.decode()
+                token_bytes = s_trim[4:].encode("ascii")
+                decrypted_str = None
+                for ciph in _get_all_decryption_ciphers():
+                    try:
+                        decrypted_str = ciph.decrypt(token_bytes).decode("utf-8")
+                        break
+                    except Exception:
+                        continue
+                if decrypted_str is None:
+                    break
                 if decrypted_str.startswith("num:"):
                     s = decrypted_str[4:]
                     return float(s) if '.' in s else int(s)
@@ -1448,10 +1471,10 @@ def product_percent_for_sales(total_prod):
 DET_ENCRYPT_COLS = {
     'name', 'first_name', 'last_name', 'username', 'user_name', 'phone', 'email', 'ssn', 'address',
     'category', 'payment_type', 'location', 'status', 'written_up', 'pulled_date', 'is_tip',
-    'title',
+    'title', 'description', 'notes', 'written_up_desc',
 }
 RAND_ENCRYPT_COLS = {
-    'notes', 'written_up_desc', 'description', 'old_data', 'new_data', 'password',
+    'old_data', 'new_data', 'password',
     'summary', 'details',
 }
 ALL_ENCRYPT_COLS = DET_ENCRYPT_COLS | RAND_ENCRYPT_COLS
@@ -3161,9 +3184,9 @@ OFFLINE_SYNC_TABLES = (
     "vagaro_pull_logs",
     "payout_tiers",
     "cash_month_locks",
-    "user_action_log",
-    "database_history_log",
 )
+_LAST_CLOUD_TABLE_DIGESTS = {}
+_DESCRIPTIONS_HEALED_ONCE = False
 _LOCAL_FIRST = True
 _SYNC_IN_PROGRESS = False
 _SYNC_LOCK = threading.Lock()
@@ -3284,10 +3307,11 @@ def _persist_offline_cache():
         return
     password = DEFAULT_ENCRYPTION_PASSWORD
     if _OFFLINE_CACHE_SALT is None or _OFFLINE_CACHE_CIPHER is None:
-        _OFFLINE_CACHE_SALT = SALT if SALT else os.urandom(16)
+        _OFFLINE_CACHE_SALT = SUPABASE_SALT
         _OFFLINE_CACHE_CIPHER = get_cipher(password, _OFFLINE_CACHE_SALT)
-    SALT = _OFFLINE_CACHE_SALT
-    CIPHER_SUITE = _OFFLINE_CACHE_CIPHER
+    if _OFFLINE_CACHE_CIPHER not in _EXTRA_DEC_CIPHERS:
+        _EXTRA_DEC_CIPHERS.append(_OFFLINE_CACHE_CIPHER)
+    init_supabase_cipher()
     try:
         try:
             ck = _original_sqlite3_connect(str(path), timeout=5)
@@ -3480,12 +3504,17 @@ def ensure_offline_cache_open():
         _OFFLINE_CACHE_CIPHER = best[3]
         decrypted = best[4]
 
-    if _OFFLINE_CACHE_SALT is None or _OFFLINE_CACHE_CIPHER is None:
-        _OFFLINE_CACHE_SALT = os.urandom(16)
-        _OFFLINE_CACHE_CIPHER = get_cipher(password, _OFFLINE_CACHE_SALT)
+    for cand in candidates:
+        if len(cand) > 3 and cand[3] is not None and cand[3] not in _EXTRA_DEC_CIPHERS:
+            _EXTRA_DEC_CIPHERS.append(cand[3])
 
-    SALT = _OFFLINE_CACHE_SALT
-    CIPHER_SUITE = _OFFLINE_CACHE_CIPHER
+    if _OFFLINE_CACHE_SALT is None or _OFFLINE_CACHE_CIPHER is None:
+        _OFFLINE_CACHE_SALT = SUPABASE_SALT
+        _OFFLINE_CACHE_CIPHER = get_cipher(password, _OFFLINE_CACHE_SALT)
+    if _OFFLINE_CACHE_CIPHER not in _EXTRA_DEC_CIPHERS:
+        _EXTRA_DEC_CIPHERS.append(_OFFLINE_CACHE_CIPHER)
+
+    init_supabase_cipher()
 
     fd, path = tempfile.mkstemp(suffix="_cloud_cache.db")
     os.close(fd)
@@ -3701,10 +3730,14 @@ def run_one_time_admin_envelopes_to_moe_migration():
     return 0
 
 
-def heal_encrypted_envelope_descriptions():
-    """Scan local SQLite and Cloud Postgres to peel any double/multi-encrypted or raw enc:/denc: descriptions."""
+def heal_encrypted_envelope_descriptions(force=False):
+    """Scan local SQLite and Cloud Postgres once per session to peel any double/multi-encrypted or device-salted descriptions & notes."""
+    global _DESCRIPTIONS_HEALED_ONCE
+    if _DESCRIPTIONS_HEALED_ONCE and not force:
+        return 0
+    _DESCRIPTIONS_HEALED_ONCE = True
     healed = 0
-    # 1. Heal local SQLite databases (offline cache & TEMP_DB_PATH)
+    # 1. Heal local SQLite databases (offline cache & TEMP_DB_PATH) across expenses, payroll_records, and shop_documents
     for db_opener in (
         lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=10),
         lambda: _original_sqlite3_connect(TEMP_DB_PATH, timeout=10) if os.path.exists(str(TEMP_DB_PATH)) else None,
@@ -3714,64 +3747,132 @@ def heal_encrypted_envelope_descriptions():
             if not conn:
                 continue
             cur = conn.cursor()
-            cur.execute("SELECT id, description, location, status, payment_type, category FROM expenses")
-            updates = []
-            for r in cur.fetchall() or []:
-                if not r:
-                    continue
-                eid, raw_desc, raw_loc, raw_st, raw_pt, raw_cat = r
-                c_desc = plain_label(raw_desc)
-                c_loc = plain_label(raw_loc)
-                c_st = plain_label(raw_st)
-                c_pt = plain_label(raw_pt)
-                c_cat = plain_label(raw_cat)
-                if (
-                    (raw_desc and str(raw_desc).strip().startswith(("enc:", "denc:")))
-                    or (raw_loc and str(raw_loc).strip().startswith(("enc:", "denc:")))
-                    or (raw_st and str(raw_st).strip().startswith(("enc:", "denc:")))
-                    or (raw_pt and str(raw_pt).strip().startswith(("enc:", "denc:")))
-                ):
-                    updates.append((c_desc, c_loc, c_st, c_pt, c_cat, eid))
-            for u in updates:
-                cur.execute(
-                    "UPDATE expenses SET description=?, location=?, status=?, payment_type=?, category=? WHERE id=?",
-                    u,
-                )
-                healed += 1
-            if updates:
-                conn.commit()
+            # a) expenses
+            try:
+                cur.execute("SELECT id, description, location, status, payment_type, category FROM expenses")
+                updates = []
+                for r in cur.fetchall() or []:
+                    if not r:
+                        continue
+                    eid, raw_desc, raw_loc, raw_st, raw_pt, raw_cat = r
+                    if any(
+                        v and str(v).strip().startswith(("enc:", "denc:", "str:"))
+                        for v in (raw_desc, raw_loc, raw_st, raw_pt, raw_cat)
+                    ):
+                        updates.append((
+                            plain_label(raw_desc),
+                            plain_label(raw_loc),
+                            plain_label(raw_st),
+                            plain_label(raw_pt),
+                            plain_label(raw_cat),
+                            eid,
+                        ))
+                for u in updates:
+                    cur.execute(
+                        "UPDATE expenses SET description=?, location=?, status=?, payment_type=?, category=? WHERE id=?",
+                        u,
+                    )
+                    healed += 1
+            except Exception:
+                pass
+
+            # b) payroll_records (notes & written_up_desc)
+            try:
+                cur.execute("SELECT id, notes, written_up_desc, location FROM payroll_records")
+                p_updates = []
+                for r in cur.fetchall() or []:
+                    if not r:
+                        continue
+                    pid, raw_n, raw_w, raw_l = r
+                    if any(
+                        v and str(v).strip().startswith(("enc:", "denc:", "str:"))
+                        for v in (raw_n, raw_w, raw_l)
+                    ):
+                        p_updates.append((plain_label(raw_n), plain_label(raw_w), plain_label(raw_l), pid))
+                for u in p_updates:
+                    cur.execute(
+                        "UPDATE payroll_records SET notes=?, written_up_desc=?, location=? WHERE id=?",
+                        u,
+                    )
+                    healed += 1
+            except Exception:
+                pass
+
+            # c) shop_documents (title & notes)
+            try:
+                cur.execute("SELECT id, title, notes, category, location FROM shop_documents")
+                d_updates = []
+                for r in cur.fetchall() or []:
+                    if not r:
+                        continue
+                    did, raw_t, raw_n, raw_c, raw_l = r
+                    if any(
+                        v and str(v).strip().startswith(("enc:", "denc:", "str:"))
+                        for v in (raw_t, raw_n, raw_c, raw_l)
+                    ):
+                        d_updates.append((
+                            plain_label(raw_t),
+                            plain_label(raw_n),
+                            plain_label(raw_c),
+                            plain_label(raw_l),
+                            did,
+                        ))
+                for u in d_updates:
+                    cur.execute(
+                        "UPDATE shop_documents SET title=?, notes=?, category=?, location=? WHERE id=?",
+                        u,
+                    )
+                    healed += 1
+            except Exception:
+                pass
+
+            conn.commit()
             conn.close()
         except Exception:
             pass
 
-    # 2. Heal double-encrypted descriptions in Supabase Cloud Postgres
+    # 2. Normalize Cloud Postgres descriptions & notes so any legacy enc: row is re-encrypted with shared denc: (SUPABASE_SALT)
     if get_db_mode() == "supabase" and not is_supabase_offline():
         try:
             pg_conn = _open_supabase_pg_conn(timeout=4)
             try:
                 raw_cur = pg_conn.cursor()
-                raw_cur.execute("SELECT id, description FROM expenses WHERE description IS NOT NULL AND description != ''")
-                pg_updates = []
-                for eid, raw_d in raw_cur.fetchall() or []:
-                    if not raw_d or not isinstance(raw_d, str):
-                        continue
-                    # Check if decrypting once still yields enc: or denc: (double-encrypted)
-                    s_trim = raw_d.strip()
-                    if s_trim.startswith("enc:"):
+                for tbl_name, col_name in (
+                    ("expenses", "description"),
+                    ("payroll_records", "notes"),
+                    ("payroll_records", "written_up_desc"),
+                    ("shop_documents", "notes"),
+                ):
+                    try:
+                        raw_cur.execute(
+                            f"SELECT id, {col_name} FROM {tbl_name} WHERE {col_name} IS NOT NULL AND {col_name} != ''"
+                        )
+                        pg_updates = []
+                        for rid, raw_val in raw_cur.fetchall() or []:
+                            if not raw_val or not isinstance(raw_val, str):
+                                continue
+                            s_trim = raw_val.strip()
+                            # If it is legacy enc: or plain or double-encrypted, decrypt and re-encrypt as shared deterministic denc:
+                            if s_trim.startswith("enc:") or not s_trim.startswith("denc:"):
+                                clean_plain = plain_label(raw_val)
+                                if clean_plain and not clean_plain.startswith(("enc:", "denc:")):
+                                    re_enc = _encrypt_for_col(col_name, clean_plain)
+                                    if re_enc != raw_val:
+                                        pg_updates.append((re_enc, rid))
+                            elif s_trim.startswith("denc:"):
+                                clean_plain = plain_label(raw_val)
+                                re_enc = _encrypt_for_col(col_name, clean_plain)
+                                if re_enc != raw_val and not clean_plain.startswith(("enc:", "denc:")):
+                                    pg_updates.append((re_enc, rid))
+                        for re_enc, rid in pg_updates:
+                            raw_cur.execute(f"UPDATE {tbl_name} SET {col_name} = %s WHERE id = %s", (re_enc, rid))
+                            healed += 1
+                    except Exception:
                         try:
-                            init_supabase_cipher()
-                            first_pass = CIPHER_SUITE.decrypt(s_trim[4:].encode()).decode()
-                            if first_pass.strip().startswith(("enc:", "denc:", "str:enc:", "str:denc:")):
-                                clean_plain = plain_label(raw_d)
-                                re_enc = _encrypt_for_col("description", clean_plain)
-                                pg_updates.append((re_enc, eid))
+                            pg_conn.rollback()
                         except Exception:
                             pass
-                for re_enc, eid in pg_updates:
-                    raw_cur.execute("UPDATE expenses SET description = %s WHERE id = %s", (re_enc, eid))
-                    healed += 1
-                if pg_updates:
-                    pg_conn.commit()
+                pg_conn.commit()
                 raw_cur.close()
             finally:
                 try:
@@ -4360,8 +4461,8 @@ def create_cloud_backup(slot_key=None, slot=None, backup_date=None, kind="auto")
     # Step 1: ALWAYS create local + permanent backup on this PC
     ok_local, msg_local = create_local_backup(slot_key=slot_key, slot=slot, backup_date=backup_date)
 
-    # Step 2: Upload to Supabase if connected
-    if get_db_mode() != "supabase" or is_supabase_offline():
+    # Step 2: Only upload to Supabase cloud_backups for daily/manual backups to conserve Supabase Egress & Storage
+    if kind == "auto30" or get_db_mode() != "supabase" or is_supabase_offline():
         return ok_local, f"Saved permanently on this device ({msg_local})"
 
     try:
@@ -5606,8 +5707,16 @@ def _merge_action_logs_into_local(lcur, use_cols, packed_rows):
 
 def _pull_user_action_logs(pg_cur, lcur):
     try:
-        pg_cur.execute("SELECT * FROM user_action_log")
+        local_max_id = 0
+        try:
+            lcur.execute("SELECT COALESCE(MAX(id), 0) FROM user_action_log")
+            local_max_id = int((lcur.fetchone() or [0])[0] or 0)
+        except Exception:
+            local_max_id = 0
+        pg_cur.execute("SELECT * FROM user_action_log WHERE id > %s ORDER BY id DESC LIMIT 100", (local_max_id,))
         rows = pg_cur.fetchall() or []
+        if not rows:
+            return
         desc = pg_cur.description
         if not desc:
             return
@@ -5940,10 +6049,31 @@ class OfflineTrackingCursor:
             self.execute(query, params)
 
     def fetchone(self):
-        return self._cur.fetchone()
+        res = self._cur.fetchone()
+        if res:
+            res_list = list(res)
+            changed = False
+            for idx, val in enumerate(res_list):
+                if isinstance(val, str) and (val.startswith("denc:") or val.startswith("enc:") or val.startswith("str:")):
+                    res_list[idx] = decrypt_val(val)
+                    changed = True
+            return tuple(res_list) if changed else res
+        return res
 
     def fetchall(self):
-        return self._cur.fetchall()
+        rows = self._cur.fetchall()
+        if not rows:
+            return rows
+        out = []
+        for row in rows:
+            row_list = list(row)
+            changed = False
+            for idx, val in enumerate(row_list):
+                if isinstance(val, str) and (val.startswith("denc:") or val.startswith("enc:") or val.startswith("str:")):
+                    row_list[idx] = decrypt_val(val)
+                    changed = True
+            out.append(tuple(row_list) if changed else row)
+        return out
 
     def close(self):
         try:
@@ -7422,8 +7552,57 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
         lcur.executemany(f"INSERT INTO users ({col_list}) VALUES ({placeholders})", final_rows)
 
 
-def refresh_offline_cache_from_cloud():
-    """Copy decrypted cloud tables into the local offline cache (for future offline use)."""
+def _get_cloud_table_digest(pg_cur, tbl):
+    """Return a tiny (~40-byte) digest tuple including a hash of descriptions/notes so any text edit triggers sync."""
+    try:
+        if tbl == "expenses":
+            pg_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), "
+                "COALESCE(ROUND(CAST(SUM(COALESCE(amount, 0)) AS NUMERIC), 2), 0), "
+                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(description AS TEXT), '') || '|' || "
+                "COALESCE(CAST(location AS TEXT), '') || '|' || COALESCE(CAST(status AS TEXT), '') || '|' || "
+                "COALESCE(CAST(owner AS TEXT), '') || '|' || COALESCE(CAST(category AS TEXT), '')) AS BIGINT)), 0) "
+                "FROM expenses"
+            )
+            r = pg_cur.fetchone()
+            return ("expenses", int(r[0] or 0), int(r[1] or 0), float(r[2] or 0.0), int(r[3] or 0))
+        elif tbl == "payroll_records":
+            pg_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), "
+                "COALESCE(ROUND(CAST(SUM(COALESCE(total_payout, 0)) AS NUMERIC), 2), 0), "
+                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(notes AS TEXT), '') || '|' || "
+                "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || COALESCE(CAST(location AS TEXT), '')) AS BIGINT)), 0) "
+                "FROM payroll_records"
+            )
+            r = pg_cur.fetchone()
+            return ("payroll_records", int(r[0] or 0), int(r[1] or 0), float(r[2] or 0.0), int(r[3] or 0))
+        elif tbl == "shop_documents":
+            pg_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), "
+                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(title AS TEXT), '') || '|' || "
+                "COALESCE(CAST(notes AS TEXT), '') || '|' || COALESCE(CAST(category AS TEXT), '')) AS BIGINT)), 0) "
+                "FROM shop_documents"
+            )
+            r = pg_cur.fetchone()
+            return ("shop_documents", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0))
+        elif tbl == "users":
+            pg_cur.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM users")
+            r = pg_cur.fetchone()
+            return ("users", int(r[0] or 0), str(r[1] or ""))
+        elif tbl == "cash_month_locks":
+            pg_cur.execute("SELECT COUNT(*), COALESCE(MAX(year_month), '') FROM cash_month_locks")
+            r = pg_cur.fetchone()
+            return ("cash_month_locks", int(r[0] or 0), str(r[1] or ""))
+        else:
+            pg_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {tbl}")
+            r = pg_cur.fetchone()
+            return (tbl, int(r[0] or 0), int(r[1] or 0))
+    except Exception:
+        return None
+
+
+def refresh_offline_cache_from_cloud(force_full=False):
+    """Copy decrypted cloud tables into the local offline cache ONLY when a table's cloud digest has changed."""
     if get_db_mode() != "supabase":
         return False
     try:
@@ -7442,18 +7621,45 @@ def refresh_offline_cache_from_cloud():
             lcur.execute(
                 "CREATE TABLE IF NOT EXISTS offline_sync_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, created_at TEXT)"
             )
-            try:
-                dropped = _dedupe_payroll_table(pg_cur)
-                if dropped:
-                    pg_proxy.commit()
-            except Exception:
-                try:
-                    pg_proxy.rollback()
-                except Exception:
-                    pass
             for tbl in OFFLINE_SYNC_TABLES:
                 try:
-                    pg_cur.execute(f"SELECT * FROM {tbl}")
+                    # 1. Tiny 32-byte digest gate: skip full SELECT * if nothing in this table changed!
+                    cloud_digest = _get_cloud_table_digest(pg_cur, tbl)
+                    cloud_count = cloud_digest[1] if cloud_digest and len(cloud_digest) > 1 else -1
+                    try:
+                        lcur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                        local_count = int((lcur.fetchone() or [0])[0] or 0)
+                    except Exception:
+                        local_count = 0
+
+                    if (
+                        not force_full
+                        and cloud_digest is not None
+                        and _LAST_CLOUD_TABLE_DIGESTS.get(tbl) == cloud_digest
+                        and (local_count == cloud_count or (local_count > 0 and cloud_count > 0))
+                    ):
+                        continue
+
+                    if tbl == "payroll_records":
+                        try:
+                            dropped = _dedupe_payroll_table(pg_cur)
+                            if dropped:
+                                pg_proxy.commit()
+                        except Exception:
+                            try:
+                                pg_proxy.rollback()
+                            except Exception:
+                                pass
+
+                    # 2. For shop_documents, NEVER bulk-download multi-MB file_data blobs during sync
+                    if tbl == "shop_documents":
+                        pg_cur.execute(
+                            "SELECT id, title, category, location, expiration_date, reminder_days, "
+                            "file_path, uploaded_at, date_entered, notes, file_size, file_type, filename, owner "
+                            "FROM shop_documents"
+                        )
+                    else:
+                        pg_cur.execute(f"SELECT * FROM {tbl}")
                     rows = pg_cur.fetchall() or []
                     desc = pg_cur.description
                     if not desc:
@@ -7472,12 +7678,7 @@ def refresh_offline_cache_from_cloud():
                     # Never replace a table that has local data with an empty cloud result
                     # (a failed/blank SELECT would delete every envelope/expense).
                     if not packed:
-                        try:
-                            lcur.execute(f"SELECT COUNT(*) FROM {tbl}")
-                            local_n = int((lcur.fetchone() or [0])[0] or 0)
-                        except Exception:
-                            local_n = 0
-                        if local_n > 0:
+                        if local_count > 0:
                             continue
                     sp = f"sp_pull_{tbl}"
                     lcur.execute(f"SAVEPOINT {sp}")
@@ -7510,6 +7711,8 @@ def refresh_offline_cache_from_cloud():
                             except Exception:
                                 pass
                         lcur.execute(f"RELEASE SAVEPOINT {sp}")
+                        if cloud_digest is not None:
+                            _LAST_CLOUD_TABLE_DIGESTS[tbl] = cloud_digest
                     except Exception:
                         try:
                             lcur.execute(f"ROLLBACK TO SAVEPOINT {sp}")
@@ -8438,9 +8641,9 @@ VAGARO_API_ENDPOINT = "https://api.vagaro.com/v1/revenue"
 AUTHORIZED_MACHINE_ID = "ANY"
 
 # While logged in on Supabase, pull the other PC's changes this often (ms).
-LIVE_SYNC_INTERVAL_MS = 30000  # Sync every 30 seconds
+LIVE_SYNC_INTERVAL_MS = 60000  # Sync every 60 seconds (with 32-byte digest gate)
 # How often to refresh the local offline cache while online (seconds).
-OFFLINE_CACHE_PULL_SEC = 30
+OFFLINE_CACHE_PULL_SEC = 60
 # Minimum seconds between forced UI reloads when cloud data is unchanged.
 LIVE_SYNC_MIN_UI_REFRESH_SEC = 10
 
@@ -10803,12 +11006,9 @@ if HAS_DEPS:
             
         def unlock_database_silently(self):
             global TEMP_DB_PATH, CIPHER_SUITE, SALT
-            if get_db_mode() == "supabase":
-                init_supabase_cipher()
             path = enable_local_first_mode()
             TEMP_DB_PATH = path
-            SALT = _OFFLINE_CACHE_SALT
-            CIPHER_SUITE = _OFFLINE_CACHE_CIPHER
+            init_supabase_cipher()
             _persist_offline_cache()
 
         def clear_window(self):
@@ -11738,7 +11938,8 @@ if HAS_DEPS:
             """Checks for cloud software updates in the background on startup and displays an install badge or mandatory update blocker."""
             def _bg():
                 try:
-                    if get_db_mode() == "supabase":
+                    if get_db_mode() == "supabase" and not getattr(self, "_login_cloud_cache_synced", False):
+                        self._login_cloud_cache_synced = True
                         try:
                             refresh_offline_cache_from_cloud()
                         except Exception:
