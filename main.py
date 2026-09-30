@@ -855,7 +855,17 @@ TRANSLATIONS = {
     "📁 Daily Backups (Local & Cloud DB)": "📁 النسخ الاحتياطي اليومي (محلي وسحابي DB)",
     "📋 DB Update & Recovery Audit History": "📋 سجل تحديثات واستعادة قاعدة البيانات (DB)",
     "Enforce Minimum Version:": "فرض الحد الأدنى للإصدار:",
-    "🔒 Enforce on All Devices": "🔒 فرض التحديث على جميع الأجهزة"
+    "🔒 Enforce on All Devices": "🔒 فرض التحديث على جميع الأجهزة",
+    "Lock Cycle": "قفل الدورة",
+    "Unlock Cycle": "فتح قفل الدورة",
+    "Cycle Locked": "الدورة مقفلة",
+    "Cycles Locked": "دورات مقفلة",
+    "Cycle Report / Print": "تقرير / طباعة الدورات",
+    "Employee Cycle Payout Report": "تقرير رواتب الدورات للموظف",
+    "Print / Save PDF": "طباعة / حفظ PDF",
+    "Last 2 Cycles": "آخر دورتين",
+    "Last 4 Cycles": "آخر 4 دورات",
+    "All Cycles with Sales": "كل الدورات ذات المبيعات",
 }
 
 # --- APP CONFIGURATION ---
@@ -868,7 +878,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.60"
+APP_VERSION = "2.5.61"
 APP_BUILD_DATE = "2026-09-15"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -5923,6 +5933,19 @@ class OfflineTrackingCursor:
                         )
                         self._log_change("insert", table, row=row, record_id=params[0])
                     return self
+                if table.lower() == "cash_month_locks" and params:
+                    row = self._fetch_named_row(table, "year_month", params[0])
+                    if row:
+                        self._enqueue(
+                            {
+                                "op": "upsert_key",
+                                "table": table,
+                                "key": "year_month",
+                                "row": row,
+                            }
+                        )
+                        self._log_change("insert", table, row=row, record_id=params[0])
+                    return self
                 lid = self._lastrowid or self._cur.lastrowid
                 if lid:
                     if table.lower() in ("expenses", "payroll_records", "shop_documents"):
@@ -7571,7 +7594,8 @@ def _get_cloud_table_digest(pg_cur, tbl):
                 "SELECT COUNT(*), COALESCE(MAX(id), 0), "
                 "COALESCE(ROUND(CAST(SUM(COALESCE(total_payout, 0)) AS NUMERIC), 2), 0), "
                 "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(notes AS TEXT), '') || '|' || "
-                "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || COALESCE(CAST(location AS TEXT), '')) AS BIGINT)), 0) "
+                "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || COALESCE(CAST(location AS TEXT), '') || '|' || "
+                "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || COALESCE(CAST(percentage AS TEXT), '')) AS BIGINT)), 0) "
                 "FROM payroll_records"
             )
             r = pg_cur.fetchone()
@@ -7590,9 +7614,13 @@ def _get_cloud_table_digest(pg_cur, tbl):
             r = pg_cur.fetchone()
             return ("users", int(r[0] or 0), str(r[1] or ""))
         elif tbl == "cash_month_locks":
-            pg_cur.execute("SELECT COUNT(*), COALESCE(MAX(year_month), '') FROM cash_month_locks")
+            pg_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(year_month), ''), "
+                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(year_month AS TEXT), '')) AS BIGINT)), 0) "
+                "FROM cash_month_locks"
+            )
             r = pg_cur.fetchone()
-            return ("cash_month_locks", int(r[0] or 0), str(r[1] or ""))
+            return ("cash_month_locks", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
         else:
             pg_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {tbl}")
             r = pg_cur.fetchone()
@@ -10779,14 +10807,33 @@ if HAS_DEPS:
                 except Exception:
                     pass
 
+        def go_to_main_revenue_tab(self, event=None):
+            """Navigate back to the Main Revenue Tab (Shop Earnings) when the top-left icon/logo is clicked."""
+            try:
+                self._hide_rev_cycles_popover()
+            except Exception:
+                pass
+            try:
+                nb = getattr(self, "notebook", None)
+                tab_cal = getattr(self, "tab_calendar", None)
+                if nb is not None and tab_cal is not None and self._widget_alive(nb) and self._widget_alive(tab_cal):
+                    nb.select(tab_cal)
+            except Exception:
+                pass
+            try:
+                self.lift()
+                self.focus_force()
+            except Exception:
+                pass
+
         def _create_barber_pole_badge(self, parent, mode="hero", subtitle=None):
             """Renders an authentic Barbershop Pole ('popstickle') with diagonal Red, White, and Royal Blue
             stripes and matching Red-White-Blue HIGHEND PAYROLL APP typography.
             """
-            wrapper = tb.Frame(parent)
+            wrapper = tb.Frame(parent, cursor="hand2" if mode == "header" else "")
             if mode == "header":
                 pole_w, pole_h = 20, 32
-                pole_cv = tk.Canvas(wrapper, width=pole_w, height=pole_h, highlightthickness=0, bg="#1e293b")
+                pole_cv = tk.Canvas(wrapper, width=pole_w, height=pole_h, highlightthickness=0, bg="#1e293b", cursor="hand2")
                 pole_cv.pack(side=LEFT, padx=(0, 8))
                 # Diagonal Red / White / Blue stripes inside cylinder
                 stripe_colors = ["#EF4444", "#FFFFFF", "#2563EB", "#FFFFFF"]
@@ -10802,11 +10849,19 @@ if HAS_DEPS:
                 pole_cv.create_rectangle(2, pole_h - 4, pole_w - 2, pole_h, fill="#CBD5E1", outline="#64748B")
                 pole_cv.create_rectangle(3, 4, pole_w - 3, pole_h - 4, outline="#94A3B8", width=1)
 
-                txt_f = tb.Frame(wrapper)
+                txt_f = tb.Frame(wrapper, cursor="hand2")
                 txt_f.pack(side=LEFT)
-                tk.Label(txt_f, text="HIGHEND ", font=("Segoe UI", 13, "bold"), fg="#FF5252", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
-                tk.Label(txt_f, text="PAYROLL ", font=("Segoe UI", 13, "bold"), fg="#FFFFFF", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
-                tk.Label(txt_f, text="APP", font=("Segoe UI", 13, "bold"), fg="#60A5FA", bg=self.style.colors.primary if hasattr(self, "style") else "#222").pack(side=LEFT)
+                lbl1 = tk.Label(txt_f, text="HIGHEND ", font=("Segoe UI", 13, "bold"), fg="#FF5252", bg=self.style.colors.primary if hasattr(self, "style") else "#222", cursor="hand2")
+                lbl1.pack(side=LEFT)
+                lbl2 = tk.Label(txt_f, text="PAYROLL ", font=("Segoe UI", 13, "bold"), fg="#FFFFFF", bg=self.style.colors.primary if hasattr(self, "style") else "#222", cursor="hand2")
+                lbl2.pack(side=LEFT)
+                lbl3 = tk.Label(txt_f, text="APP", font=("Segoe UI", 13, "bold"), fg="#60A5FA", bg=self.style.colors.primary if hasattr(self, "style") else "#222", cursor="hand2")
+                lbl3.pack(side=LEFT)
+                for _w in (wrapper, pole_cv, txt_f, lbl1, lbl2, lbl3):
+                    try:
+                        _w.bind("<Button-1>", self.go_to_main_revenue_tab)
+                    except Exception:
+                        pass
                 return wrapper
 
             # Hero mode (Splash screen & Login page)
@@ -14883,6 +14938,1320 @@ if HAS_DEPS:
             except Exception:
                 pass
 
+        def _rev_cycle_lock_key(self, cycle_key):
+            return f"CYCLE:{str(cycle_key or '').strip()}"
+
+        def get_locked_rev_cycles_map(self):
+            """Return {cycle_key: {'locked_by': str, 'locked_at': str}} for all locked pay cycles."""
+            locked = {}
+            try:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+                cur = conn.cursor()
+                cur.execute("SELECT year_month, locked_by, locked_at FROM cash_month_locks WHERE year_month LIKE 'CYCLE:%'")
+                for ym, l_by, l_at in cur.fetchall() or []:
+                    ym_s = str(ym or "").strip()
+                    if ym_s.startswith("CYCLE:"):
+                        ck = ym_s[6:].strip()
+                        if ck:
+                            locked[ck] = {
+                                "locked_by": str(l_by or "admin"),
+                                "locked_at": str(l_at or ""),
+                            }
+                conn.close()
+            except Exception:
+                pass
+            return locked
+
+        def is_rev_cycle_locked(self, cycle_key):
+            if not cycle_key:
+                return False
+            return str(cycle_key).strip() in self.get_locked_rev_cycles_map()
+
+        def _resolve_record_cycle_key(self, rec_date, stored_ck=None):
+            if stored_ck:
+                s_ck = str(stored_ck).strip()
+                if s_ck and parse_cycle_key(s_ck):
+                    return s_ck
+            return cycle_for_date(rec_date)
+
+        def update_rev_cycle_lock_button(self, locked_map=None):
+            btn = getattr(self, "btn_rev_cycle_lock", None)
+            if not self._widget_alive(btn):
+                return
+            if locked_map is None:
+                locked_map = self.get_locked_rev_cycles_map()
+            sel = sorted(getattr(self, "selected_rev_cycles", set()) or set())
+            try:
+                if len(sel) == 1:
+                    ck = sel[0]
+                    short_lbl = cycle_short_label(ck)
+                    if ck in locked_map:
+                        btn.config(
+                            text=f"🔒 {self._tr('Cycle Locked')} ({short_lbl})",
+                            bootstyle="warning",
+                        )
+                    else:
+                        btn.config(
+                            text=f"🔒 {self._tr('Lock Cycle')} ({short_lbl})",
+                            bootstyle="danger",
+                        )
+                elif len(sel) > 1:
+                    locked_cnt = sum(1 for c in sel if c in locked_map)
+                    if locked_cnt == len(sel):
+                        btn.config(
+                            text=f"🔒 {locked_cnt} {self._tr('Cycles Locked')}",
+                            bootstyle="warning",
+                        )
+                    elif locked_cnt > 0:
+                        btn.config(
+                            text=f"🔒 {self._tr('Lock Cycle')} ({locked_cnt}/{len(sel)})",
+                            bootstyle="danger",
+                        )
+                    else:
+                        btn.config(
+                            text=f"🔒 {self._tr('Lock Cycle')} ({len(sel)})",
+                            bootstyle="danger",
+                        )
+                else:
+                    btn.config(text=f"🔒 {self._tr('Lock Cycle')}", bootstyle="danger")
+            except Exception:
+                pass
+
+        def _compute_per_cycle_row_payouts(self, resolved_rows, locked_cycles=None, name_to_id=None):
+            """Calculate employee payouts with strict per-cycle isolation ('each cycle with itself').
+
+            - Sales are NEVER combined across different cycles when computing commission tiers or add-on rankings.
+            - Locked cycles (and rows with saved hour_rate/percentage on payroll_records) preserve the employee's
+              exact percentage and hourly rate recorded at that time, even if the employee's rate/percentage
+              changes in a later cycle.
+            - Returns a dict mapping `record_id (row[0]) -> payout_info_dict`.
+            """
+            name_to_id = name_to_id or {}
+            if locked_cycles is None:
+                locked_cycles = self.get_locked_rev_cycles_map()
+
+            def _norm_perc(val):
+                if val is None or str(val).strip() == "":
+                    return None
+                f = to_float(val, -1.0)
+                if f < 0:
+                    return None
+                return f / 100.0 if f > 1.0 else f
+
+            def _norm_hr(val):
+                if val is None or str(val).strip() == "":
+                    return None
+                f = to_float(val, -1.0)
+                if f < 0:
+                    return None
+                return f
+
+            # 1. Group rows by cycle_key so each cycle is evaluated strictly on its own
+            rows_by_cycle = {}
+            for idx, (row, row_ck) in enumerate(resolved_rows):
+                ck_key = row_ck or f"_no_cycle_{row[1]}"
+                rows_by_cycle.setdefault(ck_key, []).append((idx, row, row_ck))
+
+            results_by_rec_id = {}
+            for ck_key, ck_items in rows_by_cycle.items():
+                is_cycle_locked = bool(ck_key in locked_cycles)
+                emp_rev = {}
+                emp_addon = {}
+                emp_prod = {}
+
+                for _idx, row, _rck in ck_items:
+                    emp_name = row[2]
+                    emp_id = row[17] if len(row) > 17 and row[17] is not None else name_to_id.get(emp_name, None)
+                    emp_rev[emp_id] = emp_rev.get(emp_id, 0.0) + to_float(row[4], 0.0)
+                    emp_addon[emp_id] = emp_addon.get(emp_id, 0.0) + to_float(row[5], 0.0)
+                    emp_prod[emp_id] = emp_prod.get(emp_id, 0.0) + to_float(row[6], 0.0)
+
+                # Resolve per-row rate configuration within this cycle
+                row_rate_info = {}
+                emp_cycle_summary_mode = {}
+                for _idx, row, _rck in ck_items:
+                    emp_name = row[2]
+                    emp_id = row[17] if len(row) > 17 and row[17] is not None else name_to_id.get(emp_name, None)
+                    rec_hr = _norm_hr(row[8])
+                    emp_hr = _norm_hr(row[9]) or 0.0
+                    rec_perc = _norm_perc(row[10])
+                    emp_perc = _norm_perc(row[11]) or 0.0
+                    live_tiered = bool(row[16] in (1, "1", True))
+
+                    tot_svc_in_cycle = emp_rev.get(emp_id, 0.0) + emp_addon.get(emp_id, 0.0)
+                    tot_prod_in_cycle = emp_prod.get(emp_id, 0.0)
+                    cycle_prod_perc = product_percent_for_sales(tot_prod_in_cycle)
+
+                    # Priority 1: Explicit commission percentage recorded on the row (from cycle lock or manual edit)
+                    if rec_perc is not None and rec_perc > 0:
+                        service_perc = rec_perc
+                        hour_rate = rec_hr if (rec_hr is not None and rec_hr > 0) else (0.0 if is_cycle_locked else emp_hr)
+                        product_perc = cycle_prod_perc
+                        is_hourly = False
+                        use_tiered = live_tiered
+                    # Priority 2: Explicit hourly rate recorded on the row with 0 commission (from cycle lock or manual edit)
+                    elif (
+                        rec_hr is not None
+                        and rec_hr > 0
+                        and (is_cycle_locked or (rec_perc is not None and rec_perc <= 0) or (not live_tiered and emp_perc <= 0))
+                    ):
+                        hour_rate = rec_hr
+                        service_perc = 0.0
+                        product_perc = 0.0
+                        is_hourly = True
+                        use_tiered = False
+                    # Priority 3: Unlocked row without row-level override -> use employee's profile on THIS cycle's sales only
+                    else:
+                        if live_tiered:
+                            service_perc = service_percent_for_sales(tot_svc_in_cycle)
+                            product_perc = cycle_prod_perc
+                            hour_rate = rec_hr if (rec_hr is not None and rec_hr > 0) else emp_hr
+                            is_hourly = False
+                            use_tiered = True
+                        else:
+                            service_perc = emp_perc
+                            hour_rate = rec_hr if (rec_hr is not None and rec_hr > 0) else emp_hr
+                            product_perc = cycle_prod_perc
+                            is_hourly = (hour_rate > 0 and service_perc <= 0)
+                            use_tiered = False
+
+                    row_rate_info[_idx] = (emp_id, service_perc, product_perc, hour_rate, is_hourly, use_tiered)
+                    if emp_id not in emp_cycle_summary_mode:
+                        emp_cycle_summary_mode[emp_id] = (service_perc, is_hourly, use_tiered)
+
+                # Determine top below-50% (including hourly) add-on earner strictly within THIS cycle
+                top_below_50_emp = None
+                top_below_50_amt = -1.0
+                for eid, amt in emp_addon.items():
+                    if eid is None:
+                        continue
+                    s_perc, is_hr, is_tiered = emp_cycle_summary_mode.get(eid, (0.0, False, False))
+                    if is_hr or ((is_tiered or s_perc > 0) and s_perc < 0.50):
+                        if amt > top_below_50_amt and amt > 0:
+                            top_below_50_amt = amt
+                            top_below_50_emp = eid
+
+                # Compute final payout breakdown for each row in this cycle
+                for _idx, row, row_ck in ck_items:
+                    emp_id, service_perc, product_perc, hour_rate, is_hourly, use_tiered = row_rate_info[_idx]
+                    rev_v = to_float(row[4], 0.0)
+                    addon_v = to_float(row[5], 0.0)
+                    prod_v = to_float(row[6], 0.0)
+                    tip_v = to_float(row[7], 0.0)
+                    hrs_v = to_float(row[12], 0.0)
+
+                    rate_missing = (not use_tiered and service_perc <= 0 and hour_rate <= 0)
+                    hours_missing = (is_hourly and hrs_v <= 0)
+
+                    if is_hourly:
+                        svc_only_calc = 0.0
+                        hrs_only_calc = round(hrs_v * hour_rate, 2)
+                        svc_calc = hrs_only_calc
+                        if emp_id is not None and emp_id == top_below_50_emp and emp_addon.get(emp_id, 0.0) > 0:
+                            addon_rate = 0.50
+                        else:
+                            addon_rate = 0.40
+                        addon_calc = round(addon_v * addon_rate, 2)
+                        prod_calc = 0.0
+                        tip_calc = round(tip_v * 1.0, 2)
+                        calc_v = round(svc_calc + addon_calc + tip_calc, 2)
+                    elif rate_missing:
+                        svc_only_calc = 0.0
+                        hrs_only_calc = 0.0
+                        svc_calc = 0.0
+                        addon_rate = 0.0
+                        addon_calc = 0.0
+                        prod_calc = 0.0
+                        tip_calc = round(tip_v * 1.0, 2)
+                        calc_v = round(tip_calc, 2)
+                    else:
+                        svc_only_calc = round(rev_v * service_perc, 2)
+                        hrs_only_calc = round(hrs_v * hour_rate, 2)
+                        svc_calc = round(svc_only_calc + hrs_only_calc, 2)
+                        if service_perc < 0.50:
+                            if emp_id is not None and emp_id == top_below_50_emp and emp_addon.get(emp_id, 0.0) > 0:
+                                addon_rate = 0.50
+                            else:
+                                addon_rate = 0.40
+                        else:
+                            addon_rate = service_perc
+                        addon_calc = round(addon_v * addon_rate, 2)
+                        prod_calc = round(prod_v * product_perc, 2)
+                        tip_calc = round(tip_v * 1.0, 2)
+                        calc_v = round(svc_calc + addon_calc + tip_calc, 2)
+
+                    rec_key = row[0] if row[0] is not None else _idx
+                    results_by_rec_id[rec_key] = {
+                        "emp_id": emp_id,
+                        "cycle_key": row_ck,
+                        "is_locked": is_cycle_locked,
+                        "service_perc": service_perc,
+                        "addon_rate": addon_rate,
+                        "product_perc": product_perc,
+                        "hour_rate": hour_rate,
+                        "is_hourly": is_hourly,
+                        "use_tiered": use_tiered,
+                        "rate_missing": rate_missing,
+                        "hours_missing": hours_missing,
+                        "rev_v": rev_v,
+                        "addon_v": addon_v,
+                        "prod_v": prod_v,
+                        "tip_v": tip_v,
+                        "hrs_v": hrs_v,
+                        "svc_only_calc": svc_only_calc,
+                        "hrs_only_calc": hrs_only_calc,
+                        "svc_calc": svc_calc,
+                        "addon_calc": addon_calc,
+                        "prod_calc": prod_calc,
+                        "tip_calc": tip_calc,
+                        "calc_v": calc_v,
+                    }
+            return results_by_rec_id
+
+        def _fetch_all_resolved_payroll_rows(self, conn=None):
+            own_conn = conn is None
+            if own_conn:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(payroll_records)")
+            col_names = [col[1] for col in cur.fetchall() or []]
+            self._cache_payroll_cols = col_names
+            hr_col = "r.hour_rate" if "hour_rate" in col_names else "NULL"
+            perc_col = "r.percentage" if "percentage" in col_names else "NULL"
+            cyc_col = "r.cycle_key" if "cycle_key" in col_names else "NULL"
+            owner_col = "r.owner" if "owner" in col_names else "''"
+
+            query_all = f"""
+                SELECT r.id, r.record_date, e.name, r.location, r.revenue, r.service_addon_sales, r.product_sales, r.tip,
+                    {hr_col}, e.hour_rate, {perc_col}, e.percentage, r.hours, r.calculation, r.notes, r.written_up, e.use_tiered_payout, r.employee_id, {cyc_col}, {owner_col}
+                FROM payroll_records r
+                JOIN employees e ON r.employee_id = e.id
+                ORDER BY r.record_date DESC
+            """
+            cur.execute(query_all)
+            raw_rows = cur.fetchall() or []
+            if own_conn:
+                conn.close()
+            resolved = []
+            for row in raw_rows:
+                stored_ck = row[18] if len(row) > 18 else None
+                resolved_ck = self._resolve_record_cycle_key(row[1], stored_ck)
+                resolved.append((row, resolved_ck))
+            return resolved
+
+        def lock_rev_cycle(self, cycle_key, conn=None, parent=None):
+            """Freeze and persist every employee's active percentage, hour_rate, and calculation in cycle_key."""
+            ck = str(cycle_key or "").strip()
+            if not ck:
+                return 0
+            own_conn = conn is None
+            if own_conn:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+            cur = conn.cursor()
+            resolved_all = self._fetch_all_resolved_payroll_rows(conn=conn)
+            target_rows = [(row, r_ck) for (row, r_ck) in resolved_all if r_ck == ck]
+            locked_map = self.get_locked_rev_cycles_map()
+            calc_map = self._compute_per_cycle_row_payouts(target_rows, locked_cycles=locked_map)
+
+            updated_count = 0
+            for idx, (row, _rck) in enumerate(target_rows):
+                rec_id = row[0]
+                info = calc_map.get(rec_id, {})
+                frozen_hr = to_float(info.get("hour_rate"), 0.0)
+                frozen_perc = 0.0 if info.get("is_hourly") else to_float(info.get("service_perc"), 0.0)
+                frozen_calc = to_float(info.get("calc_v"), 0.0)
+                cur.execute(
+                    "UPDATE payroll_records SET hour_rate=?, percentage=?, calculation=?, cycle_key=? WHERE id=?",
+                    (frozen_hr, frozen_perc, frozen_calc, ck, rec_id),
+                )
+                updated_count += 1
+
+            lock_key = self._rev_cycle_lock_key(ck)
+            cur.execute("DELETE FROM cash_month_locks WHERE year_month=?", (lock_key,))
+            cur.execute(
+                "INSERT INTO cash_month_locks (year_month, locked_by, locked_at) VALUES (?, ?, ?)",
+                (
+                    lock_key,
+                    getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            )
+            if own_conn:
+                commit_and_save(conn)
+                conn.close()
+            return max(1, updated_count)
+
+        def unlock_rev_cycle(self, cycle_key, reset_row_rates=False, conn=None, parent=None):
+            """Unlock a pay cycle so its records can be edited; optionally clear frozen row rates to pick up live employee rates."""
+            ck = str(cycle_key or "").strip()
+            if not ck:
+                return False
+            own_conn = conn is None
+            if own_conn:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+            cur = conn.cursor()
+            lock_key = self._rev_cycle_lock_key(ck)
+            cur.execute("DELETE FROM cash_month_locks WHERE year_month=?", (lock_key,))
+            if reset_row_rates:
+                resolved_all = self._fetch_all_resolved_payroll_rows(conn=conn)
+                for row, r_ck in resolved_all:
+                    if r_ck == ck:
+                        cur.execute(
+                            "UPDATE payroll_records SET hour_rate=NULL, percentage=NULL WHERE id=?",
+                            (row[0],),
+                        )
+            if own_conn:
+                commit_and_save(conn)
+                conn.close()
+            return True
+
+        def open_rev_cycle_lock_dialog(self, target_cycle_key=None):
+            """Interactive dialog on the Main Revenue Tab to Lock or Unlock Pay Cycles and inspect frozen employee rates."""
+            locked_map = self.get_locked_rev_cycles_map()
+            sel_cycles = sorted(getattr(self, "selected_rev_cycles", set()) or set())
+            if target_cycle_key:
+                initial_ck = target_cycle_key
+            elif sel_cycles:
+                initial_ck = sel_cycles[0]
+            else:
+                today_iso = datetime.today().strftime("%Y-%m-%d")
+                initial_ck = last_completed_cycle_for_date(today_iso) or f"{self.rev_cal_year}-01-1"
+
+            cycle_choices, cycle_key_by_label, active_lbl = get_formatted_cycle_choices(initial_ck, start_from_june_2026=False)
+
+            dialog = tb.Toplevel(self)
+            dialog.title(self._tr("Lock / Unlock Pay Cycle"))
+            dialog.geometry("760x560")
+            try:
+                dialog.transient(self)
+            except Exception:
+                pass
+            self._safe_grab_set(dialog)
+            self._present_window(dialog)
+            dialog.focus_set()
+
+            def _close_dlg():
+                self._safe_grab_release(dialog)
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", _close_dlg)
+
+            top_f = tb.Frame(dialog, padding=(20, 14))
+            top_f.pack(fill=X)
+            tb.Label(
+                top_f,
+                text="🔒 " + self._tr("Pay Cycle Rate Lock & Snapshot"),
+                font=("Segoe UI", 16, "bold"),
+                bootstyle="primary",
+            ).pack(anchor=W)
+            tb.Label(
+                top_f,
+                text=self._tr(
+                    "Locking a cycle records and freezes each employee's commission percentage and hourly rate in that cycle so future rate changes never alter past payouts."
+                ),
+                font=("Segoe UI", 9),
+                bootstyle="secondary",
+                wraplength=700,
+                justify=LEFT,
+            ).pack(anchor=W, pady=(4, 0))
+
+            sel_row = tb.Frame(dialog, padding=(20, 6))
+            sel_row.pack(fill=X)
+            tb.Label(sel_row, text=self._tr("Target Cycle:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 8))
+            cb_ck = tb.Combobox(sel_row, values=cycle_choices, width=38, state="readonly", bootstyle="info")
+            cb_ck.set(active_lbl)
+            cb_ck.pack(side=LEFT, padx=(0, 12))
+
+            lbl_status = tb.Label(sel_row, text="", font=("Segoe UI", 10, "bold"))
+            lbl_status.pack(side=LEFT, padx=6)
+
+            # Preview table of employee rates in this cycle
+            preview_lf = tb.Labelframe(
+                dialog,
+                text=self._tr("Employee Rates & Payout Snapshot in Selected Cycle"),
+                padding=10,
+                bootstyle="info",
+            )
+            preview_lf.pack(fill=BOTH, expand=True, padx=20, pady=8)
+
+            cols = ("Employee", "Pay Mode", "Service Sales", "Service %", "Add-on Sales", "Add-on %", "Hours × Rate", "Cycle Payout")
+            tree_prev = tb.Treeview(preview_lf, columns=cols, show="headings", height=10, bootstyle="primary")
+            col_w = {
+                "Employee": 130,
+                "Pay Mode": 115,
+                "Service Sales": 95,
+                "Service %": 75,
+                "Add-on Sales": 95,
+                "Add-on %": 75,
+                "Hours × Rate": 115,
+                "Cycle Payout": 105,
+            }
+            for c in cols:
+                tree_prev.heading(c, text=c)
+                tree_prev.column(c, width=col_w.get(c, 95), anchor=CENTER if c != "Employee" else W)
+            tree_prev.pack(side=LEFT, fill=BOTH, expand=True)
+            sb_p = tb.Scrollbar(preview_lf, orient=VERTICAL, command=tree_prev.yview)
+            tree_prev.configure(yscrollcommand=sb_p.set)
+            sb_p.pack(side=RIGHT, fill=Y)
+
+            reset_rates_var = tk.BooleanVar(value=False)
+            chk_reset = tb.Checkbutton(
+                dialog,
+                text=self._tr("When unlocking, also refresh this cycle's records to use current employee rates/percentages"),
+                variable=reset_rates_var,
+                bootstyle="warning-round-toggle",
+            )
+
+            btn_bar = tb.Frame(dialog, padding=(20, 12))
+            btn_bar.pack(fill=X, side=BOTTOM)
+            btn_primary = tb.Button(btn_bar, text="🔒 Lock Cycle", bootstyle="danger", cursor="hand2")
+            btn_primary.pack(side=LEFT, padx=(0, 10), ipadx=16, ipady=4)
+
+            if len(sel_cycles) > 1:
+                def _lock_all_selected():
+                    total_rows = 0
+                    for c_k in sel_cycles:
+                        total_rows += self.lock_rev_cycle(c_k)
+                    _close_dlg()
+                    self._rebuild_cycle_cards()
+                    self.load_calendar_data(quiet=True)
+                    messagebox.showinfo(
+                        self._tr("Cycles Locked"),
+                        f"Locked {len(sel_cycles)} selected pay cycles ({total_rows} records frozen).",
+                        parent=self,
+                    )
+
+                tb.Button(
+                    btn_bar,
+                    text=f"🔒 Lock All {len(sel_cycles)} Selected Cycles",
+                    bootstyle="warning",
+                    cursor="hand2",
+                    command=_lock_all_selected,
+                ).pack(side=LEFT, padx=6, ipadx=10, ipady=4)
+
+            tb.Button(
+                btn_bar,
+                text="🖨️ " + self._tr("Open Cycle Report / Print"),
+                bootstyle="info-outline",
+                cursor="hand2",
+                command=lambda: (_close_dlg(), self.open_employee_cycle_report_dialog(default_cycles=[cycle_key_by_label.get(cb_ck.get()) or initial_ck])),
+            ).pack(side=LEFT, padx=6, ipadx=10, ipady=4)
+            tb.Button(btn_bar, text=self._tr("Cancel"), bootstyle="secondary", cursor="hand2", command=_close_dlg).pack(side=RIGHT, ipadx=14, ipady=4)
+
+            def _refresh_preview(*_):
+                for item in tree_prev.get_children():
+                    tree_prev.delete(item)
+                chosen_ck = cycle_key_by_label.get(cb_ck.get()) or initial_ck
+                cur_locks = self.get_locked_rev_cycles_map()
+                is_lck = chosen_ck in cur_locks
+                if is_lck:
+                    l_info = cur_locks[chosen_ck]
+                    lbl_status.config(
+                        text=f"🔒 LOCKED (by {l_info.get('locked_by', 'admin')} at {l_info.get('locked_at', '')[:16]})",
+                        bootstyle="warning",
+                    )
+                    chk_reset.pack(anchor=W, padx=20, pady=(0, 4))
+                else:
+                    lbl_status.config(text="🔓 UNLOCKED (Open for Import / Edits)", bootstyle="success")
+                    chk_reset.pack_forget()
+
+                resolved_all = self._fetch_all_resolved_payroll_rows()
+                ck_rows = [(r, rck) for (r, rck) in resolved_all if rck == chosen_ck]
+                calc_map = self._compute_per_cycle_row_payouts(ck_rows, locked_cycles=cur_locks)
+
+                emp_agg = {}
+                for idx, (row, _rck) in enumerate(ck_rows):
+                    info = calc_map.get(row[0], {})
+                    emp_name = row[2] or "Unknown"
+                    agg = emp_agg.setdefault(
+                        emp_name,
+                        {
+                            "rev": 0.0,
+                            "addon": 0.0,
+                            "hrs": 0.0,
+                            "calc": 0.0,
+                            "service_perc": info.get("service_perc", 0.0),
+                            "addon_rate": info.get("addon_rate", 0.0),
+                            "hour_rate": info.get("hour_rate", 0.0),
+                            "is_hourly": info.get("is_hourly", False),
+                            "use_tiered": info.get("use_tiered", False),
+                        },
+                    )
+                    agg["rev"] += to_float(info.get("rev_v"), 0.0)
+                    agg["addon"] += to_float(info.get("addon_v"), 0.0)
+                    agg["hrs"] += to_float(info.get("hrs_v"), 0.0)
+                    agg["calc"] += to_float(info.get("calc_v"), 0.0)
+
+                for emp_name, agg in sorted(emp_agg.items()):
+                    if agg["is_hourly"]:
+                        mode_s = "Hourly"
+                        s_pct_s = "—"
+                    elif agg["use_tiered"]:
+                        mode_s = "Tiered %"
+                        s_pct_s = f"{agg['service_perc'] * 100:.1f}%"
+                    else:
+                        mode_s = "Commission %"
+                        s_pct_s = f"{agg['service_perc'] * 100:.1f}%"
+                    a_pct_s = f"{agg['addon_rate'] * 100:.1f}%" if agg["addon_rate"] > 0 else "—"
+                    hr_s = f"{agg['hrs']:.1f}h × ${agg['hour_rate']:,.2f}" if agg["hour_rate"] > 0 else f"{agg['hrs']:.1f}h"
+                    tree_prev.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            emp_name,
+                            mode_s,
+                            f"${agg['rev']:,.2f}",
+                            s_pct_s,
+                            f"${agg['addon']:,.2f}",
+                            a_pct_s,
+                            hr_s,
+                            f"${agg['calc']:,.2f}",
+                        ),
+                    )
+
+                def _do_toggle():
+                    if is_lck:
+                        self.unlock_rev_cycle(chosen_ck, reset_row_rates=bool(reset_rates_var.get()))
+                        _close_dlg()
+                        self._rebuild_cycle_cards()
+                        self.load_calendar_data(quiet=True)
+                        messagebox.showinfo(
+                            self._tr("Cycle Unlocked"),
+                            f"{cycle_label_with_year(chosen_ck)} has been unlocked.",
+                            parent=self,
+                        )
+                    else:
+                        n_rows = self.lock_rev_cycle(chosen_ck)
+                        _close_dlg()
+                        self._rebuild_cycle_cards()
+                        self.load_calendar_data(quiet=True)
+                        messagebox.showinfo(
+                            self._tr("Cycle Locked"),
+                            f"🔒 {cycle_label_with_year(chosen_ck)} is now LOCKED.\n\n"
+                            f"Recorded and froze employee commission percentages & hourly rates across {n_rows} record(s).",
+                            parent=self,
+                        )
+
+                if is_lck:
+                    btn_primary.config(text=f"🔓 {self._tr('Unlock Cycle')} ({cycle_short_label(chosen_ck)})", bootstyle="warning", command=_do_toggle)
+                else:
+                    btn_primary.config(text=f"🔒 {self._tr('Lock Cycle')} ({cycle_short_label(chosen_ck)})", bootstyle="danger", command=_do_toggle)
+
+            cb_ck.bind("<<ComboboxSelected>>", _refresh_preview)
+            _refresh_preview()
+
+        def open_employee_cycle_report_dialog(self, default_emp_id=None, default_cycles=None, parent=None):
+            """Multi-Cycle Employee Payout Breakdown & Printable Report Tool.
+
+            Calculates each pay cycle independently ('each cycle with itself') using that cycle's locked/recorded
+            percentage or hourly rate, shows the full per-cycle breakdown (Service Sales %, Add-on Sales %,
+            Hourly Rate × Hours, Product Sales, Tips), and prints/exports a clean statement across 1 or N cycles.
+            """
+            parent_win = parent if self._widget_alive(parent) else self
+            win = tb.Toplevel(parent_win)
+            win.title(self._tr("Employee Cycle Payout Report"))
+            try:
+                self.update_idletasks()
+                w = max(1080, min(1320, self.winfo_width()))
+                h = max(700, min(880, self.winfo_height()))
+                x = self.winfo_x() + max(0, (self.winfo_width() - w) // 2)
+                y = self.winfo_y() + max(0, (self.winfo_height() - h) // 2)
+                win.geometry(f"{w}x{h}+{x}+{y}")
+            except Exception:
+                win.geometry("1160x780")
+            try:
+                win.transient(parent_win)
+            except Exception:
+                pass
+            self._safe_grab_set(win)
+            self._present_window(win)
+            win.focus_set()
+
+            def _close_rep():
+                self._safe_grab_release(win)
+                win.destroy()
+
+            win.protocol("WM_DELETE_WINDOW", _close_rep)
+
+            # Load employees list
+            conn = sqlite3.connect(TEMP_DB_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT id, name FROM employees ORDER BY id ASC")
+            emp_list = []
+            emp_id_by_name = {}
+            emp_name_by_id = {}
+            for eid, raw_name in cur.fetchall() or []:
+                nm = str(decrypt_val(raw_name) if raw_name is not None else "").strip()
+                if not nm or nm.lower() == "shop":
+                    continue
+                emp_list.append((eid, nm))
+                emp_id_by_name[nm] = eid
+                emp_name_by_id[eid] = nm
+            conn.close()
+
+            # Determine initial employee selection
+            init_emp_label = self._tr("All Employees")
+            if default_emp_id and default_emp_id in emp_name_by_id:
+                init_emp_label = emp_name_by_id[default_emp_id]
+            else:
+                cal_emp = getattr(self, "cal_name_filter", None)
+                if cal_emp and self._widget_alive(cal_emp):
+                    cv = cal_emp.get()
+                    if cv and cv != self._tr("All") and cv in emp_id_by_name:
+                        init_emp_label = cv
+                if init_emp_label == self._tr("All Employees") and emp_list:
+                    init_emp_label = emp_list[0][1]
+
+            # Determine initial selected cycles
+            rep_year_var = tk.IntVar(value=getattr(self, "rev_cal_year", datetime.today().year))
+            selected_cycles = set()
+            if default_cycles:
+                selected_cycles.update(default_cycles)
+            elif getattr(self, "selected_rev_cycles", None):
+                selected_cycles.update(self.selected_rev_cycles)
+            else:
+                today_iso = datetime.today().strftime("%Y-%m-%d")
+                ck_now = last_completed_cycle_for_date(today_iso)
+                if ck_now:
+                    selected_cycles.add(ck_now)
+
+            # Top Header Bar
+            hdr = tb.Frame(win, padding=(18, 12), bootstyle="primary")
+            hdr.pack(fill=X, side=TOP)
+            title_col = tb.Frame(hdr, bootstyle="primary")
+            title_col.pack(side=LEFT)
+            tb.Label(
+                title_col,
+                text="🖨️ " + self._tr("Employee Multi-Cycle Payout Breakdown & Printout"),
+                font=("Segoe UI", 15, "bold"),
+                bootstyle="inverse-primary",
+            ).pack(anchor=W)
+            tb.Label(
+                title_col,
+                text=self._tr("Each cycle is calculated independently on its own sales & locked/recorded rate — combining cycles never inflates tiers."),
+                font=("Segoe UI", 9),
+                bootstyle="inverse-primary",
+            ).pack(anchor=W)
+
+            hdr_btns = tb.Frame(hdr, bootstyle="primary")
+            hdr_btns.pack(side=RIGHT)
+
+            # Filter & Cycle Selector Bar
+            ctrl_lf = tb.Labelframe(win, text=self._tr("1. Select Employee & Pay Cycles to Combine / Print"), padding=(12, 8), bootstyle="info")
+            ctrl_lf.pack(fill=X, padx=16, pady=(10, 6))
+
+            row_top = tb.Frame(ctrl_lf)
+            row_top.pack(fill=X, pady=(0, 6))
+
+            tb.Label(row_top, text=self._tr("Employee:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
+            emp_choices = [self._tr("All Employees")] + [nm for _, nm in emp_list]
+            cb_emp = tb.Combobox(row_top, values=emp_choices, width=22, state="readonly", bootstyle="primary")
+            cb_emp.set(init_emp_label)
+            cb_emp.pack(side=LEFT, padx=(0, 14))
+
+            tb.Separator(row_top, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=6)
+
+            tb.Label(row_top, text=self._tr("Year:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(4, 4))
+            lbl_yr = tb.Label(row_top, text=str(rep_year_var.get()), font=("Segoe UI", 12, "bold"), bootstyle="primary")
+
+            def _chg_year(delta):
+                rep_year_var.set(rep_year_var.get() + delta)
+                lbl_yr.config(text=str(rep_year_var.get()))
+                _rebuild_cycle_checkboxes()
+                _refresh_report()
+
+            tb.Button(row_top, text="◀", width=3, bootstyle="outline-primary", cursor="hand2", command=lambda: _chg_year(-1)).pack(side=LEFT, padx=2)
+            lbl_yr.pack(side=LEFT, padx=6)
+            tb.Button(row_top, text="▶", width=3, bootstyle="outline-primary", cursor="hand2", command=lambda: _chg_year(1)).pack(side=LEFT, padx=2)
+
+            tb.Separator(row_top, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=8)
+
+            def _select_last_n_cycles(n_count):
+                resolved_all = self._fetch_all_resolved_payroll_rows()
+                sel_emp = cb_emp.get()
+                target_eid = emp_id_by_name.get(sel_emp) if sel_emp != self._tr("All Employees") else None
+                cycles_with_data = sorted(
+                    {
+                        rck
+                        for (r, rck) in resolved_all
+                        if rck and (target_eid is None or (r[17] if len(r) > 17 else emp_id_by_name.get(r[2])) == target_eid)
+                    }
+                )
+                if not cycles_with_data:
+                    all_yr = cycles_for_year(rep_year_var.get())
+                    cycles_with_data = all_yr
+                picked = cycles_with_data[-n_count:] if n_count > 0 else cycles_with_data
+                selected_cycles.clear()
+                selected_cycles.update(picked)
+                if picked:
+                    p_yr = parse_cycle_key(picked[-1])
+                    if p_yr:
+                        rep_year_var.set(p_yr[0].year)
+                        lbl_yr.config(text=str(rep_year_var.get()))
+                _rebuild_cycle_checkboxes()
+                _refresh_report()
+
+            def _clear_cycles():
+                selected_cycles.clear()
+                _rebuild_cycle_checkboxes()
+                _refresh_report()
+
+            tb.Button(row_top, text="1 Cycle", bootstyle="outline-info", cursor="hand2", command=lambda: _select_last_n_cycles(1)).pack(side=LEFT, padx=3)
+            tb.Button(row_top, text=self._tr("Last 2 Cycles"), bootstyle="outline-info", cursor="hand2", command=lambda: _select_last_n_cycles(2)).pack(side=LEFT, padx=3)
+            tb.Button(row_top, text=self._tr("Last 4 Cycles"), bootstyle="info", cursor="hand2", command=lambda: _select_last_n_cycles(4)).pack(side=LEFT, padx=3)
+            tb.Button(row_top, text=self._tr("All Cycles with Sales"), bootstyle="outline-primary", cursor="hand2", command=lambda: _select_last_n_cycles(0)).pack(side=LEFT, padx=3)
+            tb.Button(row_top, text=self._tr("Clear Selection"), bootstyle="outline-secondary", cursor="hand2", command=_clear_cycles).pack(side=LEFT, padx=3)
+
+            # Cycle Checkboxes Strip (2 rows of 13 cycles for the selected year)
+            cyc_grid_frame = tb.Frame(ctrl_lf)
+            cyc_grid_frame.pack(fill=X, pady=(4, 2))
+            cyc_vars = {}
+
+            def _on_toggle_ck(ck):
+                v = cyc_vars.get(ck)
+                if v and v.get():
+                    selected_cycles.add(ck)
+                else:
+                    selected_cycles.discard(ck)
+                _refresh_report()
+
+            def _rebuild_cycle_checkboxes():
+                for child in cyc_grid_frame.winfo_children():
+                    child.destroy()
+                cyc_vars.clear()
+                locked_map = self.get_locked_rev_cycles_map()
+                yr_cycles = cycles_for_year(rep_year_var.get())
+                cols_per_row = 7
+                for c in range(cols_per_row):
+                    cyc_grid_frame.columnconfigure(c, weight=1)
+                for idx, ck in enumerate(yr_cycles):
+                    r_i = idx // cols_per_row
+                    c_i = idx % cols_per_row
+                    var = tk.BooleanVar(value=(ck in selected_cycles))
+                    cyc_vars[ck] = var
+                    bounds = cycle_bounds(ck)
+                    short_d = f"{bounds[0][5:].replace('-', '/')}→{bounds[1][5:].replace('-', '/')}" if bounds else ""
+                    lck_mark = "🔒" if ck in locked_map else ""
+                    lbl_txt = f"{cycle_short_label(ck)}{lck_mark} ({short_d})"
+                    cb = tb.Checkbutton(
+                        cyc_grid_frame,
+                        text=lbl_txt,
+                        variable=var,
+                        bootstyle="primary-toolbutton" if ck not in locked_map else "warning-toolbutton",
+                        command=lambda target=ck: _on_toggle_ck(target),
+                    )
+                    cb.grid(row=r_i, column=c_i, padx=2, pady=2, sticky="ew")
+
+            # Middle: Per-Cycle Breakdown Table
+            table_lf = tb.Labelframe(
+                win,
+                text=self._tr("2. Per-Cycle Breakdown (Each Cycle Calculated With Itself)"),
+                padding=(10, 6),
+                bootstyle="primary",
+            )
+            table_lf.pack(fill=BOTH, expand=True, padx=16, pady=(2, 6))
+
+            rep_cols = (
+                "Cycle",
+                "Dates",
+                "Lock Status",
+                "Employee",
+                "Pay Plan / Rate",
+                "Service Sales",
+                "Service %",
+                "Service Pay",
+                "Add-on Sales",
+                "Add-on %",
+                "Add-on Pay",
+                "Hours × Rate",
+                "Product Sales",
+                "Tips (100%)",
+                "Cycle Total Payout",
+            )
+            tree_rep = tb.Treeview(table_lf, columns=rep_cols, show="headings", height=8, bootstyle="primary")
+            rep_widths = {
+                "Cycle": 75,
+                "Dates": 120,
+                "Lock Status": 90,
+                "Employee": 115,
+                "Pay Plan / Rate": 135,
+                "Service Sales": 95,
+                "Service %": 70,
+                "Service Pay": 95,
+                "Add-on Sales": 95,
+                "Add-on %": 70,
+                "Add-on Pay": 90,
+                "Hours × Rate": 115,
+                "Product Sales": 90,
+                "Tips (100%)": 85,
+                "Cycle Total Payout": 125,
+            }
+            for c in rep_cols:
+                tree_rep.heading(c, text=c)
+                tree_rep.column(c, width=rep_widths.get(c, 95), anchor=CENTER if c not in ("Employee", "Pay Plan / Rate") else W)
+            sb_ry = tb.Scrollbar(table_lf, orient=VERTICAL, command=tree_rep.yview)
+            sb_rx = tb.Scrollbar(table_lf, orient=HORIZONTAL, command=tree_rep.xview)
+            tree_rep.configure(yscrollcommand=sb_ry.set, xscrollcommand=sb_rx.set)
+            sb_ry.pack(side=RIGHT, fill=Y)
+            sb_rx.pack(side=BOTTOM, fill=X)
+            tree_rep.pack(side=LEFT, fill=BOTH, expand=True)
+
+            # Bottom: Printable Statement Preview
+            preview_lf = tb.Labelframe(
+                win,
+                text=self._tr("3. Printable Employee Cycle Statement Preview"),
+                padding=(10, 6),
+                bootstyle="secondary",
+            )
+            preview_lf.pack(fill=BOTH, expand=True, padx=16, pady=(0, 10))
+            txt_preview = tk.Text(
+                preview_lf,
+                height=11,
+                font=("Consolas", 10),
+                wrap="none",
+                bg="#0f172a" if getattr(self, "theme_mode", "dark") == "dark" else "#f8fafc",
+                fg="#f8fafc" if getattr(self, "theme_mode", "dark") == "dark" else "#0f172a",
+                padx=12,
+                pady=8,
+            )
+            sb_ty = tb.Scrollbar(preview_lf, orient=VERTICAL, command=txt_preview.yview)
+            txt_preview.configure(yscrollcommand=sb_ty.set)
+            sb_ty.pack(side=RIGHT, fill=Y)
+            txt_preview.pack(side=LEFT, fill=BOTH, expand=True)
+
+            report_state = {"cycle_entries": [], "grand": {}, "emp_label": init_emp_label, "text": ""}
+
+            def _refresh_report(*_):
+                for item in tree_rep.get_children():
+                    tree_rep.delete(item)
+                sel_emp = cb_emp.get()
+                target_eid = emp_id_by_name.get(sel_emp) if sel_emp != self._tr("All Employees") else None
+                locked_map = self.get_locked_rev_cycles_map()
+                resolved_all = self._fetch_all_resolved_payroll_rows()
+                calc_all = self._compute_per_cycle_row_payouts(resolved_all, locked_cycles=locked_map)
+
+                # Group by (cycle_key, emp_id, emp_name)
+                active_cks = sorted(selected_cycles) if selected_cycles else sorted({rck for (_, rck) in resolved_all if rck})
+                grouped = {}
+                for idx, (row, rck) in enumerate(resolved_all):
+                    if not rck or rck not in active_cks:
+                        continue
+                    info = calc_all.get(row[0], {})
+                    eid = info.get("emp_id")
+                    if target_eid is not None and eid != target_eid:
+                        continue
+                    ename = row[2] or "Unknown"
+                    key = (rck, eid, ename)
+                    g = grouped.setdefault(
+                        key,
+                        {
+                            "cycle_key": rck,
+                            "emp_id": eid,
+                            "emp_name": ename,
+                            "is_locked": bool(rck in locked_map),
+                            "locked_info": locked_map.get(rck, {}),
+                            "service_perc": info.get("service_perc", 0.0),
+                            "addon_rate": info.get("addon_rate", 0.0),
+                            "product_perc": info.get("product_perc", 0.0),
+                            "hour_rate": info.get("hour_rate", 0.0),
+                            "is_hourly": info.get("is_hourly", False),
+                            "use_tiered": info.get("use_tiered", False),
+                            "rev_v": 0.0,
+                            "addon_v": 0.0,
+                            "prod_v": 0.0,
+                            "tip_v": 0.0,
+                            "hrs_v": 0.0,
+                            "svc_only_calc": 0.0,
+                            "hrs_only_calc": 0.0,
+                            "svc_calc": 0.0,
+                            "addon_calc": 0.0,
+                            "prod_calc": 0.0,
+                            "tip_calc": 0.0,
+                            "calc_v": 0.0,
+                            "locations": [],
+                            "notes": [],
+                        },
+                    )
+                    g["rev_v"] += to_float(info.get("rev_v"), 0.0)
+                    g["addon_v"] += to_float(info.get("addon_v"), 0.0)
+                    g["prod_v"] += to_float(info.get("prod_v"), 0.0)
+                    g["tip_v"] += to_float(info.get("tip_v"), 0.0)
+                    g["hrs_v"] += to_float(info.get("hrs_v"), 0.0)
+                    g["svc_only_calc"] += to_float(info.get("svc_only_calc"), 0.0)
+                    g["hrs_only_calc"] += to_float(info.get("hrs_only_calc"), 0.0)
+                    g["svc_calc"] += to_float(info.get("svc_calc"), 0.0)
+                    g["addon_calc"] += to_float(info.get("addon_calc"), 0.0)
+                    g["prod_calc"] += to_float(info.get("prod_calc"), 0.0)
+                    g["tip_calc"] += to_float(info.get("tip_calc"), 0.0)
+                    g["calc_v"] += to_float(info.get("calc_v"), 0.0)
+                    if row[3] and str(row[3]) not in g["locations"]:
+                        g["locations"].append(str(row[3]))
+
+                sorted_entries = [grouped[k] for k in sorted(grouped.keys(), key=lambda x: (x[0], str(x[2])))]
+
+                grand = {
+                    "rev_v": 0.0,
+                    "svc_only_calc": 0.0,
+                    "addon_v": 0.0,
+                    "addon_calc": 0.0,
+                    "hrs_v": 0.0,
+                    "hrs_only_calc": 0.0,
+                    "prod_v": 0.0,
+                    "prod_calc": 0.0,
+                    "tip_v": 0.0,
+                    "calc_v": 0.0,
+                }
+
+                lines = []
+                lines.append("=" * 92)
+                lines.append(f"  HIGHEND PAYROLL — EMPLOYEE MULTI-CYCLE PAYOUT BREAKDOWN REPORT")
+                lines.append(f"  Employee: {sel_emp}   |   Selected Cycles: {len(active_cks)}   |   Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+                lines.append("  Note: Each pay cycle is calculated independently on its own sales and recorded rate.")
+                lines.append("=" * 92)
+
+                for idx_e, g in enumerate(sorted_entries, 1):
+                    rck = g["cycle_key"]
+                    bounds = cycle_bounds(rck)
+                    dates_s = f"{bounds[0]} → {bounds[1]}" if bounds else rck
+                    lck_s = "🔒 Locked" if g["is_locked"] else "Unlocked"
+
+                    if g["is_hourly"]:
+                        plan_s = f"Hourly (${g['hour_rate']:,.2f}/hr)"
+                        svc_pct_s = "Hourly"
+                    elif g["use_tiered"]:
+                        plan_s = f"Tiered ({g['service_perc'] * 100:.0f}%)"
+                        svc_pct_s = f"{g['service_perc'] * 100:.1f}%"
+                    else:
+                        plan_s = f"Commission ({g['service_perc'] * 100:.1f}%)"
+                        svc_pct_s = f"{g['service_perc'] * 100:.1f}%"
+
+                    addon_pct_s = f"{g['addon_rate'] * 100:.1f}%" if g["addon_rate"] > 0 else "0%"
+                    hrs_rate_s = (
+                        f"{g['hrs_v']:.1f}h × ${g['hour_rate']:,.2f} = ${g['hrs_only_calc']:,.2f}"
+                        if g["hour_rate"] > 0 or g["hrs_v"] > 0
+                        else "0.0h"
+                    )
+
+                    tree_rep.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            cycle_short_label(rck),
+                            dates_s,
+                            lck_s,
+                            g["emp_name"],
+                            plan_s,
+                            f"${g['rev_v']:,.2f}",
+                            svc_pct_s,
+                            f"${g['svc_only_calc']:,.2f}",
+                            f"${g['addon_v']:,.2f}",
+                            addon_pct_s,
+                            f"${g['addon_calc']:,.2f}",
+                            hrs_rate_s,
+                            f"${g['prod_v']:,.2f}",
+                            f"${g['tip_v']:,.2f}",
+                            f"⭐ ${g['calc_v']:,.2f} ⭐",
+                        ),
+                    )
+
+                    for k in grand:
+                        grand[k] += g[k]
+
+                    lines.append("")
+                    lines.append(f"▶ CYCLE {idx_e}: {cycle_label_with_year(rck)} ({dates_s})  [{lck_s}] — {g['emp_name']}")
+                    lines.append(f"  Recorded Pay Structure in this Cycle: {plan_s}  |  Add-on Rate: {addon_pct_s}")
+                    if not g["is_hourly"]:
+                        lines.append(
+                            f"    • Service Sales:          ${g['rev_v']:>10,.2f}  ×  {g['service_perc']*100:>5.1f}%       =  ${g['svc_only_calc']:>10,.2f}"
+                        )
+                    else:
+                        lines.append(
+                            f"    • Service Sales (Shop):   ${g['rev_v']:>10,.2f}  (Hourly Plan)  =       $0.00"
+                        )
+                    lines.append(
+                        f"    • Service Add-on Sales:   ${g['addon_v']:>10,.2f}  ×  {g['addon_rate']*100:>5.1f}%       =  ${g['addon_calc']:>10,.2f}"
+                    )
+                    if g["hrs_v"] > 0 or g["hour_rate"] > 0 or g["is_hourly"]:
+                        lines.append(
+                            f"    • Hourly Work Pay:        {g['hrs_v']:>10.1f}h  ×  ${g['hour_rate']:>6,.2f}/hr   =  ${g['hrs_only_calc']:>10,.2f}"
+                        )
+                    if g["prod_v"] > 0:
+                        lines.append(
+                            f"    • Product Sales:          ${g['prod_v']:>10,.2f}  (Tier: {g['product_perc']*100:.0f}%)"
+                        )
+                    lines.append(
+                        f"    • Tips (100%):            ${g['tip_v']:>10,.2f}  ×  100.0%       =  ${g['tip_v']:>10,.2f}"
+                    )
+                    lines.append("    " + "-" * 74)
+                    lines.append(f"    CYCLE SUBTOTAL PAYOUT ({cycle_short_label(rck)}):                                   ${g['calc_v']:>10,.2f}")
+
+                if sorted_entries:
+                    tree_rep.insert("", tk.END, values=("", "", "", "", "", "", "", "", "", "", "", "", "", "", ""))
+                    tree_rep.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            "TOTALS",
+                            f"{len(sorted_entries)} Cycle(s)",
+                            "Isolated/Cycle",
+                            sel_emp,
+                            "Sum of Cycles",
+                            f"${grand['rev_v']:,.2f}",
+                            "—",
+                            f"${grand['svc_only_calc']:,.2f}",
+                            f"${grand['addon_v']:,.2f}",
+                            "—",
+                            f"${grand['addon_calc']:,.2f}",
+                            f"{grand['hrs_v']:.1f}h (${grand['hrs_only_calc']:,.2f})",
+                            f"${grand['prod_v']:,.2f}",
+                            f"${grand['tip_v']:,.2f}",
+                            f"⭐ ${grand['calc_v']:,.2f} ⭐",
+                        ),
+                        tags=("totals",),
+                    )
+                    tree_rep.tag_configure("totals", background="#375a7f", foreground="white", font=("Segoe UI", 10, "bold"))
+
+                    lines.append("")
+                    lines.append("=" * 92)
+                    lines.append(f"  COMBINED GRAND TOTAL ACROSS {len(sorted_entries)} CYCLE(S) — {sel_emp}")
+                    lines.append("  (Sum of individual cycle payouts; each cycle calculated independently)")
+                    lines.append("-" * 92)
+                    lines.append(f"    Total Service Sales:         ${grand['rev_v']:>10,.2f}   →  Service Commission Pay:  ${grand['svc_only_calc']:>10,.2f}")
+                    lines.append(f"    Total Add-on Service Sales:  ${grand['addon_v']:>10,.2f}   →  Add-on Commission Pay:   ${grand['addon_calc']:>10,.2f}")
+                    lines.append(f"    Total Hours Worked:          {grand['hrs_v']:>10.1f}h   →  Total Hourly Pay:        ${grand['hrs_only_calc']:>10,.2f}")
+                    lines.append(f"    Total Product Sales:         ${grand['prod_v']:>10,.2f}")
+                    lines.append(f"    Total Tips (100%):           ${grand['tip_v']:>10,.2f}   →  Total Tips Pay:          ${grand['tip_v']:>10,.2f}")
+                    lines.append("  " + "=" * 88)
+                    lines.append(f"    GRAND TOTAL PAYOUT ({len(sorted_entries)} CYCLES COMBINED):                        ${grand['calc_v']:>10,.2f}")
+                    lines.append("=" * 92)
+                else:
+                    lines.append("")
+                    lines.append("  No payroll records found for the selected employee and cycle(s).")
+
+                full_txt = "\n".join(lines)
+                txt_preview.config(state="normal")
+                txt_preview.delete("1.0", tk.END)
+                txt_preview.insert("1.0", full_txt)
+                txt_preview.config(state="disabled")
+
+                report_state["cycle_entries"] = sorted_entries
+                report_state["grand"] = grand
+                report_state["emp_label"] = sel_emp
+                report_state["text"] = full_txt
+
+            def _print_or_pdf_report():
+                entries = report_state.get("cycle_entries") or []
+                if not entries:
+                    messagebox.showinfo(self._tr("Print Report"), self._tr("No cycle records selected to print."), parent=win)
+                    return
+                grand = report_state["grand"]
+                emp_lbl = report_state["emp_label"]
+                import webbrowser
+                import html as _html
+
+                cards_html = []
+                for idx_e, g in enumerate(entries, 1):
+                    rck = g["cycle_key"]
+                    bounds = cycle_bounds(rck)
+                    dates_s = f"{bounds[0]} &rarr; {bounds[1]}" if bounds else _html.escape(str(rck))
+                    lck_badge = (
+                        '<span class="badge locked">&#128274; Locked Rate</span>'
+                        if g["is_locked"]
+                        else '<span class="badge unlocked">Unlocked</span>'
+                    )
+                    if g["is_hourly"]:
+                        plan_s = f"Hourly Rate Plan (${g['hour_rate']:,.2f}/hr)"
+                        svc_row = f"<tr><td>Service Sales (Shop Revenue)</td><td>${g['rev_v']:,.2f}</td><td>Hourly Plan</td><td class='amt'>$0.00</td></tr>"
+                    elif g["use_tiered"]:
+                        plan_s = f"Tiered Commission ({g['service_perc']*100:.1f}%)"
+                        svc_row = f"<tr><td>Service Sales</td><td>${g['rev_v']:,.2f}</td><td>{g['service_perc']*100:.1f}%</td><td class='amt'>${g['svc_only_calc']:,.2f}</td></tr>"
+                    else:
+                        plan_s = f"Commission ({g['service_perc']*100:.1f}%)"
+                        svc_row = f"<tr><td>Service Sales</td><td>${g['rev_v']:,.2f}</td><td>{g['service_perc']*100:.1f}%</td><td class='amt'>${g['svc_only_calc']:,.2f}</td></tr>"
+
+                    addon_row = f"<tr><td>Service Add-on Sales</td><td>${g['addon_v']:,.2f}</td><td>{g['addon_rate']*100:.1f}%</td><td class='amt'>${g['addon_calc']:,.2f}</td></tr>"
+                    hr_row = ""
+                    if g["hrs_v"] > 0 or g["hour_rate"] > 0 or g["is_hourly"]:
+                        hr_row = f"<tr><td>Hours Worked &times; Hourly Rate</td><td>{g['hrs_v']:.1f} hrs</td><td>${g['hour_rate']:,.2f}/hr</td><td class='amt'>${g['hrs_only_calc']:,.2f}</td></tr>"
+                    prod_row = ""
+                    if g["prod_v"] > 0:
+                        prod_row = f"<tr><td>Product Sales</td><td>${g['prod_v']:,.2f}</td><td>{g['product_perc']*100:.0f}%</td><td class='amt'>—</td></tr>"
+                    tip_row = f"<tr><td>Tips (100%)</td><td>${g['tip_v']:,.2f}</td><td>100%</td><td class='amt'>${g['tip_v']:,.2f}</td></tr>"
+
+                    cards_html.append(
+                        f"""
+                        <div class="cycle-card">
+                            <div class="cycle-hdr">
+                                <div>
+                                    <strong>Cycle {idx_e}: {_html.escape(cycle_label_with_year(rck))}</strong>
+                                    <span class="dates">({dates_s})</span> &mdash; <strong>{_html.escape(g['emp_name'])}</strong>
+                                </div>
+                                <div>{lck_badge} &nbsp; <span class="plan">{_html.escape(plan_s)}</span></div>
+                            </div>
+                            <table class="breakdown-tbl">
+                                <thead>
+                                    <tr><th>Category</th><th>Cycle Volume / Hours</th><th>Recorded Rate / %</th><th class="amt">Calculated Pay</th></tr>
+                                </thead>
+                                <tbody>
+                                    {svc_row}
+                                    {addon_row}
+                                    {hr_row}
+                                    {prod_row}
+                                    {tip_row}
+                                    <tr class="sub-row">
+                                        <td colspan="3"><strong>{_html.escape(cycle_short_label(rck))} Subtotal Payout</strong></td>
+                                        <td class="amt"><strong>${g['calc_v']:,.2f}</strong></td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        """
+                    )
+
+                html_doc = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Employee Cycle Payout Report - {_html.escape(emp_lbl)}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #0f172a; margin: 24px; background: #f8fafc; }}
+  .no-print {{ background: #1e293b; color: white; padding: 12px 20px; border-radius: 8px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }}
+  .no-print button {{ background: #10b981; color: white; border: none; padding: 8px 18px; border-radius: 6px; font-size: 14px; font-weight: bold; cursor: pointer; }}
+  .report-box {{ background: white; padding: 28px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.06); max-width: 920px; margin: 0 auto; }}
+  h1 {{ margin: 0 0 4px 0; font-size: 22px; color: #1e3a8a; }}
+  .meta {{ color: #475569; font-size: 13px; margin-bottom: 18px; border-bottom: 2px solid #e2e8f0; padding-bottom: 12px; }}
+  .cycle-card {{ border: 1px solid #cbd5e1; border-radius: 8px; margin-bottom: 16px; overflow: hidden; page-break-inside: avoid; }}
+  .cycle-hdr {{ background: #f1f5f9; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; border-bottom: 1px solid #cbd5e1; }}
+  .dates {{ color: #64748b; font-size: 12px; }}
+  .badge {{ padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }}
+  .badge.locked {{ background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; }}
+  .badge.unlocked {{ background: #e0f2fe; color: #075985; }}
+  .plan {{ font-weight: 600; color: #0f172a; font-size: 12px; }}
+  table.breakdown-tbl {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+  table.breakdown-tbl th, table.breakdown-tbl td {{ padding: 7px 14px; border-bottom: 1px solid #f1f5f9; text-align: left; }}
+  table.breakdown-tbl th {{ background: #f8fafc; color: #475569; font-size: 11px; text-transform: uppercase; }}
+  table.breakdown-tbl td.amt, table.breakdown-tbl th.amt {{ text-align: right; }}
+  tr.sub-row td {{ background: #f8fafc; border-top: 1px solid #cbd5e1; font-size: 14px; color: #0f172a; }}
+  .grand-box {{ margin-top: 22px; border: 2px solid #1e3a8a; border-radius: 8px; padding: 16px 20px; background: #eff6ff; page-break-inside: avoid; }}
+  .grand-box h2 {{ margin: 0 0 10px 0; font-size: 16px; color: #1e3a8a; }}
+  .grand-grid {{ display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 24px; font-size: 13px; }}
+  .grand-total-line {{ margin-top: 12px; padding-top: 10px; border-top: 2px solid #93c5fd; display: flex; justify-content: space-between; font-size: 18px; font-weight: bold; color: #1e3a8a; }}
+  @media print {{
+    body {{ background: white; margin: 0; }}
+    .no-print {{ display: none !important; }}
+    .report-box {{ box-shadow: none; padding: 0; max-width: 100%; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="no-print">
+    <div><strong>&#128424; Employee Multi-Cycle Payout Statement</strong> &mdash; Click Print or choose "Save as PDF" in your printer dialog.</div>
+    <button onclick="window.print()">&#128424; Print / Save as PDF</button>
+  </div>
+  <div class="report-box">
+    <h1>HIGHEND PAYROLL &mdash; EMPLOYEE CYCLE PAYOUT BREAKDOWN</h1>
+    <div class="meta">
+      <strong>Employee:</strong> {_html.escape(emp_lbl)} &nbsp;|&nbsp;
+      <strong>Cycles Included:</strong> {len(entries)} &nbsp;|&nbsp;
+      <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')}<br>
+      <em>Each pay cycle is calculated independently on its own sales and uses the employee's recorded percentage or hourly rate for that cycle.</em>
+    </div>
+    {''.join(cards_html)}
+    <div class="grand-box">
+      <h2>COMBINED SUMMARY ACROSS {len(entries)} CYCLE(S) &mdash; {_html.escape(emp_lbl)}</h2>
+      <div class="grand-grid">
+        <div><strong>Total Service Sales:</strong> ${grand['rev_v']:,.2f} &rarr; <strong>Pay:</strong> ${grand['svc_only_calc']:,.2f}</div>
+        <div><strong>Total Add-on Sales:</strong> ${grand['addon_v']:,.2f} &rarr; <strong>Pay:</strong> ${grand['addon_calc']:,.2f}</div>
+        <div><strong>Total Hours Worked:</strong> {grand['hrs_v']:.1f} hrs &rarr; <strong>Hourly Pay:</strong> ${grand['hrs_only_calc']:,.2f}</div>
+        <div><strong>Total Tips (100%):</strong> ${grand['tip_v']:,.2f} &nbsp;|&nbsp; <strong>Product Sales:</strong> ${grand['prod_v']:,.2f}</div>
+      </div>
+      <div class="grand-total-line">
+        <span>COMBINED GRAND TOTAL PAYOUT ({len(entries)} Cycles):</span>
+        <span>${grand['calc_v']:,.2f}</span>
+      </div>
+    </div>
+  </div>
+  <script>setTimeout(function() {{ window.print(); }}, 350);</script>
+</body>
+</html>"""
+                try:
+                    rep_dir = os.path.join(get_app_dir(), "printed_cycle_reports")
+                    os.makedirs(rep_dir, exist_ok=True)
+                    safe_emp = "".join(ch if ch.isalnum() else "_" for ch in str(emp_lbl)).strip("_") or "employee"
+                    html_path = os.path.join(rep_dir, f"cycle_report_{safe_emp}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+                    with open(html_path, "w", encoding="utf-8") as f:
+                        f.write(html_doc)
+                    webbrowser.open(f"file://{os.path.abspath(html_path)}")
+                except Exception as e:
+                    messagebox.showerror("Print Error", f"Could not open printable report:\n{e}", parent=win)
+
+            def _export_csv_excel():
+                entries = report_state.get("cycle_entries") or []
+                if not entries:
+                    messagebox.showinfo(self._tr("Export"), self._tr("No data available to export."), parent=win)
+                    return
+                safe_emp = "".join(ch if ch.isalnum() else "_" for ch in str(report_state.get("emp_label", "employee"))).strip("_")
+                filepath = filedialog.asksaveasfilename(
+                    parent=win,
+                    defaultextension=".csv",
+                    initialfile=f"cycle_breakdown_{safe_emp}.csv",
+                    filetypes=[("CSV Files", "*.csv"), ("Excel Files", "*.xlsx"), ("All Files", "*.*")],
+                    title=self._tr("Export Employee Cycle Breakdown"),
+                )
+                if not filepath:
+                    return
+                try:
+                    rows_out = []
+                    for item in tree_rep.get_children():
+                        vals = tree_rep.item(item).get("values") or []
+                        if vals:
+                            rows_out.append(list(vals))
+                    if filepath.lower().endswith(".xlsx"):
+                        import openpyxl
+                        wb = openpyxl.Workbook()
+                        ws = wb.active
+                        ws.title = "Cycle Breakdown"
+                        ws.append(list(rep_cols))
+                        for r in rows_out:
+                            ws.append(r)
+                        wb.save(filepath)
+                    else:
+                        import csv
+                        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(list(rep_cols))
+                            for r in rows_out:
+                                writer.writerow(r)
+                    messagebox.showinfo(self._tr("Success"), f"{self._tr('Data successfully exported to:')}\n{filepath}", parent=win)
+                except Exception as e:
+                    messagebox.showerror(self._tr("Error"), f"{self._tr('Could not save file:')}\n{e}", parent=win)
+
+            def _lock_selected_from_report():
+                if not selected_cycles:
+                    messagebox.showwarning("Select Cycle", "Please select at least one cycle to lock.", parent=win)
+                    return
+                total_rows = 0
+                for ck in sorted(selected_cycles):
+                    total_rows += self.lock_rev_cycle(ck)
+                _rebuild_cycle_checkboxes()
+                _refresh_report()
+                self._rebuild_cycle_cards()
+                self.load_calendar_data(quiet=True)
+                messagebox.showinfo(
+                    self._tr("Cycles Locked"),
+                    f"🔒 Locked {len(selected_cycles)} selected cycle(s) and froze employee rates across {total_rows} record(s).",
+                    parent=win,
+                )
+
+            tb.Button(hdr_btns, text="🖨️ " + self._tr("Print / Save PDF"), bootstyle="success", cursor="hand2", command=_print_or_pdf_report).pack(side=LEFT, padx=4)
+            tb.Button(hdr_btns, text="💾 " + self._tr("Export CSV / Excel"), bootstyle="info", cursor="hand2", command=_export_csv_excel).pack(side=LEFT, padx=4)
+            tb.Button(hdr_btns, text="🔒 " + self._tr("Lock Selected Cycles"), bootstyle="danger", cursor="hand2", command=_lock_selected_from_report).pack(side=LEFT, padx=4)
+            tb.Button(hdr_btns, text="✕ " + self._tr("Close Window"), bootstyle="light", cursor="hand2", command=_close_rep).pack(side=LEFT, padx=(8, 0))
+
+            cb_emp.bind("<<ComboboxSelected>>", lambda e: _refresh_report())
+            _rebuild_cycle_checkboxes()
+            _refresh_report()
+
         def setup_calendar_tab(self):
             self.rev_cal_year = datetime.today().year
             today_iso = datetime.today().strftime('%Y-%m-%d')
@@ -14921,6 +16290,15 @@ if HAS_DEPS:
             self.btn_browse_cycles.bind("<Enter>", self._show_rev_cycles_popover)
             self.btn_browse_cycles.bind("<Leave>", lambda e: self._schedule_popover_close())
 
+            self.btn_rev_cycle_lock = tb.Button(
+                year_frame,
+                text=f"🔒 {self._tr('Lock Cycle')}",
+                bootstyle="danger",
+                cursor="hand2",
+                command=self.open_rev_cycle_lock_dialog,
+            )
+            self.btn_rev_cycle_lock.pack(side=LEFT, padx=(6, 3))
+
             # Middle: Employee Filter
             emp_lf = tb.Labelframe(top_frame, text=self._tr("Employee:"), padding=(8, 4), bootstyle="secondary")
             emp_lf.pack(side=LEFT, fill=Y, padx=(0, 10))
@@ -14940,6 +16318,7 @@ if HAS_DEPS:
                 cursor="hand2",
             )
             tb.Button(action_lf, text=self._tr("Import Excel Sales"), bootstyle="info", cursor="hand2", command=self.open_excel_import_dialog).pack(side=LEFT, padx=4)
+            tb.Button(action_lf, text="🖨️ " + self._tr("Cycle Report / Print"), bootstyle="success", cursor="hand2", command=self.open_employee_cycle_report_dialog).pack(side=LEFT, padx=4)
             tb.Button(action_lf, text=self._tr("✏️ Edit"), bootstyle="warning", cursor="hand2", command=self.edit_selected_record).pack(side=LEFT, padx=4)
             tb.Button(action_lf, text=self._tr("🗑️ Delete"), bootstyle="danger", cursor="hand2", command=self.delete_selected_record).pack(side=LEFT, padx=4)
             tb.Button(action_lf, text=self._tr("⚙️ Columns"), bootstyle="secondary-outline", cursor="hand2", command=self.open_calendar_columns_dialog).pack(side=LEFT, padx=4)
@@ -15322,6 +16701,7 @@ if HAS_DEPS:
 
             year_cycles = cycles_for_year(self.rev_cal_year)
             metrics_map = getattr(self, "last_cycle_metrics", {}) or {}
+            locked_map = self.get_locked_rev_cycles_map()
             
             # Continuous 14-day cycles (26-27 per year) across 3 columns with full vertical scrolling
             for idx, ck in enumerate(year_cycles):
@@ -15338,6 +16718,7 @@ if HAS_DEPS:
                 
                 # Card frame
                 is_sel = ck in self.selected_rev_cycles
+                is_locked = ck in locked_map
                 card = tb.Frame(
                     container,
                     borderwidth=2 if is_sel else 1,
@@ -15350,9 +16731,9 @@ if HAS_DEPS:
                 
                 lbl_title = tb.Label(
                     card,
-                    text=("✓ " if is_sel else "") + cycle_short_label(ck),
+                    text=("✓ " if is_sel else "") + ("🔒 " if is_locked else "") + cycle_short_label(ck),
                     font=("Segoe UI", 10, "bold"),
-                    bootstyle="inverse-primary" if is_sel else "primary",
+                    bootstyle="inverse-primary" if is_sel else ("warning" if is_locked else "primary"),
                     cursor="hand2",
                 )
                 lbl_title.pack(anchor=W)
@@ -15582,51 +16963,55 @@ if HAS_DEPS:
                 if plain:
                     name_to_id[plain] = emp_id
             
-            # Query all records for this entire year to populate both cards and table
+            emp_filter_id = None
+            has_emp_filter = bool(emp_val and emp_val != self._tr("All"))
+            if has_emp_filter:
+                emp_filter_id = name_to_id.get(emp_val)
+                if emp_filter_id is None:
+                    for n, i in name_to_id.items():
+                        if str(n).strip().lower() == str(emp_val).strip().lower():
+                            emp_filter_id = i
+                            break
+            
+            # Query all records across the shop so per-cycle top add-on earner & cycle calculations remain exact
             query_all = f'''
                 SELECT r.id, r.record_date, e.name, r.location, r.revenue, r.service_addon_sales, r.product_sales, r.tip, 
                     {hr_col}, e.hour_rate, {perc_col}, e.percentage, r.hours, r.calculation, r.notes, r.written_up, e.use_tiered_payout, r.employee_id, {cyc_col}, {owner_col}
                 FROM payroll_records r
                 JOIN employees e ON r.employee_id = e.id
-                WHERE 1=1
+                ORDER BY r.record_date DESC
             '''
-            params_all = []
-            if emp_val and emp_val != self._tr("All"):
-                emp_id = name_to_id.get(emp_val)
-                if emp_id is None:
-                    for n, i in name_to_id.items():
-                        if str(n).strip().lower() == str(emp_val).strip().lower():
-                            emp_id = i
-                            break
-                if emp_id is not None:
-                    query_all += " AND r.employee_id = ?"
-                    params_all.append(emp_id)
-                else:
-                    query_all += " AND 1=0"
-                
-            query_all += " ORDER BY r.record_date DESC"
             
             cursor = conn.cursor()
-            cursor.execute(query_all, params_all)
+            cursor.execute(query_all)
             all_year_rows = cursor.fetchall() or []
             conn.close()
+
+            locked_map = self.get_locked_rev_cycles_map()
+            self.update_rev_cycle_lock_button(locked_map)
 
             # Aggregate metrics per cycle for this year's cards
             cycle_metrics = {ck: {"rev": 0.0, "cnt": 0} for ck in cycles_for_year(self.rev_cal_year)}
             
             # Map rows to their resolved cycle
-            resolved_rows = []
+            resolved_rows_all = []
+            resolved_rows_filtered = []
             for row in all_year_rows:
                 rec_date = row[1]
-                resolved_ck = cycle_for_date(rec_date)
-                resolved_rows.append((row, resolved_ck))
+                explicit_ck = row[18] if len(row) > 18 else None
+                resolved_ck = self._resolve_record_cycle_key(rec_date, explicit_ck)
+                resolved_rows_all.append((row, resolved_ck))
+                row_emp_id = row[17] if len(row) > 17 else name_to_id.get(row[2], None)
+                if has_emp_filter and (emp_filter_id is None or row_emp_id != emp_filter_id):
+                    continue
+                resolved_rows_filtered.append((row, resolved_ck))
                 if resolved_ck in cycle_metrics:
                     cycle_metrics[resolved_ck]["rev"] += to_float(row[4], 0.0)
                     cycle_metrics[resolved_ck]["cnt"] += 1
 
             self.last_cycle_metrics = cycle_metrics
 
-            # Update the 24 cycle card widgets if open
+            # Update the cycle card widgets if open
             for ck, metrics in cycle_metrics.items():
                 w_dict = (getattr(self, "cycle_card_widgets", None) or {}).get(ck)
                 if not w_dict:
@@ -15635,14 +17020,15 @@ if HAS_DEPS:
                     if not self._widget_alive(w_dict.get("frame")):
                         continue
                     is_sel = ck in self.selected_rev_cycles
+                    is_locked = ck in locked_map
                     lbl_title = w_dict["title"]
                     lbl_rev = w_dict["rev"]
                     lbl_cnt = w_dict["cnt"]
                     card_frame = w_dict["frame"]
                     
                     lbl_title.config(
-                        text=("✓ " if is_sel else "") + cycle_short_label(ck),
-                        bootstyle="inverse-primary" if is_sel else "primary"
+                        text=("✓ " if is_sel else "") + ("🔒 " if is_locked else "") + cycle_short_label(ck),
+                        bootstyle="inverse-primary" if is_sel else ("warning" if is_locked else "primary")
                     )
                     lbl_rev.config(
                         text=f"${metrics['rev']:,.2f}",
@@ -15660,61 +17046,16 @@ if HAS_DEPS:
 
             # Filter rows for the table: if self.selected_rev_cycles is non-empty, filter by it; otherwise show all
             if self.selected_rev_cycles:
-                table_rows = [r_tuple for r_tuple in resolved_rows if r_tuple[1] in self.selected_rev_cycles]
+                calc_scope_rows = [r_tuple for r_tuple in resolved_rows_all if r_tuple[1] in self.selected_rev_cycles]
+                table_rows = [r_tuple for r_tuple in resolved_rows_filtered if r_tuple[1] in self.selected_rev_cycles]
             else:
-                table_rows = resolved_rows
+                calc_scope_rows = resolved_rows_all
+                table_rows = resolved_rows_filtered
 
-            # Pre-compute employee payout details and add-on sales to apply rules:
-            # 1. Below 50%: top add-on earner gets 50%, rest get 40%
-            # 2. At or above 50%: if tiered checked, get their service %; if fixed >= 50%, get 50%
-            # 3. Hourly employees (hour_rate > 0 and no percentage/not tiered):
-            #    (hours worked * hour rate) + (100% * tip)
-            emp_service_perc = {}
-            emp_use_tiered = {}
-            emp_is_hourly = {}
-            addon_by_emp = {}
-            payout_cache = {}
-
-            for row, row_ck in table_rows:
-                emp_name = row[2]
-                emp_id = row[17] if len(row) > 17 else name_to_id.get(emp_name, None)
-                addon_by_emp[emp_id] = addon_by_emp.get(emp_id, 0.0) + to_float(row[5], 0.0)
-                if emp_id not in emp_service_perc:
-                    rec_perc = row[10]
-                    emp_perc = row[11]
-                    rec_hr = row[8]
-                    emp_hr = row[9]
-                    hr_num = to_float(rec_hr if rec_hr is not None else emp_hr, 0.0)
-                    use_tiered = (row[16] == 1 or row[16] == '1' or row[16] is True)
-                    emp_use_tiered[emp_id] = use_tiered
-                    if use_tiered:
-                        if emp_id:
-                            if emp_id not in payout_cache:
-                                bounds = cycle_bounds(row_ck) if row_ck else (row[1], row[1])
-                                payout_cache[emp_id] = self.get_employee_payout_details(emp_id, bounds[0], bounds[1])
-                            _, s_perc, _, _ = payout_cache[emp_id]
-                            emp_service_perc[emp_id] = to_float(s_perc, 0.0)
-                        else:
-                            emp_service_perc[emp_id] = 0.0
-                        emp_is_hourly[emp_id] = False
-                    else:
-                        s_perc = to_float(rec_perc if rec_perc is not None else emp_perc, 0.0)
-                        emp_service_perc[emp_id] = s_perc
-                        emp_is_hourly[emp_id] = (hr_num > 0 and s_perc <= 0)
-
-            top_below_50_emp = None
-            top_below_50_amt = -1.0
-            for eid, amt in addon_by_emp.items():
-                if eid is None:
-                    continue
-                is_hr = emp_is_hourly.get(eid, False)
-                s_perc = emp_service_perc.get(eid, 0.0)
-                is_tiered = emp_use_tiered.get(eid, False)
-                # Include both hourly employees and commission barbers below 50%
-                if is_hr or ((is_tiered or s_perc > 0) and s_perc < 0.50):
-                    if amt > top_below_50_amt and amt > 0:
-                        top_below_50_amt = amt
-                        top_below_50_emp = eid
+            # Strict Per-Cycle Calculation Isolation:
+            # Each cycle's commission tier %, hourly rate, and top add-on earner are computed strictly within that cycle,
+            # honoring any locked cycle snapshot rates stored on payroll_records.
+            per_cycle_payout_map = self._compute_per_cycle_row_payouts(calc_scope_rows, locked_map)
 
             total_rev = 0.0
             total_addon = 0.0
@@ -15728,65 +17069,33 @@ if HAS_DEPS:
             for r_idx, (row, row_ck) in enumerate(table_rows):
                 emp_name = row[2]
                 emp_id = row[17] if len(row) > 17 else name_to_id.get(emp_name, None)
+                info = per_cycle_payout_map.get(row[0])
+                if info is None:
+                    # Fallback single-row computation if needed
+                    info = self._compute_per_cycle_row_payouts([(row, row_ck)], locked_map).get(row[0], {})
 
-                rec_hr = row[8]
-                emp_hr = row[9]
-                hour_rate = to_float(rec_hr if rec_hr is not None else emp_hr, 0.0)
-                product_perc = 0.00
+                hour_rate = to_float(info.get("hour_rate", 0.0), 0.0)
+                service_perc = to_float(info.get("service_perc", 0.0), 0.0)
+                product_perc = to_float(info.get("product_perc", 0.0), 0.0)
+                addon_rate = to_float(info.get("addon_rate", 0.0), 0.0)
+                use_tiered = bool(info.get("use_tiered", False))
+                is_hourly = bool(info.get("is_hourly", False))
+                rate_missing = bool(info.get("rate_missing", False))
+                hours_missing = bool(info.get("hours_missing", False))
+                is_locked = bool(info.get("is_locked", row_ck in locked_map))
 
-                service_perc = emp_service_perc.get(emp_id, 0.0)
-                use_tiered = emp_use_tiered.get(emp_id, False)
-                is_hourly = emp_is_hourly.get(emp_id, (hour_rate > 0 and not use_tiered and service_perc <= 0))
-
-                if use_tiered and emp_id in payout_cache:
-                    _, _, product_perc, t_hr = payout_cache[emp_id]
-                    product_perc = to_float(product_perc, 0.0)
-                    if not rec_hr:
-                        hour_rate = to_float(t_hr, hour_rate)
-                else:
-                    product_perc = product_percent_for_sales(to_float(row[6], 0.0))
-
-                rev_v = to_float(row[4], 0.0)
-                addon_v = to_float(row[5], 0.0)
-                prod_v = to_float(row[6], 0.0)
-                tip_v = to_float(row[7], 0.0)
+                rev_v = to_float(info.get("rev_v", row[4]), 0.0)
+                addon_v = to_float(info.get("addon_v", row[5]), 0.0)
+                prod_v = to_float(info.get("prod_v", row[6]), 0.0)
+                tip_v = to_float(info.get("tip_v", row[7]), 0.0)
                 loc_v = row[3] if row[3] else ""
-                hrs_v = to_float(row[12], 0.0)
+                hrs_v = to_float(info.get("hrs_v", row[12]), 0.0)
 
-                rate_missing = (not use_tiered and service_perc <= 0 and hour_rate <= 0)
-                hours_missing = (is_hourly and hrs_v <= 0)
+                svc_calc = to_float(info.get("svc_calc", 0.0), 0.0)
+                calc_v = to_float(info.get("calc_v", 0.0), 0.0)
 
                 if rate_missing and emp_id:
                     missing_rate_emp_ids[emp_id] = emp_name
-
-                if is_hourly:
-                    svc_calc = round(hrs_v * hour_rate, 2)
-                    if emp_id is not None and emp_id == top_below_50_emp and addon_by_emp.get(emp_id, 0.0) > 0:
-                        addon_rate = 0.50
-                    else:
-                        addon_rate = 0.40
-                    addon_calc = round(addon_v * addon_rate, 2)
-                    tip_calc = round(tip_v * 1.0, 2)
-                    calc_v = round(svc_calc + addon_calc + tip_calc, 2)
-                elif rate_missing:
-                    svc_calc = 0.0
-                    addon_rate = 0.0
-                    addon_calc = 0.0
-                    tip_calc = round(tip_v * 1.0, 2)
-                    calc_v = round(tip_calc, 2)
-                else:
-                    svc_calc = round((rev_v * service_perc) + (hrs_v * hour_rate), 2)
-                    if service_perc < 0.50:
-                        if emp_id is not None and emp_id == top_below_50_emp and addon_by_emp.get(emp_id, 0.0) > 0:
-                            addon_rate = 0.50
-                        else:
-                            addon_rate = 0.40
-                    else:
-                        addon_rate = service_perc
-                    addon_calc = round(addon_v * addon_rate, 2)
-                    prod_calc = round(prod_v * product_perc, 2)
-                    tip_calc = round(tip_v * 1.0, 2)
-                    calc_v = round(svc_calc + addon_calc + tip_calc, 2)
 
                 total_rev += rev_v
                 total_addon += addon_v
@@ -15796,20 +17105,21 @@ if HAS_DEPS:
                 total_svc_calc += svc_calc
                 total_calc += calc_v
 
-                cyc_display = cycle_label(row_ck) if row_ck else ""
+                cyc_display = (f"🔒 {cycle_label(row_ck)}" if is_locked else cycle_label(row_ck)) if row_ck else ""
+                lock_suffix = " 🔒" if is_locked else ""
 
                 if rate_missing:
                     hr_disp = "⚠️ Not Set"
                     perc_disp = "🔴 Missing Rate (+Add)"
                 elif is_hourly:
-                    hr_disp = f"${hour_rate:,.2f}/hr"
-                    perc_disp = f"Hourly (Add-on: {int(addon_rate * 100)}%)"
+                    hr_disp = f"${hour_rate:,.2f}/hr{lock_suffix}"
+                    perc_disp = f"Hourly (Add-on: {int(round(addon_rate * 100))}%){lock_suffix}"
                 elif use_tiered:
-                    hr_disp = f"${hour_rate:,.2f}/hr" if hour_rate > 0 else "0.00/hr"
-                    perc_disp = f"{service_perc * 100:.0f}% (P: {product_perc * 100:.0f}%)"
+                    hr_disp = f"${hour_rate:,.2f}/hr{lock_suffix}" if hour_rate > 0 else "0.00/hr"
+                    perc_disp = f"{service_perc * 100:.0f}% (P: {product_perc * 100:.0f}%){lock_suffix}"
                 else:
-                    hr_disp = f"${hour_rate:,.2f}/hr" if hour_rate > 0 else "0.00/hr"
-                    perc_disp = f"{service_perc * 100:.1f}%"
+                    hr_disp = f"${hour_rate:,.2f}/hr{lock_suffix}" if hour_rate > 0 else "0.00/hr"
+                    perc_disp = f"{service_perc * 100:.1f}%{lock_suffix}"
 
                 if is_hourly and hours_missing:
                     hrs_disp = f"⚠️ {hrs_v:.1f} (Missing)"
@@ -15940,9 +17250,10 @@ if HAS_DEPS:
             num_sel = len(self.selected_rev_cycles)
             if num_sel == 1:
                 ck_single = next(iter(self.selected_rev_cycles))
-                sel_desc = f"{self._tr('Selected')}: {cycle_label_with_year(ck_single)}"
+                lock_tag = " (🔒 Locked)" if ck_single in locked_map else ""
+                sel_desc = f"{self._tr('Selected')}: {cycle_label_with_year(ck_single)}{lock_tag}"
             elif num_sel > 1:
-                sel_desc = f"{self._tr('Selected')}: {num_sel} {self._tr('Pay Cycles')}"
+                sel_desc = f"{self._tr('Selected')}: {num_sel} {self._tr('Pay Cycles')} ({self._tr('Per-Cycle Isolated')})"
             else:
                 sel_desc = f"{self._tr('Year:')} {self.rev_cal_year} ({self._tr('All Cycles')})"
 
@@ -16004,6 +17315,28 @@ if HAS_DEPS:
                 except Exception as e:
                     messagebox.showerror(self._tr("Error"), f"{self._tr('Could not save file:')}\n{e}")
 
+        def _get_record_cycle_keys_by_ids(self, record_ids):
+            """Return set of resolved cycle keys for the given payroll_records IDs."""
+            if not record_ids:
+                return set()
+            cks = set()
+            try:
+                conn = sqlite3.connect(TEMP_DB_PATH)
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(payroll_records)")
+                cols = [c[1] for c in cur.fetchall()]
+                cyc_col = "cycle_key" if "cycle_key" in cols else "NULL"
+                placeholders = ",".join("?" for _ in record_ids)
+                cur.execute(f"SELECT record_date, {cyc_col} FROM payroll_records WHERE id IN ({placeholders})", list(record_ids))
+                for r_date, r_ck in cur.fetchall() or []:
+                    ck = self._resolve_record_cycle_key(r_date, r_ck)
+                    if ck:
+                        cks.add(ck)
+                conn.close()
+            except Exception:
+                pass
+            return cks
+
         def delete_selected_record(self):
             selected = self.tree_calendar.selection()
             if not selected:
@@ -16013,11 +17346,25 @@ if HAS_DEPS:
             record_ids = []
             for sel in selected:
                 item_vals = self.tree_calendar.item(sel)['values']
-                if item_vals:
+                if item_vals and item_vals[0]:
                     record_ids.append(item_vals[0])
             
             if not record_ids:
                 return 
+
+            locked_map = self.get_locked_rev_cycles_map()
+            rec_cks = self._get_record_cycle_keys_by_ids(record_ids)
+            locked_hits = [ck for ck in rec_cks if ck in locked_map]
+            if locked_hits:
+                ck_lbl = cycle_label_with_year(locked_hits[0])
+                messagebox.showwarning(
+                    self._tr("Cycle Locked"),
+                    f"🔒 Pay Cycle {ck_lbl} is locked.\n\n"
+                    "Locked cycles freeze employee percentages, hourly rates, and sales records.\n"
+                    "To delete records in this cycle, click '🔒 Cycle Locked' on the Main Revenue Tab to unlock it first.",
+                    parent=self,
+                )
+                return
                 
             confirm_msg = "Are you sure you want to completely delete this record? This cannot be undone." if len(record_ids) == 1 else f"Are you sure you want to completely delete all {len(record_ids)} selected records?\nTip: hold Ctrl (Windows) or ⌘ (Mac) to multi-select.\nThis cannot be undone."
             if messagebox.askyesno("Confirm Delete", confirm_msg):
@@ -16048,10 +17395,24 @@ if HAS_DEPS:
             record_id = item['values'][0]
             if not record_id:
                 return
+
+            locked_map = self.get_locked_rev_cycles_map()
+            rec_cks = self._get_record_cycle_keys_by_ids([record_id])
+            locked_hits = [ck for ck in rec_cks if ck in locked_map]
+            if locked_hits:
+                ck_lbl = cycle_label_with_year(locked_hits[0])
+                messagebox.showwarning(
+                    self._tr("Cycle Locked"),
+                    f"🔒 Pay Cycle {ck_lbl} is locked.\n\n"
+                    "Locked cycles freeze employee percentages, hourly rates, and sales records.\n"
+                    "To edit records in this cycle, click '🔒 Cycle Locked' on the Main Revenue Tab to unlock it first.",
+                    parent=self,
+                )
+                return
             
             if "missing_rate" in (item.get("tags", ()) or ()):
                 vals = item.get("values", [])
-                emp_name = vals[3] if len(vals) > 3 else ""
+                emp_name = vals[4] if len(vals) > 4 else (vals[3] if len(vals) > 3 else "")
                 if messagebox.askyesno(
                     self._tr("Missing Rate"),
                     f"Employee '{emp_name}' does not have a percentage or hourly rate configured.\n\n"
@@ -16093,6 +17454,19 @@ if HAS_DEPS:
             self.open_edit_record_dialog(record_id, rec)
 
         def open_edit_record_dialog(self, record_id, rec, parent=None):
+            locked_map = self.get_locked_rev_cycles_map()
+            rec_cks = self._get_record_cycle_keys_by_ids([record_id])
+            locked_hits = [ck for ck in rec_cks if ck in locked_map]
+            if locked_hits:
+                ck_lbl = cycle_label_with_year(locked_hits[0])
+                messagebox.showwarning(
+                    self._tr("Cycle Locked"),
+                    f"🔒 Pay Cycle {ck_lbl} is locked.\n\n"
+                    "Locked cycles freeze employee percentages, hourly rates, and sales records.\n"
+                    "Unlock the cycle on the Main Revenue Tab first before editing.",
+                    parent=parent if self._widget_alive(parent) else self,
+                )
+                return
             parent_win = parent if self._widget_alive(parent) else self
             dialog = tb.Toplevel(parent_win)
             dialog.title(f"Edit Record: {rec[6]}")
@@ -16222,6 +17596,15 @@ if HAS_DEPS:
                 except ValueError:
                     messagebox.showerror("Error", "Invalid Date format. Use YYYY-MM-DD.", parent=dialog)
                     return
+                target_ck = cycle_for_date(date_val)
+                if target_ck and self.is_rev_cycle_locked(target_ck):
+                    messagebox.showwarning(
+                        self._tr("Cycle Locked"),
+                        f"🔒 Target Pay Cycle {cycle_label_with_year(target_ck)} is locked.\n"
+                        "Unlock the cycle first before moving or editing records in it.",
+                        parent=dialog,
+                    )
+                    return
                     
                 try:
                     r_amt = float(rev_ent.get() or 0)
@@ -16253,7 +17636,8 @@ if HAS_DEPS:
                 
                 if use_tiered:
                     perc_to_save = None
-                    _, service_perc, product_perc, _ = self.get_employee_payout_details(emp_id, date_val, date_val)
+                    t_bounds = cycle_bounds(target_ck) if target_ck else (date_val, date_val)
+                    _, service_perc, product_perc, _ = self.get_employee_payout_details(emp_id, t_bounds[0], t_bounds[1])
                     calc = round(((r_amt + addon_amt) * service_perc) + (h_amt * cust_hr_val), 2)
                 else:
                     try:
@@ -16321,6 +17705,26 @@ if HAS_DEPS:
             tb.Button(btn_frame, text=self._tr("🗑️ Delete Selected"), bootstyle="danger", cursor="hand2", command=self.delete_selected_employee).pack(side=LEFT, padx=10)
             tb.Label(btn_frame, text=self._tr("(Ctrl / ⌘ + click to multi-select)"), font=("Segoe UI", 9), bootstyle="secondary").pack(side=LEFT, padx=5)
             tb.Button(btn_frame, text=self._tr("📊 View Performance"), bootstyle="info", cursor="hand2", command=self.view_employee_summary).pack(side=LEFT, padx=10)
+
+            def _open_selected_emp_cycle_report():
+                sel = self.tree_names.selection()
+                sel_eid = None
+                if sel:
+                    try:
+                        vals = self.tree_names.item(sel[0]).get("values") or []
+                        if vals:
+                            sel_eid = int(vals[0])
+                    except Exception:
+                        sel_eid = None
+                self.open_employee_cycle_report_dialog(default_emp_id=sel_eid)
+
+            tb.Button(
+                btn_frame,
+                text=f"🖨️ {self._tr('Cycle Report / Print')}",
+                bootstyle="primary",
+                cursor="hand2",
+                command=_open_selected_emp_cycle_report,
+            ).pack(side=LEFT, padx=6)
             
             columns = tuple(self._tr(c) for c in ("ID", "First Name", "Last Name", "Phone", "Email", "Hour Rate", "Percentage"))
             names_tree_holder = tb.Frame(self.tab_names)
@@ -16683,7 +18087,7 @@ if HAS_DEPS:
                 
             item = self.tree_names.item(selected[0])
             emp_id = item['values'][0]
-            emp_name = item['values'][1]
+            emp_name = f"{item['values'][1]} {item['values'][2]}".strip() if len(item['values']) > 2 else item['values'][1]
             
             win = tb.Toplevel(self)
             win.title(f"Payroll Summary: {emp_name}")
@@ -16744,6 +18148,13 @@ if HAS_DEPS:
             tb.Button(date_frame, text="This Week", bootstyle="outline-primary", cursor="hand2", command=lambda: set_summary_period("week")).pack(side=LEFT, padx=5)
             tb.Button(date_frame, text="This Month", bootstyle="outline-primary", cursor="hand2", command=lambda: set_summary_period("month")).pack(side=LEFT, padx=5)
             tb.Button(date_frame, text="All Time", bootstyle="outline-primary", cursor="hand2", command=lambda: set_summary_period("all")).pack(side=LEFT, padx=5)
+            tb.Button(
+                date_frame,
+                text=f"🖨️ {self._tr('Cycle Report / Print')}",
+                bootstyle="info",
+                cursor="hand2",
+                command=lambda: self.open_employee_cycle_report_dialog(default_emp_id=int(emp_id), parent=win),
+            ).pack(side=RIGHT, padx=5)
             
             # Row 2: Category Filter Row (vertically stacked so it is 100% visible on standard display sizes)
             filter_row = tb.Frame(win, padding=5)
@@ -16801,20 +18212,29 @@ if HAS_DEPS:
                 to_d = cal_to_date.entry.get()
                 filter_val = perf_filter_var.get()
                 
-                # Fetch payroll records
-                query_payroll = '''
-                    SELECT r.record_date, r.location, 'Employee Revenue' AS category, r.revenue, r.service_addon_sales, r.product_sales, r.tip, r.hours, r.calculation, r.notes, e.hour_rate, e.percentage
-                    FROM payroll_records r
-                    JOIN employees e ON r.employee_id = e.id
-                    WHERE r.employee_id=? 
-                '''
-                params_payroll = [emp_id]
-                if from_d:
-                    query_payroll += " AND r.record_date >= ?"
-                    params_payroll.append(from_d)
-                if to_d:
-                    query_payroll += " AND r.record_date <= ?"
-                    params_payroll.append(to_d)
+                # Fetch all resolved payroll records across the shop so per-cycle calculation isolation is exact
+                all_resolved = self._fetch_all_resolved_payroll_rows()
+                locked_map = self.get_locked_rev_cycles_map()
+                emp_id_int = int(emp_id)
+
+                # Filter employee payroll rows by date range and collect relevant cycles
+                emp_resolved = []
+                relevant_cks = set()
+                for r_row, r_ck in all_resolved:
+                    r_eid = int(r_row[17]) if len(r_row) > 17 and r_row[17] is not None else -1
+                    if r_eid != emp_id_int:
+                        continue
+                    r_date = str(r_row[1] or "")
+                    if from_d and r_date < from_d:
+                        continue
+                    if to_d and r_date > to_d:
+                        continue
+                    emp_resolved.append((r_row, r_ck))
+                    if r_ck:
+                        relevant_cks.add(r_ck)
+
+                scope_resolved = [rt for rt in all_resolved if rt[1] in relevant_cks] if relevant_cks else emp_resolved
+                payout_map = self._compute_per_cycle_row_payouts(scope_resolved, locked_map)
                 
                 # Fetch expenses attached to this employee (salary is an expense;
                 # match plaintext and leftover encrypted category values).
@@ -16833,82 +18253,27 @@ if HAS_DEPS:
                     
                 conn = sqlite3.connect(TEMP_DB_PATH)
                 cursor = conn.cursor()
-                
-                cursor.execute(query_payroll, params_payroll)
-                payroll_rows = cursor.fetchall()
-                
                 cursor.execute(query_expenses, params_expenses)
                 expense_rows = cursor.fetchall()
-
-                # Determine top below-50% (including hourly) add-on earner in this period
-                q_all_addons = '''
-                    SELECT r.employee_id, SUM(CAST(r.service_addon_sales AS REAL)), e.hour_rate, e.percentage, e.use_tiered_payout
-                    FROM payroll_records r
-                    JOIN employees e ON r.employee_id = e.id
-                    WHERE 1=1
-                '''
-                p_all = []
-                if from_d:
-                    q_all_addons += " AND r.record_date >= ?"
-                    p_all.append(from_d)
-                if to_d:
-                    q_all_addons += " AND r.record_date <= ?"
-                    p_all.append(to_d)
-                q_all_addons += " GROUP BY r.employee_id"
-                cursor.execute(q_all_addons, p_all)
-                all_addon_rows = cursor.fetchall()
                 conn.close()
-
-                top_below_50_id = None
-                top_below_50_amt = -1.0
-                for a_eid, a_sum, a_hr, a_perc, a_tiered in all_addon_rows:
-                    a_sum_f = to_float(a_sum, 0.0)
-                    a_hr_f = to_float(a_hr, 0.0)
-                    a_perc_f = to_float(a_perc, 0.0)
-                    a_is_tiered = (a_tiered == 1 or a_tiered == '1' or a_tiered is True)
-                    if a_is_tiered:
-                        _, a_s_perc, _, _ = self.get_employee_payout_details(a_eid, from_d, to_d)
-                        a_s_perc = to_float(a_s_perc, 0.0)
-                        a_is_hourly = False
-                    else:
-                        a_s_perc = a_perc_f
-                        a_is_hourly = (a_hr_f > 0 and a_s_perc <= 0)
-                    if a_is_hourly or ((a_is_tiered or a_s_perc > 0) and a_s_perc < 0.50):
-                        if a_sum_f > top_below_50_amt and a_sum_f > 0:
-                            top_below_50_amt = a_sum_f
-                            top_below_50_id = a_eid
                 
-                # Combine rows
+                # Combine rows using strict per-cycle payouts
                 combined = []
-                use_tiered, service_perc, product_perc, hour_rate = self.get_employee_payout_details(emp_id, from_d, to_d)
-                service_perc = to_float(service_perc, 0.0)
-                product_perc = to_float(product_perc, 0.0)
-                hour_rate = to_float(hour_rate, 0.0)
-                is_hourly_emp = (not use_tiered and hour_rate > 0 and service_perc <= 0)
-                if is_hourly_emp or service_perc < 0.50:
-                    emp_addon_rate = 0.50 if (emp_id == top_below_50_id and top_below_50_amt > 0) else 0.40
-                else:
-                    emp_addon_rate = service_perc
+                for r_row, r_ck in emp_resolved:
+                    rec_id = r_row[0]
+                    info = payout_map.get(rec_id, {})
+                    rev_val = to_float(info.get("rev_v", r_row[4]), 0.0)
+                    addon_val = to_float(info.get("addon_v", r_row[5]), 0.0)
+                    prod_val = to_float(info.get("prod_v", r_row[6]), 0.0)
+                    tip_val = to_float(info.get("tip_v", r_row[7]), 0.0)
+                    hours_val = to_float(info.get("hrs_v", r_row[12]), 0.0)
+                    calc_val = to_float(info.get("calc_v", r_row[13]), 0.0)
+                    s_perc = to_float(info.get("service_perc", 0.0), 0.0)
+                    a_rate = to_float(info.get("addon_rate", 0.0), 0.0)
+                    h_rate = to_float(info.get("hour_rate", 0.0), 0.0)
+                    is_hr = bool(info.get("is_hourly", False))
+                    is_locked = bool(info.get("is_locked", r_ck in locked_map))
 
-                for pr in payroll_rows:
-                    rev_val = to_float(pr[3], 0.0)
-                    addon_val = to_float(pr[4], 0.0)
-                    prod_val = to_float(pr[5], 0.0)
-                    tip_val = to_float(pr[6], 0.0)
-                    hr_rate_val = hour_rate
-                    perc_val = service_perc
-                    hours_val = to_float(pr[7], 0.0)
-                    
-                    if is_hourly_emp:
-                        svc_calc = round(hours_val * hr_rate_val, 2)
-                        addon_calc = round(addon_val * emp_addon_rate, 2)
-                        tip_calc = round(tip_val * 1.0, 2)
-                        calc_val = round(svc_calc + addon_calc + tip_calc, 2)
-                    elif use_tiered:
-                        calc_val = round((rev_val * service_perc) + (addon_val * emp_addon_rate) + (prod_val * product_perc) + (hours_val * hour_rate) + tip_val, 2)
-                    else:
-                        calc_val = round((rev_val * perc_val) + (addon_val * emp_addon_rate) + (hours_val * hr_rate_val) + tip_val, 2)
-                    
                     if filter_val == "Service":
                         if (not rev_val or rev_val <= 0) and (not addon_val or addon_val <= 0):
                             continue
@@ -16928,8 +18293,15 @@ if HAS_DEPS:
                         addon_val = 0.0
                         tip_val = 0.0
                         calc_val = 0.0
+
+                    rate_tag = f"${h_rate:,.2f}/hr, Add-on {int(round(a_rate*100))}%" if is_hr else f"Svc {s_perc*100:g}%, Add-on {a_rate*100:g}%"
+                    if is_locked:
+                        rate_tag += " 🔒"
+                    raw_note = r_row[14] if r_row[14] else ""
+                    cyc_note = f"[{cycle_short_label(r_ck)}: {rate_tag}]" if r_ck else f"[{rate_tag}]"
+                    note_combined = f"{cyc_note} {raw_note}".strip()
                         
-                    combined.append((pr[0], pr[1], pr[2], rev_val, addon_val, prod_val, tip_val, pr[7], calc_val, None, pr[9], 'payroll'))
+                    combined.append((r_row[1], r_row[3] or "", "Employee Revenue", rev_val, addon_val, prod_val, tip_val, hours_val, calc_val, None, note_combined, 'payroll'))
                     
                 for ex in expense_rows:
                     category_name = plain_label(ex[1])
@@ -17066,9 +18438,8 @@ if HAS_DEPS:
                 else: # All
                     net_val = (total_rev + total_addon + total_prod + total_tip) - total_exp
                     
-                tiered_rate_str = f" | Rates: S={service_perc*100:.0f}%, P={product_perc*100:.0f}%" if use_tiered else ""
                 lbl_total.config(
-                    text=f"Service: ${total_rev:,.2f}  |  Add-on: ${total_addon:,.2f}  |  Product: ${total_prod:,.2f}  |  Tip: ${total_tip:,.2f}  |  Calculated: ${total_calc:,.2f}  |  Expenses: ${total_exp:,.2f}  |  Net: ${net_val:,.2f}{tiered_rate_str}"
+                    text=f"Service: ${total_rev:,.2f}  |  Add-on: ${total_addon:,.2f}  |  Product: ${total_prod:,.2f}  |  Tip: ${total_tip:,.2f}  |  Calculated (Per-Cycle): ${total_calc:,.2f}  |  Expenses: ${total_exp:,.2f}  |  Net: ${net_val:,.2f}"
                 )
 
             last_state = {"from": "", "to": ""}
@@ -17419,14 +18790,14 @@ if HAS_DEPS:
 
             popup = tb.Toplevel(self)
             popup.title(self._tr("Select Action"))
-            popup.geometry("450x220")
+            popup.geometry("620x230")
             popup.transient(self)
             popup.grab_set()
             popup.focus_set()
             
             popup.update_idletasks()
-            w = 450
-            h = 220
+            w = 620
+            h = 230
             x = self.winfo_x() + (self.winfo_width() - w) // 2
             y = self.winfo_y() + (self.winfo_height() - h) // 2
             popup.geometry(f"{w}x{h}+{x}+{y}")
@@ -17443,9 +18814,17 @@ if HAS_DEPS:
             def handle_performance():
                 popup.destroy()
                 self.view_employee_summary()
+
+            def handle_cycle_report():
+                popup.destroy()
+                try:
+                    self.open_employee_cycle_report_dialog(default_emp_id=int(emp_id))
+                except Exception:
+                    self.open_employee_cycle_report_dialog()
                 
-            tb.Button(btn_frame, text=self._tr("✏️ Edit Employee"), bootstyle="warning", width=18, command=handle_edit).pack(side=LEFT, padx=15)
-            tb.Button(btn_frame, text=self._tr("📊 Performance Report"), bootstyle="info", width=18, command=handle_performance).pack(side=LEFT, padx=15)
+            tb.Button(btn_frame, text=self._tr("✏️ Edit Employee"), bootstyle="warning", width=18, command=handle_edit).pack(side=LEFT, padx=10)
+            tb.Button(btn_frame, text=self._tr("📊 Performance Report"), bootstyle="info", width=18, command=handle_performance).pack(side=LEFT, padx=10)
+            tb.Button(btn_frame, text=f"🖨️ {self._tr('Cycle Report / Print')}", bootstyle="primary", width=20, command=handle_cycle_report).pack(side=LEFT, padx=10)
             
             tb.Button(popup, text=self._tr("Close Window"), bootstyle="secondary outline", width=15, command=popup.destroy).pack(pady=15)
 
@@ -18003,6 +19382,33 @@ if HAS_DEPS:
                 messagebox.showerror("Validation Error", "Write Up Reason is mandatory when Written Up is Yes.")
                 return
 
+            _cyc_to_save = None
+            if 'Cycle' in self.entry_vars:
+                c_val = str(self.entry_vars['Cycle'].get() or "").strip()
+                if c_val:
+                    if parse_cycle_key(c_val):
+                        _cyc_to_save = c_val
+                    else:
+                        for yr in (datetime.today().year - 1, datetime.today().year, datetime.today().year + 1):
+                            for ck in cycles_for_year(yr):
+                                if cycle_label_with_year(ck) == c_val or cycle_label(ck) == c_val:
+                                    _cyc_to_save = ck
+                                    break
+                            if _cyc_to_save:
+                                break
+            if not _cyc_to_save:
+                _cyc_to_save = cycle_for_date(date_val)
+
+            if _cyc_to_save and self.is_rev_cycle_locked(_cyc_to_save):
+                messagebox.showwarning(
+                    self._tr("Cycle Locked"),
+                    f"🔒 Pay Cycle {cycle_label_with_year(_cyc_to_save)} is locked.\n\n"
+                    "Locked cycles freeze employee percentages, hourly rates, and sales records.\n"
+                    "Unlock the cycle on the Main Revenue Tab first before adding new records to it.",
+                    parent=self,
+                )
+                return
+
             self._saving_payroll = True
             self.show_busy(self._tr("Saving payroll record…"))
             try:
@@ -18021,7 +19427,8 @@ if HAS_DEPS:
                 hour_rate_val = cust_hr
                 if use_tiered:
                     perc_to_save = None
-                    _, service_perc, product_perc, _ = self.get_employee_payout_details(emp_id, date_val, date_val)
+                    c_bounds = cycle_bounds(_cyc_to_save) if _cyc_to_save else (date_val, date_val)
+                    _, service_perc, product_perc, _ = self.get_employee_payout_details(emp_id, c_bounds[0], c_bounds[1])
                     calculation = round(((revenue + addon_sales_val) * service_perc) + (hours * hour_rate_val), 2)
                 else:
                     try:
@@ -18033,23 +19440,6 @@ if HAS_DEPS:
                     calculation = round(((revenue + addon_sales_val) * perc_to_save) + (hours * hour_rate_val), 2)
                     
                 try:
-                    _cyc_to_save = None
-                    if 'Cycle' in self.entry_vars:
-                        c_val = str(self.entry_vars['Cycle'].get() or "").strip()
-                        if c_val:
-                            # Try parsing as direct key or matching against standard cycle labels
-                            if parse_cycle_key(c_val):
-                                _cyc_to_save = c_val
-                            else:
-                                for yr in (datetime.today().year - 1, datetime.today().year, datetime.today().year + 1):
-                                    for ck in cycles_for_year(yr):
-                                        if cycle_label_with_year(ck) == c_val or cycle_label(ck) == c_val:
-                                            _cyc_to_save = ck
-                                            break
-                                    if _cyc_to_save:
-                                        break
-                    if not _cyc_to_save:
-                        _cyc_to_save = cycle_for_date(date_val)
                     cursor.execute('''
                         INSERT INTO payroll_records (employee_id, record_date, payment_amount, payment_type, revenue, service_addon_sales, hours, calculation, notes, written_up, written_up_desc, hour_rate, percentage, cycle_key, owner)
                         VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -19829,7 +21219,11 @@ if HAS_DEPS:
                 if not exp_id:
                     continue
                 if category == "Employee Revenue" or category == self._tr("Employee Revenue"):
-                    payroll_ids.append(exp_id)
+                    rec_cks = self._get_record_cycle_keys_by_ids([exp_id])
+                    if any(self.is_rev_cycle_locked(ck) for ck in rec_cks):
+                        locked_blocked += 1
+                    else:
+                        payroll_ids.append(exp_id)
                 elif (category == "Cash Envelope Received" or category == self._tr("Cash Envelope Received")) and self.is_date_in_locked_cash_month(str(exp_date)):
                     locked_blocked += 1
                 else:
@@ -19838,7 +21232,7 @@ if HAS_DEPS:
             if locked_blocked and not payroll_ids and not expense_ids:
                 messagebox.showwarning(
                     "Locked",
-                    "Selected cash envelope(s) are in a locked month. Unlock the month from Cash Calendar first.",
+                    "Selected record(s) belong to a locked Pay Cycle or locked Cash Month.\nUnlock the cycle on the Main Revenue Tab (or Cash Month in Cash Calendar) first.",
                     parent=self.expenses_win,
                 )
                 return
@@ -19853,7 +21247,7 @@ if HAS_DEPS:
                 else "Are you sure you want to delete this record? This cannot be undone."
             )
             if locked_blocked:
-                confirm_msg += f"\n\nNote: {locked_blocked} locked cash envelope(s) will be skipped."
+                confirm_msg += f"\n\nNote: {locked_blocked} locked record(s) will be skipped."
             if not messagebox.askyesno("Confirm Delete", confirm_msg, parent=self.expenses_win):
                 return
 
@@ -20110,6 +21504,15 @@ if HAS_DEPS:
             cb_cycle.set(active_cycle_lbl)
             cb_cycle.grid(row=2, column=1, **ent_pad)
 
+            lock_after_import_var = tk.BooleanVar(value=False)
+            chk_lock_after = tb.Checkbutton(
+                step1_lf,
+                text="🔒 Lock this Pay Cycle after importing (records employee % & hourly rate at this time)",
+                variable=lock_after_import_var,
+                bootstyle="warning-round-toggle",
+            )
+            chk_lock_after.grid(row=3, column=0, columnspan=2, padx=10, pady=(6, 4), sticky=W)
+
             # Step 2: Match Columns
             step2_lf = tb.Labelframe(dialog, text=self._tr("2. Match Column Headers"), padding=(12, 6), bootstyle="secondary")
             step2_lf.pack(fill=X, padx=15, pady=(0, 10))
@@ -20215,6 +21618,16 @@ if HAS_DEPS:
                 c_bounds = cycle_bounds(selected_cycle_key)
                 cycle_start_date = c_bounds[0] if c_bounds else datetime.today().strftime('%Y-%m-%d')
 
+                if selected_cycle_key and self.is_rev_cycle_locked(selected_cycle_key):
+                    messagebox.showwarning(
+                        self._tr("Cycle Locked"),
+                        f"🔒 Pay Cycle {cycle_label_with_year(selected_cycle_key)} is locked.\n\n"
+                        "Locked cycles freeze employee percentages, hourly rates, and sales records.\n"
+                        "Unlock this cycle on the Main Revenue Tab first before importing into it.",
+                        parent=dialog,
+                    )
+                    return
+
                 # Check for overlapping imports in this cycle and location
                 try:
                     conn_chk = sqlite3.connect(TEMP_DB_PATH)
@@ -20268,11 +21681,14 @@ if HAS_DEPS:
                         except ValueError:
                             continue
                             
-                        cursor.execute("SELECT id, percentage FROM employees WHERE name = ?", (emp_name,))
+                        cursor.execute("SELECT id, hour_rate, percentage, use_tiered_payout FROM employees WHERE name = ?", (emp_name,))
                         emp_row = cursor.fetchone()
                         
                         if emp_row:
-                            emp_id, perc = emp_row
+                            emp_id = emp_row[0]
+                            hr_rate_emp = to_float(emp_row[1], 0.0)
+                            perc = to_float(emp_row[2], 0.0)
+                            use_tiered_emp = bool(emp_row[3] == 1 or emp_row[3] == '1' or emp_row[3] is True)
                         else:
                             parts = emp_name.split(" ", 1)
                             first_name = parts[0]
@@ -20282,18 +21698,27 @@ if HAS_DEPS:
                                 VALUES (?, ?, ?, 0.0, 0.0)
                             ''', (emp_name, first_name, last_name))
                             emp_id = cursor.lastrowid
+                            hr_rate_emp = 0.0
                             perc = 0.0
+                            use_tiered_emp = False
                             new_employees += 1
                             
                             os.makedirs(os.path.join(EMPLOYEE_FOLDERS_DIR, f"{first_name}_{last_name}_{emp_id}".replace(" ", "_")), exist_ok=True)
                             
-                        # Service Add-on Sales split calculation includes both Service Revenue AND Service Add-on Sales!
-                        pay = round((revenue + addon_sales) * perc, 2) if perc > 0 else 0.0
+                        # Snapshot employee's active hour_rate and percentage onto the record at import time
+                        rec_hr_to_save = hr_rate_emp if hr_rate_emp > 0 else None
+                        if use_tiered_emp:
+                            rec_perc_to_save = None
+                            eff_perc = service_percent_for_sales(revenue + addon_sales)
+                        else:
+                            rec_perc_to_save = perc if perc > 0 else None
+                            eff_perc = perc
+                        pay = round((revenue + addon_sales) * eff_perc, 2) if eff_perc > 0 else 0.0
                         note_text = f"Excel Import (Cycle: {cycle_label(selected_cycle_key)}) (Period: {period_str}) | Loc: {location} | Addon: ${addon_sales:.2f} | Prod Sales: ${product_sales:.2f} | Tips: ${tip:.2f}"
                         cursor.execute('''
-                            INSERT INTO payroll_records (employee_id, record_date, payment_amount, payment_type, revenue, service_addon_sales, hours, calculation, notes, written_up, location, tip, product_sales, cycle_key)
-                            VALUES (?, ?, NULL, NULL, ?, ?, 0.0, ?, ?, 'No', ?, ?, ?, ?)
-                        ''', (emp_id, cycle_start_date, revenue, addon_sales, pay, note_text, location, tip, product_sales, selected_cycle_key))
+                            INSERT INTO payroll_records (employee_id, record_date, payment_amount, payment_type, revenue, service_addon_sales, hours, calculation, notes, written_up, location, tip, product_sales, hour_rate, percentage, cycle_key, owner)
+                            VALUES (?, ?, NULL, NULL, ?, ?, 0.0, ?, ?, 'No', ?, ?, ?, ?, ?, ?, ?)
+                        ''', (emp_id, cycle_start_date, revenue, addon_sales, pay, note_text, location, tip, product_sales, rec_hr_to_save, rec_perc_to_save, selected_cycle_key, _session_user_name()))
                         
                         imported_records += 1
                         
@@ -20307,9 +21732,13 @@ if HAS_DEPS:
                 
                 conn = sqlite3.connect(TEMP_DB_PATH)
                 cursor = conn.cursor()
-                cursor.execute("SELECT name FROM employees WHERE hour_rate = 0.0 AND percentage = 0.0")
-                missing_employees = [r[0] for r in cursor.fetchall()]
+                cursor.execute("SELECT name FROM employees WHERE hour_rate = 0.0 AND percentage = 0.0 AND COALESCE(use_tiered_payout, 0) = 0")
+                missing_employees = [r[0] for r in cursor.fetchall() if r and r[0] and str(r[0]).strip().lower() != "shop"]
                 conn.close()
+
+                # Select the imported cycle on the Main Revenue Tab
+                if selected_cycle_key:
+                    self.selected_rev_cycles = {selected_cycle_key}
                 
                 self.refresh_expense_filter_employees()
                 self.load_expenses_data()
@@ -20320,20 +21749,26 @@ if HAS_DEPS:
                         self.load_financials_data(quiet=True)
                 except Exception:
                     pass
+
+                locked_msg = ""
+                if lock_after_import_var.get() and selected_cycle_key and not missing_employees:
+                    if self.lock_rev_cycle(selected_cycle_key, parent=dialog):
+                        locked_msg = f"\n🔒 Cycle '{cycle_label_with_year(selected_cycle_key)}' has been LOCKED with current employee rates."
                 
                 messagebox.showinfo(
                     "Import Complete",
                     f"Successfully imported {imported_records} rows into '{cycle_label_with_year(selected_cycle_key)}'.\n"
-                    f"Registered {new_employees} new employees.",
+                    f"Registered {new_employees} new employees.{locked_msg}",
                     parent=dialog
                 )
                 
                 if missing_employees:
                     missing_names_str = ", ".join(missing_employees)
+                    warn_lock_note = "\n\nNote: Cycle was not locked yet because these employees still need their Hour Rate or Percentage configured first." if lock_after_import_var.get() else ""
                     messagebox.showwarning(
                         "Config Rates Missing",
                         f"The following employees lack configured Hour Rates or Percentages:\n\n{missing_names_str}\n\n"
-                        f"We are redirecting you to configure them.",
+                        f"We are redirecting you to configure them.{warn_lock_note}",
                         parent=dialog
                     )
                     self.notebook.select(self.tab_names)
