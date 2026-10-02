@@ -878,8 +878,8 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.61"
-APP_BUILD_DATE = "2026-09-15"
+APP_VERSION = "2.5.62"
+APP_BUILD_DATE = "2026-10-02"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
 
@@ -1194,6 +1194,95 @@ def save_calendar_column_colors(colors_dict):
     prefs = load_ui_column_preferences()
     prefs["calendar_column_colors"] = dict(colors_dict or {})
     save_ui_column_preferences(prefs)
+
+
+def _current_dropdown_user_key():
+    try:
+        u = str(CURRENT_SESSION_USER or "").strip().lower()
+        if not u and GLOBAL_APP_INSTANCE and getattr(GLOBAL_APP_INSTANCE, "current_user", None):
+            u = str(GLOBAL_APP_INSTANCE.current_user or "").strip().lower()
+        return u or "admin"
+    except Exception:
+        return "admin"
+
+
+_SHARED_EMPLOYEE_DROPDOWN_KEYS = (
+    "cash_envelope_assignee",
+    "envelope_assignee",
+    "expense_employee",
+    "ledger_employee",
+    "last_employee",
+)
+
+
+def save_last_dropdown_selection(field_key, value, emp_id=None, user=None):
+    """Persist the latest dropdown selection for the current user and device."""
+    if value is None:
+        return
+    val_str = str(value).strip()
+    if not val_str:
+        return
+    try:
+        prefs = load_ui_column_preferences()
+        dd = prefs.get("sticky_dropdowns")
+        if not isinstance(dd, dict):
+            dd = {}
+        u_key = str(user or _current_dropdown_user_key()).strip().lower() or "admin"
+        entry = {"value": val_str, "emp_id": emp_id, "updated_at": time.time()}
+        dd[f"user:{u_key}:{field_key}"] = entry
+        dd[f"device:{field_key}"] = entry
+        if field_key in _SHARED_EMPLOYEE_DROPDOWN_KEYS:
+            dd[f"user:{u_key}:last_employee"] = entry
+            dd["device:last_employee"] = entry
+        prefs["sticky_dropdowns"] = dd
+        save_ui_column_preferences(prefs)
+    except Exception:
+        pass
+
+
+def get_last_dropdown_selection(field_key, default="", user=None, fallback_shared_employee=True):
+    """Return the saved dropdown value string (or default) for the current user (falling back to device)."""
+    try:
+        prefs = load_ui_column_preferences()
+        dd = prefs.get("sticky_dropdowns")
+        if isinstance(dd, dict):
+            u_key = str(user or _current_dropdown_user_key()).strip().lower() or "admin"
+            keys_to_try = [f"user:{u_key}:{field_key}"]
+            if fallback_shared_employee and field_key in _SHARED_EMPLOYEE_DROPDOWN_KEYS:
+                keys_to_try.append(f"user:{u_key}:last_employee")
+            keys_to_try.append(f"device:{field_key}")
+            if fallback_shared_employee and field_key in _SHARED_EMPLOYEE_DROPDOWN_KEYS:
+                keys_to_try.append("device:last_employee")
+            for k in keys_to_try:
+                item = dd.get(k)
+                if isinstance(item, dict) and item.get("value"):
+                    return str(item.get("value"))
+                elif isinstance(item, str) and item.strip():
+                    return item.strip()
+    except Exception:
+        pass
+    return default
+
+
+def needs_auto_version_sync():
+    """Return True if this device has not yet completed a full backfill+pull sync on APP_VERSION."""
+    try:
+        prefs = load_ui_column_preferences()
+        return prefs.get("last_full_sync_app_version") != APP_VERSION
+    except Exception:
+        return True
+
+
+def mark_auto_version_sync_done():
+    """Record that this device completed its automatic post-update full sync for APP_VERSION."""
+    try:
+        prefs = load_ui_column_preferences()
+        if prefs.get("last_full_sync_app_version") != APP_VERSION:
+            prefs["last_full_sync_app_version"] = APP_VERSION
+            save_ui_column_preferences(prefs)
+    except Exception:
+        pass
+
 
 CURRENT_SESSION_USER = "admin"
 SUPABASE_SALT = b"\x80\xa7\xbf\xcc\xa3\x12\xcc\x81\xf2\x93\xb4\x37\x13\xc3\xb4\x3a"
@@ -1797,7 +1886,19 @@ class PostgresCursorProxy:
             words = translated_query.split()
             if len(words) > 2:
                 tbl_name = words[2].lower().strip("()")
-                if tbl_name not in ["users", "config_locations", "config_categories", "config_payments", "config_languages", "cash_month_locks"]:
+                if tbl_name not in [
+                    "users",
+                    "config_locations",
+                    "config_categories",
+                    "config_payments",
+                    "config_languages",
+                    "cash_month_locks",
+                    "vagaro_pull_logs",
+                    "app_system_config",
+                    "cloud_config",
+                    "cloud_file_storage",
+                    "app_settings",
+                ]:
                     translated_query += " RETURNING id"
                     ret_val = True
 
@@ -1893,8 +1994,26 @@ class PostgresCursorProxy:
                                 raise inner_e
                     else:
                         err_l = str(inner_e).lower()
-                        if any(m in err_l for m in ("does not exist", "undefinedtable", "undefinedcolumn", "no such table", "no such column")):
+                        is_missing_schema = (
+                            "function " not in err_l
+                            and "42883" not in err_l
+                            and any(
+                                m in err_l
+                                for m in (
+                                    "relation ",
+                                    "column ",
+                                    "undefinedtable",
+                                    "undefinedcolumn",
+                                    "no such table",
+                                    "no such column",
+                                    "42p01",
+                                    "42703",
+                                )
+                            )
+                        )
+                        if is_missing_schema and (time.time() - getattr(self.conn, "_last_ensure_tables_ts", 0) > 60):
                             try:
+                                self.conn._last_ensure_tables_ts = time.time()
                                 self.conn.rollback()
                             except Exception:
                                 pass
@@ -1936,8 +2055,26 @@ class PostgresCursorProxy:
                     pass
             except Exception as inner_e:
                 err_l = str(inner_e).lower()
-                if any(m in err_l for m in ("does not exist", "undefinedtable", "undefinedcolumn", "no such table", "no such column")):
+                is_missing_schema = (
+                    "function " not in err_l
+                    and "42883" not in err_l
+                    and any(
+                        m in err_l
+                        for m in (
+                            "relation ",
+                            "column ",
+                            "undefinedtable",
+                            "undefinedcolumn",
+                            "no such table",
+                            "no such column",
+                            "42p01",
+                            "42703",
+                        )
+                    )
+                )
+                if is_missing_schema and (time.time() - getattr(self.conn, "_last_ensure_tables_ts", 0) > 60):
                     try:
+                        self.conn._last_ensure_tables_ts = time.time()
                         self.conn.rollback()
                     except Exception:
                         pass
@@ -3658,9 +3795,12 @@ def enable_local_first_mode():
     return path
 
 
-def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=False):
+_LAST_AUTO_BACKFILL_TS = 0.0
+
+
+def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=False, force_full=False):
     """Flush local edits to Supabase, then download the latest copy into the local cache."""
-    global _SYNC_IN_PROGRESS, _SUPABASE_OFFLINE, _LAST_SYNC_ERROR
+    global _SYNC_IN_PROGRESS, _SUPABASE_OFFLINE, _LAST_SYNC_ERROR, _LAST_AUTO_BACKFILL_TS
     if get_db_mode() != "supabase":
         if progress_cb:
             progress_cb("Ready")
@@ -3669,6 +3809,13 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         return False, "busy"
     _SYNC_IN_PROGRESS = True
     try:
+        auto_ver_sync = needs_auto_version_sync()
+        if auto_ver_sync:
+            backfill = True
+            force_full = True
+        elif not backfill and (time.time() - _LAST_AUTO_BACKFILL_TS > 60.0):
+            backfill = True
+
         enable_local_first_mode()
         if progress_cb:
             progress_cb("Connecting to cloud…")
@@ -3677,7 +3824,7 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         except Exception:
             get_shared_supabase_conn(force_reconnect=True)
         _SUPABASE_OFFLINE = False
-        if init_schema:
+        if init_schema or auto_ver_sync:
             try:
                 db_conn = _open_supabase_pg_conn(timeout=10)
                 try:
@@ -3700,6 +3847,7 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
             _LAST_SYNC_ERROR = msg or "upload failed"
         if backfill:
             try:
+                _LAST_AUTO_BACKFILL_TS = time.time()
                 if progress_cb:
                     progress_cb("Checking for unsynced local records…")
                 if backfill_local_rows_missing_from_cloud():
@@ -3708,13 +3856,15 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
                 pass
         if progress_cb:
             progress_cb("Downloading latest records…")
-        refresh_offline_cache_from_cloud()
+        pulled_ok = refresh_offline_cache_from_cloud(force_full=force_full)
         try:
             run_one_time_admin_envelopes_to_moe_migration()
         except Exception:
             pass
         if offline_pending_count():
             flush_offline_queue_to_cloud()
+        if pulled_ok and auto_ver_sync:
+            mark_auto_version_sync_done()
         if progress_cb:
             progress_cb("Almost ready…")
         enable_local_first_mode()
@@ -5748,9 +5898,10 @@ class OfflineTrackingConnection:
 
     def __init__(self, conn):
         self._conn = conn
+        self._dirty = False
 
     def cursor(self):
-        return OfflineTrackingCursor(self._conn.cursor(), self._conn)
+        return OfflineTrackingCursor(self._conn.cursor(), self._conn, self)
 
     def execute(self, sql, parameters=()):
         cur = self.cursor()
@@ -5763,6 +5914,7 @@ class OfflineTrackingConnection:
         return cur
 
     def executescript(self, sql_script):
+        self._dirty = True
         cur = self.cursor()
         if hasattr(cur, "executescript"):
             return cur.executescript(sql_script)
@@ -5773,19 +5925,25 @@ class OfflineTrackingConnection:
 
     def commit(self):
         self._conn.commit()
+        self._dirty = False
         _schedule_persist_offline_cache(0.15)
         if get_db_mode() == "supabase":
             schedule_cloud_push()
 
     def rollback(self):
+        self._dirty = False
         self._conn.rollback()
 
     def close(self):
-        try:
-            self._conn.commit()
-            _schedule_persist_offline_cache(0.15)
-        except Exception:
-            pass
+        if self._dirty or getattr(self._conn, "in_transaction", False):
+            try:
+                self._conn.commit()
+                self._dirty = False
+                _schedule_persist_offline_cache(0.15)
+                if get_db_mode() == "supabase":
+                    schedule_cloud_push()
+            except Exception:
+                pass
         try:
             self._conn.close()
         except Exception:
@@ -5797,21 +5955,23 @@ class OfflineTrackingConnection:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type:
             try:
-                self._conn.rollback()
+                self.rollback()
             except Exception:
                 pass
         else:
-            try:
-                self._conn.commit()
-            except Exception:
-                pass
+            if self._dirty or getattr(self._conn, "in_transaction", False):
+                try:
+                    self.commit()
+                except Exception:
+                    pass
         self.close()
 
 
 class OfflineTrackingCursor:
-    def __init__(self, cursor, conn):
+    def __init__(self, cursor, conn, wrapper=None):
         self._cur = cursor
         self._conn = conn
+        self._wrapper = wrapper
         self._lastrowid = None
 
     @property
@@ -5882,13 +6042,15 @@ class OfflineTrackingCursor:
 
         params = () if params is None else tuple(params)
         self._cur.execute(query, params)
+        q = (query or "").strip()
+        qu = q.upper()
+        if self._wrapper is not None and not qu.startswith(("SELECT", "PRAGMA")):
+            self._wrapper._dirty = True
         try:
-            if (query or "").strip().upper().startswith("INSERT"):
+            if qu.startswith("INSERT"):
                 self._lastrowid = self._cur.lastrowid
         except Exception:
             pass
-        q = (query or "").strip()
-        qu = q.upper()
         if "OFFLINE_SYNC_QUEUE" in qu:
             return self
         try:
@@ -6134,6 +6296,10 @@ def _pg_insert(pg_cur, table, row):
     placeholders = ", ".join(["?"] * len(cols))
     vals = [row[c] for c in cols]
     table_l = str(table or "").lower()
+    try:
+        pg_cur._lastrowid = None
+    except Exception:
+        pass
     if table_l == "user_action_log":
         pg_cur.execute(f"INSERT INTO {table} ({col_list}) VALUES ({placeholders}) ON CONFLICT (log_uid) DO NOTHING", vals)
     elif table_l in ("config_locations", "config_categories", "config_payments", "config_languages"):
@@ -6158,7 +6324,7 @@ def _pg_inserted_id(pg_cur, row):
 def _cloud_insert_row(pg_cur, table, row):
     """Insert a new row. Never overwrite an existing cloud id (avoids wiping other PCs).
 
-    Returns the cloud id used. For payroll_records, an id clash with the *same*
+    Returns the cloud id used. For payroll_records and expenses, an id clash with the *same*
     logical row is treated as already uploaded — we do not insert a second copy.
     """
     if not row:
@@ -6195,7 +6361,27 @@ def _cloud_insert_row(pg_cur, table, row):
                             if _payroll_identity(existing) == _payroll_identity(row):
                                 return row["id"]
                     except Exception:
-                        return row.get("id")
+                        pass
+                elif table_l == "expenses":
+                    try:
+                        pg_cur.execute(
+                            "SELECT id, expense_date, category, location, amount, description FROM expenses WHERE id = ?",
+                            (row["id"],),
+                        )
+                        found = pg_cur.fetchone()
+                        if found:
+                            existing = {
+                                "id": found[0],
+                                "expense_date": found[1],
+                                "category": found[2],
+                                "location": found[3],
+                                "amount": found[4],
+                                "description": found[5],
+                            }
+                            if _expense_identity(existing) == _expense_identity(row):
+                                return row["id"]
+                    except Exception:
+                        pass
                 row = dict(row)
                 row.pop("id", None)
                 popped_id = True
@@ -6219,7 +6405,8 @@ def _cloud_insert_row(pg_cur, table, row):
 
 def _cloud_upsert_row(pg_cur, table, row):
     if not row:
-        return
+        return None
+    row = dict(row)
     cols = [c for c in row.keys()]
     if "id" in row and row["id"] is not None:
         pg_cur.execute(f"SELECT id FROM {table} WHERE id = ?", (row["id"],))
@@ -6227,25 +6414,12 @@ def _cloud_upsert_row(pg_cur, table, row):
         if exists:
             set_cols = [c for c in cols if c != "id"]
             if not set_cols:
-                return
+                return row["id"]
             sets = ", ".join(f"{c}=?" for c in set_cols)
             vals = [row[c] for c in set_cols] + [row["id"]]
             pg_cur.execute(f"UPDATE {table} SET {sets} WHERE id = ?", vals)
-            return
-    col_list = ", ".join(cols)
-    placeholders = ", ".join(["?"] * len(cols))
-    vals = [row[c] for c in cols]
-    try:
-        pg_cur.execute(
-            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})", vals
-        )
-    except Exception:
-        if "id" in row and row["id"] is not None:
-            set_cols = [c for c in cols if c != "id"]
-            if set_cols:
-                sets = ", ".join(f"{c}=?" for c in set_cols)
-                vals = [row[c] for c in set_cols] + [row["id"]]
-                pg_cur.execute(f"UPDATE {table} SET {sets} WHERE id = ?", vals)
+            return row["id"]
+    return _cloud_insert_row(pg_cur, table, row)
 
 
 def _cloud_upsert_by_key(pg_cur, table, key, row):
@@ -6377,7 +6551,7 @@ def _apply_offline_payload(pg_cur, payload, col_cache):
     for _ in range(12):
         try:
             remap = None
-            orig_id = row.get("id") if op == "insert" else None
+            orig_id = row.get("id") if op in ("insert", "upsert") else None
             if op == "insert":
                 new_id = _cloud_insert_row(pg_cur, table, row)
                 try:
@@ -6391,7 +6565,17 @@ def _apply_offline_payload(pg_cur, payload, col_cache):
                 except Exception:
                     remap = None
             elif op == "upsert":
-                _cloud_upsert_row(pg_cur, table, row)
+                new_id = _cloud_upsert_row(pg_cur, table, row)
+                try:
+                    if (
+                        orig_id is not None
+                        and new_id is not None
+                        and int(orig_id) != int(new_id)
+                        and str(table or "").lower() in ("payroll_records", "expenses")
+                    ):
+                        remap = (str(table).lower(), int(orig_id), int(new_id))
+                except Exception:
+                    remap = None
             elif op == "upsert_key":
                 _cloud_upsert_by_key(pg_cur, table, payload.get("key"), row)
             elif op == "rename_key":
@@ -6419,6 +6603,11 @@ def _apply_offline_payload(pg_cur, payload, col_cache):
                 pg_cur.execute(payload.get("sql") or "", payload.get("params") or [])
             else:
                 raise ValueError(f"unknown offline op {op!r}")
+            try:
+                if table:
+                    _LAST_CLOUD_TABLE_DIGESTS.pop(str(table).lower(), None)
+            except Exception:
+                pass
             return remap
         except Exception as e:
             last_err = e
@@ -6521,18 +6710,24 @@ def flush_offline_queue_to_cloud():
         if committed:
             try:
                 raw = pg_proxy.conn.cursor()
-                for tbl in ("employees", "payroll_records", "expenses", "shop_documents", "payout_tiers", "vagaro_pull_logs"):
+                for tbl in ("employees", "payroll_records", "expenses", "shop_documents", "payout_tiers"):
                     try:
                         raw.execute(
                             f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
                             f"COALESCE((SELECT MAX(id) FROM {tbl}), 1))"
                         )
                     except Exception:
-                        pass
+                        try:
+                            pg_proxy.rollback()
+                        except Exception:
+                            pass
                 raw.close()
                 pg_proxy.commit()
             except Exception:
-                pass
+                try:
+                    pg_proxy.rollback()
+                except Exception:
+                    pass
 
         if committed and (applied_ids or remaps):
             lite = _original_sqlite3_connect(path)
@@ -6724,16 +6919,34 @@ def _dedupe_payroll_table(cur):
 
 
 def _remap_shop_employee_id(pg_cur, row):
-    """Point envelope rows at the cloud Shop employee so FK inserts succeed."""
-    if not row or not is_envelope_category(row.get("category")):
+    """Point envelope rows at the cloud Shop employee and sanitize invalid employee FKs so inserts never fail."""
+    if not row:
         return row
+    row = dict(row)
     try:
         pg_cur.execute("SELECT id, name FROM employees")
-        for eid, name in pg_cur.fetchall() or []:
+        emp_rows = pg_cur.fetchall() or []
+        valid_ids = set()
+        shop_id = None
+        for eid, name in emp_rows:
+            if eid is not None:
+                try:
+                    valid_ids.add(int(eid))
+                except Exception:
+                    pass
             if plain_label(name).lower() == "shop":
-                row = dict(row)
-                row["employee_id"] = eid
-                return row
+                shop_id = eid
+        if is_envelope_category(row.get("category")) and shop_id is not None:
+            row["employee_id"] = shop_id
+        if valid_ids:
+            for fk_col in ("employee_id", "assignee_id"):
+                val = row.get(fk_col)
+                if val is not None:
+                    try:
+                        if int(val) not in valid_ids:
+                            row[fk_col] = shop_id if (fk_col == "employee_id" and is_envelope_category(row.get("category"))) else None
+                    except Exception:
+                        row[fk_col] = None
     except Exception:
         pass
     return row
@@ -6760,6 +6973,7 @@ def backfill_local_rows_missing_from_cloud():
         except Exception:
             return 0
         cloud_expense_ids = set()
+        cloud_expense_keys = set()
         cloud_envelope_keys = set()
         cloud_payroll_keys = set()
         try:
@@ -6779,10 +6993,13 @@ def backfill_local_rows_missing_from_cloud():
                     cloud_expense_ids.add(int(r[0]))
                 except Exception:
                     pass
+                ekey = _expense_identity(rec)
+                cloud_expense_keys.add(ekey)
                 if is_envelope_category(rec.get("category")):
-                    cloud_envelope_keys.add(_expense_identity(rec))
+                    cloud_envelope_keys.add(ekey)
         except Exception:
             cloud_expense_ids = set()
+            cloud_expense_keys = set()
             cloud_envelope_keys = set()
         try:
             pg_cur.execute("SELECT * FROM payroll_records")
@@ -6798,18 +7015,19 @@ def backfill_local_rows_missing_from_cloud():
         for table in ("employees", "payroll_records", "expenses", "shop_documents"):
             queued_ids = _queued_row_ids_for_table(lcur, table)
             try:
-                pg_cur.execute(f"SELECT id FROM {table}")
-                cloud_ids = set()
-                for r in pg_cur.fetchall() or []:
-                    if r and r[0] is not None:
-                        try:
-                            cloud_ids.add(int(r[0]))
-                        except Exception:
-                            pass
+                if table == "expenses":
+                    cloud_ids = set(cloud_expense_ids)
+                else:
+                    pg_cur.execute(f"SELECT id FROM {table}")
+                    cloud_ids = set()
+                    for r in pg_cur.fetchall() or []:
+                        if r and r[0] is not None:
+                            try:
+                                cloud_ids.add(int(r[0]))
+                            except Exception:
+                                pass
             except Exception:
                 continue
-            if table == "expenses":
-                cloud_ids = set(cloud_expense_ids)
             try:
                 lcur.execute(f"PRAGMA table_info({table})")
                 cols = [r[1] for r in lcur.fetchall() or [] if r and r[1]]
@@ -6834,18 +7052,19 @@ def backfill_local_rows_missing_from_cloud():
                     if _payroll_identity(rec) in cloud_payroll_keys:
                         continue
                     payload_row = dict(rec)
-                    if rid_i in cloud_ids:
-                        payload_row.pop("id", None)
                     _queue_offline_op({"op": "insert", "table": table, "row": payload_row}, lite)
                     queued_ids.add(rid_i)
                     queued += 1
                     continue
-                if table == "expenses" and is_envelope_category(rec.get("category")):
-                    if _expense_identity(rec) in cloud_envelope_keys:
-                        continue
+                if table == "expenses":
+                    ekey = _expense_identity(rec)
+                    if is_envelope_category(rec.get("category")):
+                        if ekey in cloud_envelope_keys:
+                            continue
+                    else:
+                        if ekey in cloud_expense_keys:
+                            continue
                     payload_row = dict(rec)
-                    if rid_i in cloud_ids:
-                        payload_row.pop("id", None)
                     _queue_offline_op({"op": "insert", "table": table, "row": payload_row}, lite)
                     queued_ids.add(rid_i)
                     queued += 1
@@ -7015,36 +7234,41 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
     col_list = ", ".join(use_cols)
     placeholders = ", ".join(["?"] * len(use_cols))
     id_idx = use_cols.index("id")
-    queued_ids = _queued_row_ids_for_table(lcur, tbl)
+    protected_ids = _active_protected_expense_ids() if tbl == "expenses" else set()
+    queued_ids = _queued_row_ids_for_table(lcur, tbl) | protected_ids
 
     envelope_snaps = []
     local_envelope_ids = set()
-    if tbl == "expenses" and "category" in use_cols:
+    local_row_by_id = {}
+    if tbl == "expenses":
         try:
             lcur.execute(f"SELECT {col_list} FROM {tbl}")
             for row in lcur.fetchall() or []:
-                if is_envelope_category(_row_category(use_cols, row)):
-                    envelope_snaps.append(list(row))
-                    rid = _row_id_value(use_cols, row)
-                    if rid is not None:
-                        local_envelope_ids.add(rid)
+                rid = _row_id_value(use_cols, row)
+                if rid is not None:
+                    local_row_by_id[rid] = list(row)
+                    local_envelope_ids.add(rid)
+                envelope_snaps.append(list(row))
         except Exception:
             envelope_snaps = []
 
     cloud_ids = set()
     cloud_envelope_ids = set()
+    cloud_expense_identities = set()
     for row in packed_rows or []:
         rid = _row_id_value(use_cols, row)
         if rid is not None:
             cloud_ids.add(rid)
-        if tbl == "expenses" and is_envelope_category(_row_category(use_cols, row)):
-            if rid is not None:
+        if tbl == "expenses":
+            rec_d = {use_cols[i]: row[i] for i in range(min(len(use_cols), len(row)))}
+            cloud_expense_identities.add(_expense_identity(rec_d))
+            if is_envelope_category(_row_category(use_cols, row)) and rid is not None:
                 cloud_envelope_ids.add(rid)
 
-    taken_ids = set(cloud_ids) | set(local_envelope_ids)
+    taken_ids = set(cloud_ids) | set(local_envelope_ids) | set(queued_ids) | set(local_row_by_id.keys())
 
-    # 1. Clean up local records deleted from cloud (except envelopes & un-pushed local queue)
-    if cloud_ids:
+    # 1. Clean up local records deleted from cloud (except expenses/envelopes & un-pushed local queue)
+    if cloud_ids and tbl != "expenses":
         try:
             lcur.execute(f"SELECT id FROM {tbl}")
             local_all_ids = {r[0] for r in (lcur.fetchall() or []) if r and r[0] is not None}
@@ -7057,33 +7281,36 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
     for row in packed_rows or []:
         row = list(row)
         rid = _row_id_value(use_cols, row)
-        cloud_is_envelope = tbl == "expenses" and is_envelope_category(
-            _row_category(use_cols, row)
-        )
-        if (
-            tbl == "expenses"
-            and rid is not None
-            and rid in local_envelope_ids
-            and not cloud_is_envelope
-        ):
-            new_id = _next_sqlite_id(lcur, tbl, taken_ids)
-            try:
-                lcur.execute(
-                    f"UPDATE {tbl} SET id = ? WHERE id = ?",
-                    (new_id, rid),
-                )
-                _repoint_queued_row_id(lcur, tbl, rid, new_id)
-                local_envelope_ids.discard(rid)
-                local_envelope_ids.add(new_id)
-                taken_ids.add(new_id)
-                if rid in queued_ids:
-                    queued_ids.discard(rid)
-                    queued_ids.add(new_id)
-                for snap in envelope_snaps:
-                    if _row_id_value(use_cols, snap) == rid:
-                        snap[id_idx] = new_id
-            except Exception:
-                pass
+        if tbl == "expenses" and rid is not None and (rid in local_envelope_ids or rid in queued_ids):
+            local_r = local_row_by_id.get(rid)
+            if local_r is not None:
+                local_rec = {use_cols[i]: local_r[i] for i in range(min(len(use_cols), len(local_r)))}
+                cloud_rec = {use_cols[i]: row[i] for i in range(min(len(use_cols), len(row)))}
+                if _expense_identity(local_rec) != _expense_identity(cloud_rec):
+                    # Different expense/envelope on this ID: move the local unsynced row to a fresh ID
+                    # so BOTH the cloud record and the local record are preserved!
+                    new_id = _next_sqlite_id(lcur, tbl, taken_ids)
+                    try:
+                        lcur.execute(
+                            f"UPDATE {tbl} SET id = ? WHERE id = ?",
+                            (new_id, rid),
+                        )
+                        _repoint_queued_row_id(lcur, tbl, rid, new_id)
+                        local_row_by_id[new_id] = list(local_r)
+                        local_row_by_id[new_id][id_idx] = new_id
+                        local_row_by_id.pop(rid, None)
+                        if rid in local_envelope_ids:
+                            local_envelope_ids.discard(rid)
+                            local_envelope_ids.add(new_id)
+                        taken_ids.add(new_id)
+                        if rid in queued_ids:
+                            queued_ids.discard(rid)
+                            queued_ids.add(new_id)
+                        for snap in envelope_snaps:
+                            if _row_id_value(use_cols, snap) == rid:
+                                snap[id_idx] = new_id
+                    except Exception:
+                        pass
         if rid is not None and rid in queued_ids:
             continue
         lcur.execute(
@@ -7093,10 +7320,13 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
 
     for snap in envelope_snaps:
         sid = _row_id_value(use_cols, snap)
-        if sid is not None and sid in cloud_envelope_ids:
+        snap_rec = {use_cols[i]: snap[i] for i in range(min(len(use_cols), len(snap)))}
+        if _expense_identity(snap_rec) in cloud_expense_identities:
             continue
         if sid is not None and sid in cloud_ids:
-            continue
+            new_id = _next_sqlite_id(lcur, tbl, taken_ids)
+            snap[id_idx] = new_id
+            taken_ids.add(new_id)
         lcur.execute(
             f"INSERT OR REPLACE INTO {tbl} ({col_list}) VALUES ({placeholders})",
             tuple(snap),
@@ -7576,56 +7806,169 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
 
 
 def _get_cloud_table_digest(pg_cur, tbl):
-    """Return a tiny (~40-byte) digest tuple including a hash of descriptions/notes so any text edit triggers sync."""
+    """Return a tiny (~40-byte) digest tuple including a hash of fields so any insert/update/delete triggers sync without full-table egress."""
+    raw_cur = None
+    use_savepoint = False
     try:
+        underlying_conn = getattr(pg_cur, "conn", None) or getattr(pg_cur, "_conn", None)
+        if underlying_conn is not None and hasattr(underlying_conn, "cursor"):
+            raw_cur = underlying_conn.cursor()
+            raw_cur.execute("SAVEPOINT sp_digest")
+            use_savepoint = True
+        else:
+            raw_cur = pg_cur
+
         if tbl == "expenses":
-            pg_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), "
-                "COALESCE(ROUND(CAST(SUM(COALESCE(amount, 0)) AS NUMERIC), 2), 0), "
-                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(description AS TEXT), '') || '|' || "
-                "COALESCE(CAST(location AS TEXT), '') || '|' || COALESCE(CAST(status AS TEXT), '') || '|' || "
-                "COALESCE(CAST(owner AS TEXT), '') || '|' || COALESCE(CAST(category AS TEXT), '')) AS BIGINT)), 0) "
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(expense_date AS TEXT), '') || '|' || "
+                "COALESCE(CAST(category AS TEXT), '') || '|' || "
+                "COALESCE(CAST(description AS TEXT), '') || '|' || "
+                "COALESCE(CAST(amount AS TEXT), '') || '|' || "
+                "COALESCE(CAST(payment_type AS TEXT), '') || '|' || "
+                "COALESCE(CAST(location AS TEXT), '') || '|' || "
+                "COALESCE(CAST(status AS TEXT), '') || '|' || "
+                "COALESCE(CAST(is_tip AS TEXT), '') || '|' || "
+                "COALESCE(CAST(assignee_id AS TEXT), '') || '|' || "
+                "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
+                "COALESCE(CAST(tip_given AS TEXT), '') || '|' || "
+                "COALESCE(CAST(cycle_key AS TEXT), '')"
+                ") AS BIGINT)), 0) "
                 "FROM expenses"
             )
-            r = pg_cur.fetchone()
-            return ("expenses", int(r[0] or 0), int(r[1] or 0), float(r[2] or 0.0), int(r[3] or 0))
+            r = raw_cur.fetchone()
+            res = ("expenses", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
         elif tbl == "payroll_records":
-            pg_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), "
-                "COALESCE(ROUND(CAST(SUM(COALESCE(total_payout, 0)) AS NUMERIC), 2), 0), "
-                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(notes AS TEXT), '') || '|' || "
-                "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || COALESCE(CAST(location AS TEXT), '') || '|' || "
-                "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || COALESCE(CAST(percentage AS TEXT), '')) AS BIGINT)), 0) "
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
+                "COALESCE(CAST(record_date AS TEXT), '') || '|' || "
+                "COALESCE(CAST(payment_amount AS TEXT), '') || '|' || "
+                "COALESCE(CAST(payment_type AS TEXT), '') || '|' || "
+                "COALESCE(CAST(revenue AS TEXT), '') || '|' || "
+                "COALESCE(CAST(hours AS TEXT), '') || '|' || "
+                "COALESCE(CAST(calculation AS TEXT), '') || '|' || "
+                "COALESCE(CAST(notes AS TEXT), '') || '|' || "
+                "COALESCE(CAST(written_up AS TEXT), '') || '|' || "
+                "COALESCE(CAST(location AS TEXT), '') || '|' || "
+                "COALESCE(CAST(product_sales AS TEXT), '') || '|' || "
+                "COALESCE(CAST(tip AS TEXT), '') || '|' || "
+                "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || "
+                "COALESCE(CAST(service_addon_sales AS TEXT), '') || '|' || "
+                "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || "
+                "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
+                "COALESCE(CAST(cycle_key AS TEXT), '')"
+                ") AS BIGINT)), 0) "
                 "FROM payroll_records"
             )
-            r = pg_cur.fetchone()
-            return ("payroll_records", int(r[0] or 0), int(r[1] or 0), float(r[2] or 0.0), int(r[3] or 0))
+            r = raw_cur.fetchone()
+            res = ("payroll_records", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
         elif tbl == "shop_documents":
-            pg_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), "
-                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(title AS TEXT), '') || '|' || "
-                "COALESCE(CAST(notes AS TEXT), '') || '|' || COALESCE(CAST(category AS TEXT), '')) AS BIGINT)), 0) "
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(title AS TEXT), '') || '|' || "
+                "COALESCE(CAST(description AS TEXT), '') || '|' || "
+                "COALESCE(CAST(doc_date AS TEXT), '') || '|' || "
+                "COALESCE(CAST(location AS TEXT), '') || '|' || "
+                "COALESCE(CAST(file_path AS TEXT), '')"
+                ") AS BIGINT)), 0) "
                 "FROM shop_documents"
             )
-            r = pg_cur.fetchone()
-            return ("shop_documents", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0))
+            r = raw_cur.fetchone()
+            res = ("shop_documents", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+        elif tbl == "employees":
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(name AS TEXT), '') || '|' || "
+                "COALESCE(CAST(first_name AS TEXT), '') || '|' || "
+                "COALESCE(CAST(last_name AS TEXT), '') || '|' || "
+                "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || "
+                "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
+                "COALESCE(CAST(use_tiered_payout AS TEXT), '')"
+                ") AS BIGINT)), 0) "
+                "FROM employees"
+            )
+            r = raw_cur.fetchone()
+            res = ("employees", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+        elif tbl == "payout_tiers":
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(from_sales AS TEXT), '') || '|' || "
+                "COALESCE(CAST(to_sales AS TEXT), '') || '|' || "
+                "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
+                "COALESCE(CAST(kind AS TEXT), '')"
+                ") AS BIGINT)), 0) "
+                "FROM payout_tiers"
+            )
+            r = raw_cur.fetchone()
+            res = ("payout_tiers", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
         elif tbl == "users":
-            pg_cur.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM users")
-            r = pg_cur.fetchone()
-            return ("users", int(r[0] or 0), str(r[1] or ""))
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(username), ''), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(username AS TEXT), '') || '|' || "
+                "COALESCE(CAST(password AS TEXT), '')"
+                ") AS BIGINT)), 0) "
+                "FROM users"
+            )
+            r = raw_cur.fetchone()
+            res = ("users", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
         elif tbl == "cash_month_locks":
-            pg_cur.execute(
+            raw_cur.execute(
                 "SELECT COUNT(*), COALESCE(MAX(year_month), ''), "
-                "COALESCE(SUM(CAST(hashtext(COALESCE(CAST(year_month AS TEXT), '')) AS BIGINT)), 0) "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(year_month AS TEXT), '') || '|' || "
+                "COALESCE(CAST(locked_by AS TEXT), '') || '|' || "
+                "COALESCE(CAST(locked_at AS TEXT), '')"
+                ") AS BIGINT)), 0) "
                 "FROM cash_month_locks"
             )
-            r = pg_cur.fetchone()
-            return ("cash_month_locks", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+            r = raw_cur.fetchone()
+            res = ("cash_month_locks", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+        elif tbl in ("config_locations", "config_categories", "config_payments"):
+            raw_cur.execute(
+                f"SELECT COUNT(*), COALESCE(MAX(name), ''), "
+                f"COALESCE(SUM(CAST(hashtext(COALESCE(CAST(name AS TEXT), '')) AS BIGINT)), 0) "
+                f"FROM {tbl}"
+            )
+            r = raw_cur.fetchone()
+            res = (tbl, int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+        elif tbl == "vagaro_pull_logs":
+            raw_cur.execute(
+                "SELECT COUNT(*), COALESCE(MAX(pulled_date), ''), "
+                "COALESCE(SUM(CAST(hashtext("
+                "COALESCE(CAST(pulled_date AS TEXT), '') || '|' || "
+                "COALESCE(CAST(pull_timestamp AS TEXT), '')"
+                ") AS BIGINT)), 0) "
+                "FROM vagaro_pull_logs"
+            )
+            r = raw_cur.fetchone()
+            res = ("vagaro_pull_logs", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
         else:
-            pg_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {tbl}")
-            r = pg_cur.fetchone()
-            return (tbl, int(r[0] or 0), int(r[1] or 0))
+            raw_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {tbl}")
+            r = raw_cur.fetchone()
+            res = (tbl, int(r[0] or 0), int(r[1] or 0))
+
+        if use_savepoint:
+            raw_cur.execute("RELEASE SAVEPOINT sp_digest")
+            raw_cur.close()
+        return res
     except Exception:
+        if use_savepoint and raw_cur is not None:
+            try:
+                raw_cur.execute("ROLLBACK TO SAVEPOINT sp_digest")
+                raw_cur.execute("RELEASE SAVEPOINT sp_digest")
+            except Exception:
+                pass
+            try:
+                raw_cur.close()
+            except Exception:
+                pass
         return None
 
 
@@ -7664,7 +8007,7 @@ def refresh_offline_cache_from_cloud(force_full=False):
                         not force_full
                         and cloud_digest is not None
                         and _LAST_CLOUD_TABLE_DIGESTS.get(tbl) == cloud_digest
-                        and (local_count == cloud_count or (local_count > 0 and cloud_count > 0))
+                        and local_count == cloud_count
                     ):
                         continue
 
@@ -7679,15 +8022,7 @@ def refresh_offline_cache_from_cloud(force_full=False):
                             except Exception:
                                 pass
 
-                    # 2. For shop_documents, NEVER bulk-download multi-MB file_data blobs during sync
-                    if tbl == "shop_documents":
-                        pg_cur.execute(
-                            "SELECT id, title, category, location, expiration_date, reminder_days, "
-                            "file_path, uploaded_at, date_entered, notes, file_size, file_type, filename, owner "
-                            "FROM shop_documents"
-                        )
-                    else:
-                        pg_cur.execute(f"SELECT * FROM {tbl}")
+                    pg_cur.execute(f"SELECT * FROM {tbl}")
                     rows = pg_cur.fetchall() or []
                     desc = pg_cur.description
                     if not desc:
@@ -7950,7 +8285,7 @@ def db_connect(database, *args, **kwargs):
             except Exception:
                 pass
             return OfflineTrackingConnection(conn)
-        if is_sentinel:
+        if database == SUPABASE_DB_SENTINEL:
             try:
                 return get_shared_supabase_conn()
             except Exception as e:
@@ -12644,6 +12979,7 @@ if HAS_DEPS:
                 win.lift()
                 if platform.system() != "Darwin":
                     win.attributes("-topmost", True)
+                    win.after(200, lambda w=win: w.attributes("-topmost", False) if self._widget_alive(w) else None)
             except Exception:
                 pass
 
@@ -12658,8 +12994,8 @@ if HAS_DEPS:
                         if self._widget_alive(next_top):
                             try:
                                 if platform.system() != "Darwin":
-                                    next_top.grab_set()
                                     next_top.attributes("-topmost", True)
+                                    next_top.after(200, lambda w=next_top: w.attributes("-topmost", False) if self._widget_alive(w) else None)
                                 next_top.lift()
                                 next_top.focus_force()
                             except Exception:
@@ -12680,12 +13016,14 @@ if HAS_DEPS:
             def _is_descendant_of(w, parent):
                 if w is None or parent is None:
                     return False
+                w_str = str(w)
+                if "popdown" in w_str.lower():
+                    return True
                 try:
                     if hasattr(w, "winfo_toplevel") and w.winfo_toplevel() == parent:
                         return True
                 except Exception:
                     pass
-                w_str = str(w)
                 p_str = str(parent)
                 if w_str == p_str or w_str.startswith(p_str + ".") or (p_str in w_str):
                     return True
@@ -12707,14 +13045,13 @@ if HAS_DEPS:
                     return
                 top_popup = self._active_modal_popups[-1]
                 w = getattr(event, "widget", None)
-                if w and _is_descendant_of(w, top_popup):
+                if w is None or isinstance(w, str) or _is_descendant_of(w, top_popup):
                     return
                 # User clicked outside the active smaller window: bring it immediately to the front!
                 try:
                     top_popup.deiconify()
                     top_popup.lift()
                     top_popup.focus_force()
-                    top_popup.bell()
                 except Exception:
                     pass
                 return "break"
@@ -12791,7 +13128,7 @@ if HAS_DEPS:
                         try:
                             if platform.system() != "Darwin":
                                 prev_top.attributes("-topmost", True)
-                                prev_top.grab_set()
+                                prev_top.after(200, lambda w=prev_top: w.attributes("-topmost", False) if self._widget_alive(w) else None)
                             prev_top.lift()
                             prev_top.focus_force()
                         except Exception:
@@ -12819,8 +13156,12 @@ if HAS_DEPS:
                 pass
             try:
                 popup.lift()
-                popup.focus_force()
-                popup.attributes("-topmost", True)
+                if platform.system() != "Darwin":
+                    popup.focus_force()
+                    popup.attributes("-topmost", True)
+                    popup.after(200, lambda w=popup: w.attributes("-topmost", False) if self._widget_alive(w) else None)
+                else:
+                    popup.focus_set()
             except Exception:
                 pass
             self._register_modal_popup(popup)
@@ -14787,7 +15128,7 @@ if HAS_DEPS:
                     and get_db_mode() == "supabase"
                     and self.winfo_exists()
                 ):
-                    if _SYNC_IN_PROGRESS or getattr(self, "_rebuilding_ui", False):
+                    if _SYNC_IN_PROGRESS or getattr(self, "_rebuilding_ui", False) or self._envelope_ui_open():
                         next_interval = 2000
                     else:
                         def _bg():
@@ -16262,23 +16603,26 @@ if HAS_DEPS:
             self.selected_rev_cycles = {cur_ck} if cur_ck else {f"{self.rev_cal_year}-01-1"}
             self.cycle_card_widgets = {}
 
-            # Top Control Bar
-            top_frame = tb.Frame(self.tab_calendar, padding=(15, 10))
+            # Top Control Bar (2-row layout so all buttons after Import Excel Sales fit on 13" MacBook screens)
+            top_frame = tb.Frame(self.tab_calendar, padding=(12, 6))
             top_frame.pack(side=TOP, fill=X)
-            
-            # Left: Year & Selection Controls
-            year_frame = tb.Labelframe(top_frame, text=self._tr("Year:"), padding=(8, 4), bootstyle="info")
-            year_frame.pack(side=LEFT, fill=Y, padx=(0, 10))
-            
-            tb.Button(year_frame, text="◀", bootstyle="outline-primary", width=3, cursor="hand2", command=self.prev_rev_year).pack(side=LEFT, padx=3)
-            self.lbl_rev_year = tb.Label(year_frame, text=str(self.rev_cal_year), font=("Segoe UI", 15, "bold"), bootstyle="primary")
-            self.lbl_rev_year.pack(side=LEFT, padx=10)
-            tb.Button(year_frame, text="▶", bootstyle="outline-primary", width=3, cursor="hand2", command=self.next_rev_year).pack(side=LEFT, padx=3)
-            
-            tb.Separator(year_frame, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=8)
-            
+
+            top_row1 = tb.Frame(top_frame)
+            top_row1.pack(side=TOP, fill=X, pady=(0, 4))
+
+            # Row 1 Left: Year & Selection Controls
+            year_frame = tb.Labelframe(top_row1, text=self._tr("Year:"), padding=(8, 4), bootstyle="info")
+            year_frame.pack(side=LEFT, fill=Y, padx=(0, 8))
+
+            tb.Button(year_frame, text="◀", bootstyle="outline-primary", width=3, cursor="hand2", command=self.prev_rev_year).pack(side=LEFT, padx=2)
+            self.lbl_rev_year = tb.Label(year_frame, text=str(self.rev_cal_year), font=("Segoe UI", 14, "bold"), bootstyle="primary")
+            self.lbl_rev_year.pack(side=LEFT, padx=8)
+            tb.Button(year_frame, text="▶", bootstyle="outline-primary", width=3, cursor="hand2", command=self.next_rev_year).pack(side=LEFT, padx=2)
+
+            tb.Separator(year_frame, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=6)
+
             tb.Button(year_frame, text=f"🎯 {self._tr('Current Cycle')}", bootstyle="info-outline", cursor="hand2", command=self.select_current_rev_cycle).pack(side=LEFT, padx=3)
-            
+
             self.btn_browse_cycles = tb.Button(
                 year_frame,
                 text=f"📅 {self._tr('Pay Cycles')} ▾",
@@ -16297,32 +16641,37 @@ if HAS_DEPS:
                 cursor="hand2",
                 command=self.open_rev_cycle_lock_dialog,
             )
-            self.btn_rev_cycle_lock.pack(side=LEFT, padx=(6, 3))
+            self.btn_rev_cycle_lock.pack(side=LEFT, padx=(6, 2))
 
-            # Middle: Employee Filter
-            emp_lf = tb.Labelframe(top_frame, text=self._tr("Employee:"), padding=(8, 4), bootstyle="secondary")
-            emp_lf.pack(side=LEFT, fill=Y, padx=(0, 10))
+            # Row 1 Middle/Right: Employee Filter
+            emp_lf = tb.Labelframe(top_row1, text=self._tr("Employee:"), padding=(8, 4), bootstyle="secondary")
+            emp_lf.pack(side=LEFT, fill=Y, padx=(0, 8))
             self.cal_name_filter = tb.Combobox(emp_lf, width=18, state="readonly")
             self.cal_name_filter.set(self._tr("All"))
-            self.cal_name_filter.pack(side=LEFT, padx=5, pady=2)
+            self.cal_name_filter.pack(side=LEFT, padx=4, pady=1)
             self.cal_name_filter.bind("<<ComboboxSelected>>", lambda e: self.load_calendar_data(quiet=True))
 
-            # Right: Actions
-            action_lf = tb.Labelframe(top_frame, text=self._tr("Actions"), padding=(8, 4), bootstyle="primary")
-            action_lf.pack(side=RIGHT, fill=Y)
-            
+            # Row 2: Actions Bar (full width so all buttons after Import Excel Sales are always visible and aligned)
+            top_row2 = tb.Frame(top_frame)
+            top_row2.pack(side=TOP, fill=X)
+
+            action_lf = tb.Labelframe(top_row2, text=self._tr("Actions"), padding=(8, 4), bootstyle="primary")
+            action_lf.pack(side=LEFT, fill=X, expand=True)
+
+            tb.Button(action_lf, text="📥 " + self._tr("Import Excel Sales"), bootstyle="info", cursor="hand2", command=self.open_excel_import_dialog).pack(side=LEFT, padx=(2, 4))
+            tb.Button(action_lf, text="🖨️ " + self._tr("Cycle Report / Print"), bootstyle="success", cursor="hand2", command=self.open_employee_cycle_report_dialog).pack(side=LEFT, padx=4)
+            tb.Button(action_lf, text=self._tr("✏️ Edit"), bootstyle="warning", cursor="hand2", command=self.edit_selected_record).pack(side=LEFT, padx=4)
+            tb.Button(action_lf, text=self._tr("🗑️ Delete"), bootstyle="danger", cursor="hand2", command=self.delete_selected_record).pack(side=LEFT, padx=4)
+            tb.Button(action_lf, text=self._tr("⚙️ Columns"), bootstyle="secondary-outline", cursor="hand2", command=self.open_calendar_columns_dialog).pack(side=LEFT, padx=4)
+
             self.btn_missing_rate_action = tb.Button(
                 action_lf,
                 text="⚠️ " + self._tr("+Add Rate"),
                 bootstyle="danger",
                 cursor="hand2",
             )
-            tb.Button(action_lf, text=self._tr("Import Excel Sales"), bootstyle="info", cursor="hand2", command=self.open_excel_import_dialog).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text="🖨️ " + self._tr("Cycle Report / Print"), bootstyle="success", cursor="hand2", command=self.open_employee_cycle_report_dialog).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("✏️ Edit"), bootstyle="warning", cursor="hand2", command=self.edit_selected_record).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("🗑️ Delete"), bootstyle="danger", cursor="hand2", command=self.delete_selected_record).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("⚙️ Columns"), bootstyle="secondary-outline", cursor="hand2", command=self.open_calendar_columns_dialog).pack(side=LEFT, padx=4)
-            tb.Label(action_lf, text=self._tr("(Ctrl / ⌘ multi-select)"), font=("Segoe UI", 8), bootstyle="secondary").pack(side=LEFT, padx=2)
+
+            tb.Label(action_lf, text=self._tr("(Ctrl / ⌘ multi-select)"), font=("Segoe UI", 8), bootstyle="secondary").pack(side=RIGHT, padx=6)
 
             # Bottom Summary Bar
             summary_frame = tb.Frame(self.tab_calendar, padding=(12, 8), bootstyle="primary")
@@ -20518,13 +20867,36 @@ if HAS_DEPS:
             lbl_emp = tb.Label(form, text=self._tr("Employee:"), font=("Segoe UI", 10, "bold"))
             lbl_emp.grid(row=2, column=0, **pad)
             emp_cbo = tb.Combobox(form, width=28, state="readonly")
-            
+
+            db_last_assignee_id = None
+            db_last_emp_id = None
             conn = sqlite3.connect(TEMP_DB_PATH)
             cursor = conn.cursor()
             cursor.execute("SELECT id, name FROM employees")
             employees = cursor.fetchall()
+            if not expense_id:
+                try:
+                    cur_u = _current_dropdown_user_key()
+                    cursor.execute(
+                        "SELECT category, employee_id, assignee_id, owner FROM expenses ORDER BY id DESC LIMIT 60"
+                    )
+                    for r_cat, r_emp_id, r_ass_id, r_owner in cursor.fetchall() or []:
+                        row_u = plain_label(r_owner).strip().lower() if r_owner else "admin"
+                        if row_u != cur_u:
+                            continue
+                        p_cat = plain_label(r_cat)
+                        if is_envelope_category(p_cat):
+                            if db_last_assignee_id is None and r_ass_id is not None:
+                                db_last_assignee_id = r_ass_id
+                        else:
+                            if db_last_emp_id is None and r_emp_id is not None:
+                                db_last_emp_id = r_emp_id
+                        if db_last_assignee_id is not None and db_last_emp_id is not None:
+                            break
+                except Exception:
+                    pass
             conn.close()
-            
+
             gen_txt = self._tr("General/None")
             emp_list = [gen_txt]
             emp_id_map = {gen_txt: None}
@@ -20533,25 +20905,58 @@ if HAS_DEPS:
                 display_str = f"{dec_ename} (ID: {e_id})"
                 emp_list.append(display_str)
                 emp_id_map[display_str] = e_id
-                
+
+            def _match_emp_option(target_val, options_map):
+                if target_val is None or str(target_val).strip() == "":
+                    return None
+                t_str = str(target_val).strip()
+                if t_str in options_map:
+                    return t_str
+                # Match by integer ID
+                tid = None
+                try:
+                    tid = int(target_val)
+                except Exception:
+                    if "(ID:" in t_str:
+                        try:
+                            tid = int(t_str.split("(ID:")[-1].rstrip(")").strip())
+                        except Exception:
+                            tid = None
+                if tid is not None:
+                    for k, v in options_map.items():
+                        if v is not None and str(v) == str(tid):
+                            return k
+                # Match by employee plain name
+                t_name = t_str.split(" (ID:")[0].strip().lower()
+                if t_name:
+                    for k in options_map.keys():
+                        k_name = k.split(" (ID:")[0].strip().lower()
+                        if k_name == t_name:
+                            return k
+                return None
+
             emp_cbo['values'] = emp_list
-            if data and data[3]:
-                found = False
-                for key, val in emp_id_map.items():
-                    if val == data[3]:
-                        emp_cbo.set(key)
-                        found = True
-                        break
-                if not found:
-                    emp_cbo.set("")
+            if expense_id and data and data[3]:
+                matched_emp = _match_emp_option(data[3], emp_id_map)
+                emp_cbo.set(matched_emp or "")
+            elif not is_env and data and data[3]:
+                matched_emp = _match_emp_option(data[3], emp_id_map)
+                emp_cbo.set(matched_emp or "")
             else:
-                emp_cbo.set("")
+                sticky_emp = (
+                    get_last_dropdown_selection("expense_employee")
+                    or get_last_dropdown_selection("cash_envelope_assignee")
+                    or db_last_emp_id
+                    or db_last_assignee_id
+                )
+                matched_emp = _match_emp_option(sticky_emp, emp_id_map)
+                emp_cbo.set(matched_emp or "")
             emp_cbo.grid(row=2, column=1, **ent_pad)
-            
+
             tb.Label(form, text=self._tr("Category:"), font=("Segoe UI", 10, "bold")).grid(row=3, column=0, **pad)
             cats = self.get_db_categories()
             cat_cbo = tb.Combobox(form, width=28, state="readonly", values=cats)
-            
+
             def change_popdown_color(event=None):
                 try:
                     popdown = cat_cbo.tk.call('ttk::combobox::PopdownWindow', cat_cbo)
@@ -20562,11 +20967,15 @@ if HAS_DEPS:
                     pass
             if platform.system() != "Darwin":
                 cat_cbo.bind("<Map>", change_popdown_color)
-            
-            if data:
+
+            if data and len(data) > 1 and data[1]:
                 cat_cbo.set(plain_label(data[1]) or data[1])
             else:
-                cat_cbo.set("Office Supplies" if "Office Supplies" in cats else (cats[0] if cats else ""))
+                sticky_cat = get_last_dropdown_selection("expense_category")
+                if sticky_cat and sticky_cat in cats and not is_envelope_category(sticky_cat):
+                    cat_cbo.set(sticky_cat)
+                else:
+                    cat_cbo.set("Office Supplies" if "Office Supplies" in cats else (cats[0] if cats else ""))
             cat_cbo.grid(row=3, column=1, **ent_pad)
             
             # Tip Included checkbox (row 3) and tip-given amount (pops in below)
@@ -20632,17 +21041,24 @@ if HAS_DEPS:
                     assignee_list.append(display_str)
                     assignee_id_map[display_str] = e_id
             assignee_cbo['values'] = assignee_list
-            if data and len(data) > 8 and data[8] and is_envelope_category(data[1] if len(data) > 1 else ""):
-                found = False
-                for key, val in assignee_id_map.items():
-                    if val == data[8]:
-                        assignee_cbo.set(key)
-                        found = True
-                        break
-                if not found:
+            if expense_id and data and len(data) > 8 and is_envelope_category(data[1] if len(data) > 1 else ""):
+                if data[8]:
+                    matched_ass = _match_emp_option(data[8], assignee_id_map)
+                    assignee_cbo.set(matched_ass or self._tr("General/None"))
+                else:
                     assignee_cbo.set(self._tr("General/None"))
+            elif data and len(data) > 8 and data[8] and is_envelope_category(data[1] if len(data) > 1 else ""):
+                matched_ass = _match_emp_option(data[8], assignee_id_map)
+                assignee_cbo.set(matched_ass or self._tr("General/None"))
             else:
-                assignee_cbo.set(self._tr("General/None"))
+                sticky_ass = (
+                    get_last_dropdown_selection("cash_envelope_assignee")
+                    or get_last_dropdown_selection("expense_employee")
+                    or db_last_assignee_id
+                    or db_last_emp_id
+                )
+                matched_ass = _match_emp_option(sticky_ass, assignee_id_map)
+                assignee_cbo.set(matched_ass or self._tr("General/None"))
 
             lbl_amt = tb.Label(form, text=self._tr("Amount:"), font=("Segoe UI", 10, "bold"))
             amt_ent = tb.Entry(form, width=30)
@@ -20654,26 +21070,99 @@ if HAS_DEPS:
 
             lbl_status = tb.Label(form, text=self._tr("Status:"), font=("Segoe UI", 10, "bold"))
             status_cbo = tb.Combobox(form, width=28, state="readonly", values=["Pending", "Approved", "Rejected"])
-            if data and len(data) > 4:
+            if expense_id and data and len(data) > 4 and data[4]:
                 status_cbo.set(plain_label(data[4]) or "Pending")
             else:
-                status_cbo.set("Pending")
+                sticky_st = get_last_dropdown_selection(
+                    "cash_envelope_status" if is_env else "expense_status", ""
+                )
+                if sticky_st in ("Pending", "Approved", "Rejected"):
+                    status_cbo.set(sticky_st)
+                elif data and len(data) > 4 and data[4]:
+                    status_cbo.set(plain_label(data[4]) or "Pending")
+                else:
+                    status_cbo.set("Pending")
 
             lbl_pay = tb.Label(form, text=self._tr("Payment Type:"), font=("Segoe UI", 10, "bold"))
             pts = self.get_db_payments()
             pay_type_cbo = tb.Combobox(form, width=28, state="readonly", values=pts)
-            if data and len(data) > 6 and data[6]:
+            if expense_id and data and len(data) > 6 and data[6]:
                 pay_type_cbo.set(plain_label(data[6]) or data[6])
             else:
-                pay_type_cbo.set("Cash" if "Cash" in pts else (pts[0] if pts else ""))
+                sticky_pt = get_last_dropdown_selection(
+                    "cash_envelope_payment_type" if is_env else "expense_payment_type", ""
+                )
+                if sticky_pt and sticky_pt in pts:
+                    pay_type_cbo.set(sticky_pt)
+                elif data and len(data) > 6 and data[6]:
+                    pay_type_cbo.set(plain_label(data[6]) or data[6])
+                else:
+                    pay_type_cbo.set("Cash" if "Cash" in pts else (pts[0] if pts else ""))
 
             lbl_loc = tb.Label(form, text=self._tr("Location (Optional):"), font=("Segoe UI", 10, "bold"))
             locs = [""] + self.get_db_locations()
             loc_cbo = tb.Combobox(form, width=28, state="readonly", values=locs)
-            if data and len(data) > 7 and data[7]:
+            if expense_id and data and len(data) > 7 and data[7]:
                 loc_cbo.set(plain_label(data[7]) or "")
             else:
-                loc_cbo.set("")
+                sticky_loc = (
+                    get_last_dropdown_selection("cash_envelope_location" if is_env else "expense_location", "")
+                    or get_last_dropdown_selection("last_location", "")
+                )
+                if sticky_loc and sticky_loc in locs:
+                    loc_cbo.set(sticky_loc)
+                elif data and len(data) > 7 and data[7]:
+                    loc_cbo.set(plain_label(data[7]) or "")
+                else:
+                    loc_cbo.set("")
+
+            def _on_emp_cbo_selected(event=None):
+                val = (emp_cbo.get() or "").strip()
+                if val:
+                    save_last_dropdown_selection("expense_employee", val)
+                    if val != gen_txt:
+                        save_last_dropdown_selection("cash_envelope_assignee", val)
+
+            def _on_assignee_cbo_selected(event=None):
+                val = (assignee_cbo.get() or "").strip()
+                if val:
+                    save_last_dropdown_selection("cash_envelope_assignee", val)
+                    if val != self._tr("General/None"):
+                        save_last_dropdown_selection("expense_employee", val)
+
+            def _on_loc_cbo_selected(event=None):
+                val = (loc_cbo.get() or "").strip()
+                cur_cat = cat_cbo.get()
+                if is_envelope_category(cur_cat):
+                    save_last_dropdown_selection("cash_envelope_location", val)
+                else:
+                    save_last_dropdown_selection("expense_location", val)
+                if val:
+                    save_last_dropdown_selection("last_location", val)
+
+            def _on_pay_cbo_selected(event=None):
+                val = (pay_type_cbo.get() or "").strip()
+                if val:
+                    cur_cat = cat_cbo.get()
+                    save_last_dropdown_selection(
+                        "cash_envelope_payment_type" if is_envelope_category(cur_cat) else "expense_payment_type",
+                        val,
+                    )
+
+            def _on_status_cbo_selected(event=None):
+                val = (status_cbo.get() or "").strip()
+                if val:
+                    cur_cat = cat_cbo.get()
+                    save_last_dropdown_selection(
+                        "cash_envelope_status" if is_envelope_category(cur_cat) else "expense_status",
+                        val,
+                    )
+
+            emp_cbo.bind("<<ComboboxSelected>>", _on_emp_cbo_selected, add="+")
+            assignee_cbo.bind("<<ComboboxSelected>>", _on_assignee_cbo_selected, add="+")
+            loc_cbo.bind("<<ComboboxSelected>>", _on_loc_cbo_selected, add="+")
+            pay_type_cbo.bind("<<ComboboxSelected>>", _on_pay_cbo_selected, add="+")
+            status_cbo.bind("<<ComboboxSelected>>", _on_status_cbo_selected, add="+")
 
             lbl_desc = tb.Label(form, text=self._tr("Description:"), font=("Segoe UI", 10, "bold"))
             desc_ent = tb.Entry(form, width=30)
@@ -20761,6 +21250,8 @@ if HAS_DEPS:
 
             def layout_conditional_fields(event=None):
                 cat = cat_cbo.get()
+                if event is not None and cat and not is_envelope_category(cat):
+                    save_last_dropdown_selection("expense_category", cat)
                 extra = 0
                 if cat == "Salary Payment":
                     lbl_tip.grid(row=4, column=0, **pad)
@@ -20881,6 +21372,10 @@ if HAS_DEPS:
                         assignee_id = assignee_id_map.get(assignee_val)
                         is_tip = "No"
                         tip_given = 0.0
+                        if assignee_val:
+                            save_last_dropdown_selection("cash_envelope_assignee", assignee_val)
+                            if assignee_val != self._tr("General/None"):
+                                save_last_dropdown_selection("expense_employee", assignee_val)
                     else:
                         emp_sel = (emp_cbo.get() or "").strip()
                         if not emp_sel or emp_sel not in emp_id_map:
@@ -20910,6 +21405,10 @@ if HAS_DEPS:
                             except Exception:
                                 pass
                             return
+                        save_last_dropdown_selection("expense_employee", emp_sel)
+                        if emp_sel != gen_txt:
+                            save_last_dropdown_selection("cash_envelope_assignee", emp_sel)
+                        save_last_dropdown_selection("expense_category", category)
                         assignee_id = None
                         is_tip = "No"
                         tip_given = 0.0
@@ -20954,6 +21453,19 @@ if HAS_DEPS:
                     description = plain_label(desc_ent.get().strip())
                     pay_type = plain_label(pay_type_cbo.get())
                     location = plain_label(loc_cbo.get())
+                    try:
+                        if category == "Cash Envelope Received":
+                            save_last_dropdown_selection("cash_envelope_location", location)
+                            save_last_dropdown_selection("cash_envelope_payment_type", pay_type)
+                            save_last_dropdown_selection("cash_envelope_status", status)
+                        else:
+                            save_last_dropdown_selection("expense_location", location)
+                            save_last_dropdown_selection("expense_payment_type", pay_type)
+                            save_last_dropdown_selection("expense_status", status)
+                        if location:
+                            save_last_dropdown_selection("last_location", location)
+                    except Exception:
+                        pass
                     # Resolve cycle_key from combobox selection with fallback to date
                     cycle_val = str(cycle_cbo.get() or "").strip()
                     cycle_key = cycle_key_map.get(cycle_val)
@@ -25405,10 +25917,14 @@ if HAS_DEPS:
 
             self._present_window(dialog)
 
-        def get_all_cash_envelope_owners(self):
+        def get_all_cash_envelope_owners(self, use_cache=False):
+            if use_cache:
+                cached = getattr(self, "_cached_envelope_owners", None)
+                if cached:
+                    return list(cached)
             owners = set()
             try:
-                conn = sqlite3.connect(TEMP_DB_PATH)
+                conn = sqlite3.connect(TEMP_DB_PATH, timeout=5)
                 cur = conn.cursor()
                 try:
                     cur.execute("SELECT username FROM users")
@@ -25431,7 +25947,9 @@ if HAS_DEPS:
                 pass
             if not owners:
                 owners.add("admin")
-            return ["All Users"] + sorted(owners, key=lambda x: x.lower())
+            res = ["All Users"] + sorted(owners, key=lambda x: x.lower())
+            self._cached_envelope_owners = list(res)
+            return res
 
         def setup_cash_calendar_tab(self):
             import calendar
@@ -25480,16 +25998,23 @@ if HAS_DEPS:
             filter_left.pack(side=LEFT, fill=Y)
 
             tb.Label(filter_left, text=self._tr("User / Owner:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(2, 6))
+            all_init_owners = self.get_all_cash_envelope_owners(use_cache=True)
             self.cash_owner_filter = tb.Combobox(
                 filter_left,
-                values=self.get_all_cash_envelope_owners(),
+                values=all_init_owners,
                 state="readonly",
                 width=16,
                 font=("Segoe UI", 10),
             )
-            self.cash_owner_filter.set("All Users")
+            sticky_owner = get_last_dropdown_selection("cash_owner_filter", "All Users")
+            self.cash_owner_filter.set(sticky_owner if sticky_owner in all_init_owners else "All Users")
             self.cash_owner_filter.pack(side=LEFT, padx=(0, 8))
-            self.cash_owner_filter.bind("<<ComboboxSelected>>", lambda e: self.load_cash_calendar_data(quiet=True))
+
+            def _on_cash_owner_filter_changed(event=None):
+                save_last_dropdown_selection("cash_owner_filter", self.cash_owner_filter.get() or "All Users")
+                self.load_cash_calendar_data(quiet=True)
+
+            self.cash_owner_filter.bind("<<ComboboxSelected>>", _on_cash_owner_filter_changed)
 
             tb.Button(
                 filter_left,
@@ -25549,7 +26074,7 @@ if HAS_DEPS:
             top_bar.pack(fill=X)
 
             tb.Label(top_bar, text=self._tr("👤 User / Owner:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
-            owner_cb = tb.Combobox(top_bar, values=self.get_all_cash_envelope_owners(), state="readonly", width=16, font=("Segoe UI", 10))
+            owner_cb = tb.Combobox(top_bar, values=self.get_all_cash_envelope_owners(use_cache=True), state="readonly", width=16, font=("Segoe UI", 10))
             cur_sel = getattr(self, "cash_owner_filter", None)
             init_owner = cur_sel.get() if cur_sel else "All Users"
             owner_cb.set(init_owner if init_owner else "All Users")
@@ -25909,6 +26434,7 @@ if HAS_DEPS:
             end_date = f"{year}-{month:02d}-{num_days:02d}"
             
             rows = []
+            owners_set = set()
             try:
                 conn = sqlite3.connect(TEMP_DB_PATH)
                 cursor = conn.cursor()
@@ -25921,6 +26447,14 @@ if HAS_DEPS:
                     LEFT JOIN employees e2 ON ex.assignee_id = e2.id
                 ''')
                 rows = cursor.fetchall() or []
+                try:
+                    cursor.execute("SELECT username FROM users")
+                    for (u,) in cursor.fetchall() or []:
+                        dec_u = str(decrypt_val(u) if u is not None else "").strip()
+                        if dec_u:
+                            owners_set.add(dec_u)
+                except Exception:
+                    pass
                 conn.close()
             except Exception as e:
                 try:
@@ -25929,11 +26463,20 @@ if HAS_DEPS:
                     pass
                 return
 
+            for r in rows:
+                if len(r) > 8 and r[8]:
+                    dec_o = plain_label(r[8])
+                    if dec_o:
+                        owners_set.add(dec_o)
+            if not owners_set:
+                owners_set.add("admin")
+            all_owners = ["All Users"] + sorted(owners_set, key=lambda x: x.lower())
+            self._cached_envelope_owners = list(all_owners)
+
             sel_owner = "All Users"
             try:
                 if hasattr(self, "cash_owner_filter") and self._widget_alive(self.cash_owner_filter):
-                    cur_val = self.cash_owner_filter.get() or "All Users"
-                    all_owners = self.get_all_cash_envelope_owners()
+                    cur_val = self.cash_owner_filter.get() or get_last_dropdown_selection("cash_owner_filter", "All Users") or "All Users"
                     self.cash_owner_filter.config(values=all_owners)
                     if cur_val in all_owners:
                         self.cash_owner_filter.set(cur_val)
@@ -26265,6 +26808,10 @@ if HAS_DEPS:
                     pass
 
             popup = self._open_sheet(self, f"Cash Envelopes: {date_str}", "980x680")
+            self._envelope_popup = popup
+            self._envelope_popup_date = date_str
+            self._envelope_opening = False
+            self._cash_cal_dirty_from_popup = False
             try:
                 popup.update_idletasks()
                 screen_w = popup.winfo_screenwidth()
@@ -26276,11 +26823,59 @@ if HAS_DEPS:
                 popup.geometry(f"{pop_w}x{pop_h}+{x}+{y}")
             except Exception:
                 pass
-            self._envelope_popup = popup
-            self._envelope_popup_date = date_str
-            self._envelope_opening = False
-            
-            tb.Label(popup, text=f"Cash Envelopes for {date_str}", font=("Segoe UI", 14, "bold"), bootstyle="primary").pack(pady=(12, 4))
+
+            def _on_popup_close(event=None):
+                if getattr(popup, "_closing", False):
+                    return
+                popup._closing = True
+                if getattr(self, "_envelope_popup", None) is popup:
+                    self._envelope_popup = None
+                    self._envelope_popup_reload = None
+                    self._envelope_popup_date = None
+                self._envelope_opening = False
+                self._safe_grab_release(popup)
+                try:
+                    popup.withdraw()
+                except Exception:
+                    pass
+                try:
+                    popup.destroy()
+                except Exception:
+                    pass
+                need_reload = bool(
+                    getattr(self, "_cash_cal_reload_when_popup_closes", False)
+                    or getattr(self, "_cash_cal_dirty_from_popup", False)
+                )
+                need_fin = bool(getattr(self, "_cash_cal_dirty_from_popup", False))
+                self._cash_cal_reload_when_popup_closes = False
+                self._cash_cal_dirty_from_popup = False
+                if need_reload:
+                    def _refresh_cal():
+                        try:
+                            self.load_cash_calendar_data(quiet=True)
+                        except Exception:
+                            pass
+                        if need_fin and hasattr(self, "load_financials_data"):
+                            try:
+                                self.load_financials_data(quiet=True)
+                            except Exception:
+                                pass
+                    self.after(50, _refresh_cal)
+
+            popup.protocol("WM_DELETE_WINDOW", _on_popup_close)
+            popup.bind("<Escape>", _on_popup_close)
+
+            hdr_top = tb.Frame(popup)
+            hdr_top.pack(fill=X, padx=20, pady=(10, 2))
+            tb.Label(hdr_top, text=f"Cash Envelopes for {date_str}", font=("Segoe UI", 14, "bold"), bootstyle="primary").pack(side=LEFT)
+            tb.Button(
+                hdr_top,
+                text="✕ " + self._tr("Close Window"),
+                bootstyle="secondary",
+                cursor="hand2",
+                command=_on_popup_close,
+            ).pack(side=RIGHT)
+
             loc_hint = tb.Label(popup, text="", font=("Segoe UI", 10), bootstyle="secondary")
             loc_hint.pack(pady=(0, 6))
 
@@ -26296,9 +26891,10 @@ if HAS_DEPS:
             df_left = tb.Frame(day_filter_bar)
             df_left.pack(side=LEFT)
             tb.Label(df_left, text=self._tr("User / Owner:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(2, 6))
+            all_day_owners = self.get_all_cash_envelope_owners(use_cache=True)
             day_owner_cb = tb.Combobox(
                 df_left,
-                values=self.get_all_cash_envelope_owners(),
+                values=all_day_owners,
                 state="readonly",
                 width=16,
                 font=("Segoe UI", 10),
@@ -26309,7 +26905,7 @@ if HAS_DEPS:
                     init_u = self.cash_owner_filter.get() or "All Users"
             except Exception:
                 pass
-            day_owner_cb.set(init_u)
+            day_owner_cb.set(init_u if init_u in all_day_owners else "All Users")
             day_owner_cb.pack(side=LEFT, padx=(0, 8))
 
             df_kpi = tb.Frame(day_filter_bar)
@@ -26442,34 +27038,16 @@ if HAS_DEPS:
                 
             day_owner_cb.bind("<<ComboboxSelected>>", load_day_data)
             self._envelope_popup_reload = load_day_data
-            popup.after(30, load_day_data)
+            popup.after(15, load_day_data)
 
             def _after_save():
+                self._cash_cal_dirty_from_popup = True
+                self._cash_cal_reload_when_popup_closes = True
                 try:
                     load_day_data()
                 except Exception:
                     pass
-                self._cash_cal_reload_when_popup_closes = True
 
-            def _on_popup_close():
-                if getattr(self, "_envelope_popup", None) is popup:
-                    self._envelope_popup = None
-                    self._envelope_popup_reload = None
-                    self._envelope_popup_date = None
-                self._safe_grab_release(popup)
-                try:
-                    popup.destroy()
-                except Exception:
-                    pass
-                self._cash_cal_reload_when_popup_closes = False
-                def _refresh_cal():
-                    try:
-                        self.load_cash_calendar_data(quiet=True)
-                    except Exception:
-                        pass
-                self.after(80, _refresh_cal)
-
-            popup.protocol("WM_DELETE_WINDOW", _on_popup_close)
             month_locked = self.is_date_in_locked_cash_month(date_str)
             if month_locked:
                 tb.Label(
@@ -26528,9 +27106,9 @@ if HAS_DEPS:
                     cur.execute(f"UPDATE expenses SET status = 'Approved' WHERE id IN ({placeholders})", ids)
                     commit_and_save(conn)
                     conn.close()
+                    self._cash_cal_dirty_from_popup = True
+                    self._cash_cal_reload_when_popup_closes = True
                     load_day_data()
-                    self.load_cash_calendar_data(quiet=True)
-                    self.load_financials_data(quiet=True)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed: {e}", parent=popup)
                     
@@ -26549,9 +27127,9 @@ if HAS_DEPS:
                     cur.execute(f"UPDATE expenses SET status = 'Pending' WHERE id IN ({placeholders})", ids)
                     commit_and_save(conn)
                     conn.close()
+                    self._cash_cal_dirty_from_popup = True
+                    self._cash_cal_reload_when_popup_closes = True
                     load_day_data()
-                    self.load_cash_calendar_data(quiet=True)
-                    self.load_financials_data(quiet=True)
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed: {e}", parent=popup)
 
@@ -26594,22 +27172,23 @@ if HAS_DEPS:
                         cur.execute(f"DELETE FROM expenses WHERE id IN ({placeholders})", ids)
                         commit_and_save(conn)
                         conn.close()
+                        self._cash_cal_dirty_from_popup = True
+                        self._cash_cal_reload_when_popup_closes = True
                         load_day_data()
-                        self.load_cash_calendar_data(quiet=True)
-                        self.load_financials_data(quiet=True)
                     except Exception as e:
                         messagebox.showerror("Error", f"Failed: {e}", parent=popup)
 
-            add_btn = tb.Button(btn_frame, text=self._tr("✅ Approve Selected"), bootstyle="success", command=approve_envelope)
+            add_btn = tb.Button(btn_frame, text=self._tr("✅ Approve Selected"), bootstyle="success", cursor="hand2", command=approve_envelope)
             add_btn.pack(side=LEFT, padx=5)
-            tb.Button(btn_frame, text=self._tr("❌ Set Pending"), bootstyle="danger", command=disapprove_envelope).pack(side=LEFT, padx=5)
-            tb.Button(btn_frame, text=self._tr("+ Add Envelope"), bootstyle="primary", command=add_new_envelope).pack(side=LEFT, padx=5)
-            tb.Button(btn_frame, text=self._tr("🗑️ Delete"), bootstyle="secondary outline", command=delete_envelope).pack(side=LEFT, padx=5)
-            tb.Button(btn_frame, text=self._tr("Close Window"), bootstyle="light", command=_on_popup_close).pack(side=RIGHT, padx=5)
+            tb.Button(btn_frame, text=self._tr("❌ Set Pending"), bootstyle="danger", cursor="hand2", command=disapprove_envelope).pack(side=LEFT, padx=5)
+            tb.Button(btn_frame, text=self._tr("+ Add Envelope"), bootstyle="primary", cursor="hand2", command=add_new_envelope).pack(side=LEFT, padx=5)
+            tb.Button(btn_frame, text=self._tr("🗑️ Delete"), bootstyle="secondary outline", cursor="hand2", command=delete_envelope).pack(side=LEFT, padx=5)
+            close_btn_text = "✕ " + self._tr("Close Window")
+            tb.Button(btn_frame, text=close_btn_text, bootstyle="secondary", cursor="hand2", command=_on_popup_close).pack(side=RIGHT, padx=5)
             if month_locked:
                 for child in btn_frame.winfo_children():
                     try:
-                        if child.cget("text") != self._tr("Close Window"):
+                        if child.cget("text") not in (self._tr("Close Window"), close_btn_text):
                             child.configure(state="disabled")
                     except Exception:
                         pass
