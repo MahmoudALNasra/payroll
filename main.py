@@ -3513,19 +3513,64 @@ def _schedule_persist_offline_cache(delay=0.25):
         _persist_timer.start()
 
 
+def _is_app_logged_in_or_headless():
+    """True when no GUI instance is active or when the user is currently logged in."""
+    app = globals().get("GLOBAL_APP_INSTANCE", None)
+    if app is None:
+        return True
+    return bool(getattr(app, "is_logged_in", False))
+
+
+def pause_cloud_sync_on_logout():
+    """Stop background cloud push timers, flush any final pre-logout edits once, and close the Supabase connection."""
+    global _push_timer
+    try:
+        if _push_timer is not None:
+            _push_timer.cancel()
+            _push_timer = None
+    except Exception:
+        pass
+    if get_db_mode() != "supabase":
+        return
+
+    def _final_flush_and_close():
+        try:
+            if offline_pending_count() > 0:
+                acquired = _SYNC_LOCK.acquire(timeout=3.0)
+                if acquired:
+                    try:
+                        flush_offline_queue_to_cloud()
+                    finally:
+                        try:
+                            _SYNC_LOCK.release()
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        finally:
+            try:
+                close_shared_supabase_conn()
+            except Exception:
+                pass
+
+    threading.Thread(target=_final_flush_and_close, daemon=True).start()
+
+
 def schedule_cloud_push(delay=0.08):
     """Upload queued local edits without pulling (keeps the UI snappy)."""
     global _push_timer
     if get_db_mode() != "supabase":
         return
+    if not _is_app_logged_in_or_headless():
+        return
     def _run():
         global _push_timer, _LAST_SYNC_ERROR
         _push_timer = None
-        if get_db_mode() != "supabase":
+        if get_db_mode() != "supabase" or not _is_app_logged_in_or_headless():
             return
         acquired = _SYNC_LOCK.acquire(blocking=False)
         if not acquired:
-            if offline_pending_count():
+            if offline_pending_count() and _is_app_logged_in_or_headless():
                 schedule_cloud_push(2.0)
             return
         try:
@@ -3533,7 +3578,7 @@ def schedule_cloud_push(delay=0.08):
             if not ok:
                 _LAST_SYNC_ERROR = msg or "upload failed"
                 _sync_log(f"push failed: {msg}")
-                if offline_pending_count():
+                if offline_pending_count() and _is_app_logged_in_or_headless():
                     schedule_cloud_push(5.0)
             else:
                 if n:
@@ -3543,7 +3588,7 @@ def schedule_cloud_push(delay=0.08):
         except Exception as e:
             _LAST_SYNC_ERROR = str(e)
             _sync_log(f"push exception: {e}")
-            if offline_pending_count():
+            if offline_pending_count() and _is_app_logged_in_or_headless():
                 schedule_cloud_push(5.0)
         finally:
             try:
@@ -3805,7 +3850,8 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         if progress_cb:
             progress_cb("Ready")
         return True, "local"
-    if not _SYNC_LOCK.acquire(blocking=False):
+    acquired = _SYNC_LOCK.acquire(timeout=5.0) if force_full else _SYNC_LOCK.acquire(blocking=False)
+    if not acquired:
         return False, "busy"
     _SYNC_IN_PROGRESS = True
     try:
@@ -3813,8 +3859,13 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         if auto_ver_sync:
             backfill = True
             force_full = True
-        elif not backfill and (time.time() - _LAST_AUTO_BACKFILL_TS > 60.0):
+        elif not backfill and _LAST_AUTO_BACKFILL_TS == 0.0:
             backfill = True
+        if force_full:
+            try:
+                _LAST_CLOUD_TABLE_DIGESTS.clear()
+            except Exception:
+                pass
 
         enable_local_first_mode()
         if progress_cb:
@@ -3895,7 +3946,6 @@ def heal_encrypted_envelope_descriptions(force=False):
     global _DESCRIPTIONS_HEALED_ONCE
     if _DESCRIPTIONS_HEALED_ONCE and not force:
         return 0
-    _DESCRIPTIONS_HEALED_ONCE = True
     healed = 0
     # 1. Heal local SQLite databases (offline cache & TEMP_DB_PATH) across expenses, payroll_records, and shop_documents
     for db_opener in (
@@ -3992,7 +4042,8 @@ def heal_encrypted_envelope_descriptions(force=False):
             pass
 
     # 2. Normalize Cloud Postgres descriptions & notes so any legacy enc: row is re-encrypted with shared denc: (SUPABASE_SALT)
-    if get_db_mode() == "supabase" and not is_supabase_offline():
+    if get_db_mode() == "supabase" and not is_supabase_offline() and _is_app_logged_in_or_headless():
+        _DESCRIPTIONS_HEALED_ONCE = True
         try:
             pg_conn = _open_supabase_pg_conn(timeout=4)
             try:
@@ -5168,7 +5219,7 @@ def get_update_auth_token():
             return str(r[0]).strip()
     except Exception:
         pass
-    if get_db_mode() == "supabase" and not is_supabase_offline():
+    if get_db_mode() == "supabase" and not is_supabase_offline() and _is_app_logged_in_or_headless():
         try:
             pg = get_shared_supabase_conn()
             cur = pg.cursor()
@@ -5247,7 +5298,7 @@ def get_supabase_system_config(key, default=None):
     except Exception:
         pass
 
-    if get_db_mode() == "supabase" and not is_supabase_offline():
+    if get_db_mode() == "supabase" and not is_supabase_offline() and _is_app_logged_in_or_headless():
         try:
             import pg8000
             pg = get_shared_supabase_conn(timeout=5)
@@ -5536,7 +5587,7 @@ def check_for_cloud_update():
     m_min = re.search(r'MIN_REQUIRED_VERSION\s*=\s*["\']([^"\']+)["\']', remote_code)
     remote_min_version = m_min.group(1) if m_min else "0.0.0"
 
-    # Also check Supabase central minimum required version
+    # Also check Supabase central minimum required version when logged in (or from local cache when logged out)
     try:
         central_min = get_central_min_required_version()
         if _parse_version_tuple(central_min) > _parse_version_tuple(remote_min_version):
@@ -5566,15 +5617,6 @@ def check_for_cloud_update():
         "local_info": local_info,
         "commit_sha": resolved_sha,
     }
-
-    try:
-        log_user_action(
-            "app_update_check",
-            extra_summary=f"Checked software updates: Remote v{remote_version} vs Running v{running_version}",
-            row={"remote_version": remote_version, "running_version": running_version, "disk_matches": disk_matches_remote}
-        )
-    except Exception:
-        pass
 
     # 1. If remote version is less than or equal to running version, app is up to date!
     if remote_tuple <= running_tuple:
@@ -7992,6 +8034,7 @@ def refresh_offline_cache_from_cloud(force_full=False):
             lcur.execute(
                 "CREATE TABLE IF NOT EXISTS offline_sync_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, created_at TEXT)"
             )
+            needs_backfill = False
             for tbl in OFFLINE_SYNC_TABLES:
                 try:
                     # 1. Tiny 32-byte digest gate: skip full SELECT * if nothing in this table changed!
@@ -8002,6 +8045,9 @@ def refresh_offline_cache_from_cloud(force_full=False):
                         local_count = int((lcur.fetchone() or [0])[0] or 0)
                     except Exception:
                         local_count = 0
+
+                    if cloud_count >= 0 and local_count > cloud_count and tbl in ("expenses", "payroll_records"):
+                        needs_backfill = True
 
                     if (
                         not force_full
@@ -8111,6 +8157,11 @@ def refresh_offline_cache_from_cloud(force_full=False):
             lite.commit()
         finally:
             lite.close()
+        if needs_backfill:
+            try:
+                backfill_local_rows_missing_from_cloud()
+            except Exception:
+                pass
         _schedule_persist_offline_cache(0.5)
         return True
     except Exception:
@@ -11577,10 +11628,16 @@ if HAS_DEPS:
                             pass
                     elapsed = time.time() - self.last_activity_time
                     if elapsed >= 180:  # 3 minutes of inactivity
-                        self.is_logged_in = False
                         self._auto_save_all_pending_edits()
+                        self.is_logged_in = False
                         self._inactivity_logged_out = True
                         self.logout()
+                else:
+                    if getattr(self, "_live_sync_after_id", None) is not None:
+                        try:
+                            self.stop_live_sync()
+                        except Exception:
+                            pass
             except Exception:
                 pass
             finally:
@@ -11590,6 +11647,7 @@ if HAS_DEPS:
         def logout(self):
             self.is_logged_in = False
             self.stop_live_sync()
+            pause_cloud_sync_on_logout()
             self.hide_busy(force=True)
             for widget in list(self.winfo_children()):
                 if isinstance(widget, tk.Toplevel):
@@ -12328,12 +12386,6 @@ if HAS_DEPS:
             """Checks for cloud software updates in the background on startup and displays an install badge or mandatory update blocker."""
             def _bg():
                 try:
-                    if get_db_mode() == "supabase" and not getattr(self, "_login_cloud_cache_synced", False):
-                        self._login_cloud_cache_synced = True
-                        try:
-                            refresh_offline_cache_from_cloud()
-                        except Exception:
-                            pass
                     status, data = check_for_cloud_update()
                     r_ver = data.get("remote_version", "Latest")
                     is_forced = bool(data.get("is_forced", False))
@@ -12815,7 +12867,7 @@ if HAS_DEPS:
             self._start_prelogin_background_sync()
 
         def _start_prelogin_background_sync(self):
-            """Pre-load and synchronize cloud data in the background while the user enters their password."""
+            """Pre-load local SQLite metadata in the background while on the login screen (no cloud sync until login)."""
             if getattr(self, "_prelogin_sync_started", False):
                 return
             self._prelogin_sync_started = True
@@ -12824,45 +12876,13 @@ if HAS_DEPS:
 
             def _bg_worker():
                 try:
-                    # 1. Warm up core metadata and caches
+                    # Warm up local SQLite metadata and caches only (cloud sync is forced upon login)
                     try:
                         self.get_db_locations()
                         self.get_db_categories()
                         self.get_shop_employee_id()
                     except Exception:
                         pass
-
-                    # 2. In Supabase mode, synchronize local cache with cloud ahead of time
-                    if get_db_mode() == "supabase":
-                        ok, msg = sync_local_cache_with_cloud(backfill=False, init_schema=False)
-                        self._prelogin_sync_result["ok"] = ok
-                        self._prelogin_sync_result["msg"] = msg
-                        # Verify central version requirement from Supabase
-                        try:
-                            sb_min = get_central_min_required_version()
-                            if _parse_version_tuple(sb_min) > _parse_version_tuple(APP_VERSION):
-                                def _enforce_login_block():
-                                    self._mandatory_update_active = True
-                                    self._mandatory_update_version = sb_min
-                                    if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
-                                        self.btn_login.config(state="disabled")
-                                    if hasattr(self, "_login_status") and self._login_status.winfo_exists():
-                                        self._login_status.config(
-                                            text=f"⚠️ Login disabled: Mandatory update v{sb_min} required.",
-                                            bootstyle="danger"
-                                        )
-                                self.after(0, _enforce_login_block)
-                        except Exception:
-                            pass
-                        try:
-                            # Re-warm caches with latest synced data
-                            self._cache_locations = None
-                            self._cache_categories = None
-                            self.get_db_locations()
-                            self.get_db_categories()
-                            self.get_shop_employee_id()
-                        except Exception:
-                            pass
                 except Exception as e:
                     self._prelogin_sync_result["ok"] = False
                     self._prelogin_sync_result["msg"] = str(e)
@@ -14311,11 +14331,29 @@ if HAS_DEPS:
                 pass
 
         def _finish_login_and_sync(self):
-            """After a valid password, transition immediately to main application with zero delay."""
+            """After a valid password, force a full cloud sync so local data is up to date with all devices, then open main application."""
+            global _push_timer
+            self.is_logged_in = True
+            self.last_activity_time = time.time()
             try:
                 log_user_action("login", extra_summary="Logged in")
             except Exception:
                 pass
+            if get_db_mode() == "supabase":
+                try:
+                    if _push_timer is not None:
+                        _push_timer.cancel()
+                        _push_timer = None
+                except Exception:
+                    pass
+                self.show_busy(self._tr("Syncing latest data from all devices…"))
+                try:
+                    sync_local_cache_with_cloud(backfill=True, init_schema=False, force_full=True)
+                    self.invalidate_config_caches()
+                except Exception:
+                    pass
+                finally:
+                    self.hide_busy()
             self.show_main_application()
 
         def _tr(self, text):
