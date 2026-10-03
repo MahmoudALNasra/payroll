@@ -9055,9 +9055,9 @@ VAGARO_API_ENDPOINT = "https://api.vagaro.com/v1/revenue"
 AUTHORIZED_MACHINE_ID = "ANY"
 
 # While logged in on Supabase, pull the other PC's changes this often (ms).
-LIVE_SYNC_INTERVAL_MS = 60000  # Sync every 60 seconds (with 32-byte digest gate)
+LIVE_SYNC_INTERVAL_MS = 30000  # Sync every 30 seconds while logged in (with 32-byte digest gate)
 # How often to refresh the local offline cache while online (seconds).
-OFFLINE_CACHE_PULL_SEC = 60
+OFFLINE_CACHE_PULL_SEC = 30
 # Minimum seconds between forced UI reloads when cloud data is unchanged.
 LIVE_SYNC_MIN_UI_REFRESH_SEC = 10
 
