@@ -878,8 +878,8 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.62"
-APP_BUILD_DATE = "2026-10-02"
+APP_VERSION = "2.5.63"
+APP_BUILD_DATE = "2026-10-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
 
@@ -3534,24 +3534,24 @@ def pause_cloud_sync_on_logout():
         return
 
     def _final_flush_and_close():
+        acquired = _SYNC_LOCK.acquire(timeout=3.0)
         try:
-            if offline_pending_count() > 0:
-                acquired = _SYNC_LOCK.acquire(timeout=3.0)
-                if acquired:
-                    try:
-                        flush_offline_queue_to_cloud()
-                    finally:
-                        try:
-                            _SYNC_LOCK.release()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+            if acquired and offline_pending_count() > 0:
+                try:
+                    flush_offline_queue_to_cloud()
+                except Exception:
+                    pass
+            if not _is_app_logged_in_or_headless():
+                try:
+                    close_shared_supabase_conn()
+                except Exception:
+                    pass
         finally:
-            try:
-                close_shared_supabase_conn()
-            except Exception:
-                pass
+            if acquired:
+                try:
+                    _SYNC_LOCK.release()
+                except Exception:
+                    pass
 
     threading.Thread(target=_final_flush_and_close, daemon=True).start()
 
@@ -3857,10 +3857,7 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
     try:
         auto_ver_sync = needs_auto_version_sync()
         if auto_ver_sync:
-            backfill = True
             force_full = True
-        elif not backfill and _LAST_AUTO_BACKFILL_TS == 0.0:
-            backfill = True
         if force_full:
             try:
                 _LAST_CLOUD_TABLE_DIGESTS.clear()
@@ -3875,7 +3872,7 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
         except Exception:
             get_shared_supabase_conn(force_reconnect=True)
         _SUPABASE_OFFLINE = False
-        if init_schema or auto_ver_sync:
+        if init_schema:
             try:
                 db_conn = _open_supabase_pg_conn(timeout=10)
                 try:
@@ -3896,30 +3893,26 @@ def sync_local_cache_with_cloud(progress_cb=None, backfill=False, init_schema=Fa
                 enable_local_first_mode()
                 return False, msg
             _LAST_SYNC_ERROR = msg or "upload failed"
-        if backfill:
+        if progress_cb:
+            progress_cb("Downloading latest records…")
+        pulled_ok = refresh_offline_cache_from_cloud(force_full=force_full)
+        if backfill and pulled_ok:
             try:
                 _LAST_AUTO_BACKFILL_TS = time.time()
-                if progress_cb:
-                    progress_cb("Checking for unsynced local records…")
                 if backfill_local_rows_missing_from_cloud():
                     flush_offline_queue_to_cloud()
             except Exception:
                 pass
-        if progress_cb:
-            progress_cb("Downloading latest records…")
-        pulled_ok = refresh_offline_cache_from_cloud(force_full=force_full)
-        try:
-            run_one_time_admin_envelopes_to_moe_migration()
-        except Exception:
-            pass
         if offline_pending_count():
             flush_offline_queue_to_cloud()
-        if pulled_ok and auto_ver_sync:
-            mark_auto_version_sync_done()
+        if pulled_ok:
+            _LAST_SYNC_ERROR = ""
+            if auto_ver_sync:
+                mark_auto_version_sync_done()
         if progress_cb:
             progress_cb("Almost ready…")
         enable_local_first_mode()
-        return True, "ok"
+        return bool(pulled_ok), ("ok" if pulled_ok else (_LAST_SYNC_ERROR or "pull failed"))
     except Exception as e:
         enter_supabase_offline_mode(str(e))
         enable_local_first_mode()
@@ -3942,12 +3935,13 @@ def run_one_time_admin_envelopes_to_moe_migration():
 
 
 def heal_encrypted_envelope_descriptions(force=False):
-    """Scan local SQLite and Cloud Postgres once per session to peel any double/multi-encrypted or device-salted descriptions & notes."""
+    """Scan local SQLite once per session to peel any double/multi-encrypted or device-salted descriptions & notes."""
     global _DESCRIPTIONS_HEALED_ONCE
     if _DESCRIPTIONS_HEALED_ONCE and not force:
         return 0
+    _DESCRIPTIONS_HEALED_ONCE = True
     healed = 0
-    # 1. Heal local SQLite databases (offline cache & TEMP_DB_PATH) across expenses, payroll_records, and shop_documents
+    # Heal local SQLite databases (offline cache & TEMP_DB_PATH) across expenses, payroll_records, and shop_documents
     for db_opener in (
         lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=10),
         lambda: _original_sqlite3_connect(TEMP_DB_PATH, timeout=10) if os.path.exists(str(TEMP_DB_PATH)) else None,
@@ -4038,58 +4032,6 @@ def heal_encrypted_envelope_descriptions(force=False):
 
             conn.commit()
             conn.close()
-        except Exception:
-            pass
-
-    # 2. Normalize Cloud Postgres descriptions & notes so any legacy enc: row is re-encrypted with shared denc: (SUPABASE_SALT)
-    if get_db_mode() == "supabase" and not is_supabase_offline() and _is_app_logged_in_or_headless():
-        _DESCRIPTIONS_HEALED_ONCE = True
-        try:
-            pg_conn = _open_supabase_pg_conn(timeout=4)
-            try:
-                raw_cur = pg_conn.cursor()
-                for tbl_name, col_name in (
-                    ("expenses", "description"),
-                    ("payroll_records", "notes"),
-                    ("payroll_records", "written_up_desc"),
-                    ("shop_documents", "notes"),
-                ):
-                    try:
-                        raw_cur.execute(
-                            f"SELECT id, {col_name} FROM {tbl_name} WHERE {col_name} IS NOT NULL AND {col_name} != ''"
-                        )
-                        pg_updates = []
-                        for rid, raw_val in raw_cur.fetchall() or []:
-                            if not raw_val or not isinstance(raw_val, str):
-                                continue
-                            s_trim = raw_val.strip()
-                            # If it is legacy enc: or plain or double-encrypted, decrypt and re-encrypt as shared deterministic denc:
-                            if s_trim.startswith("enc:") or not s_trim.startswith("denc:"):
-                                clean_plain = plain_label(raw_val)
-                                if clean_plain and not clean_plain.startswith(("enc:", "denc:")):
-                                    re_enc = _encrypt_for_col(col_name, clean_plain)
-                                    if re_enc != raw_val:
-                                        pg_updates.append((re_enc, rid))
-                            elif s_trim.startswith("denc:"):
-                                clean_plain = plain_label(raw_val)
-                                re_enc = _encrypt_for_col(col_name, clean_plain)
-                                if re_enc != raw_val and not clean_plain.startswith(("enc:", "denc:")):
-                                    pg_updates.append((re_enc, rid))
-                        for re_enc, rid in pg_updates:
-                            raw_cur.execute(f"UPDATE {tbl_name} SET {col_name} = %s WHERE id = %s", (re_enc, rid))
-                            healed += 1
-                    except Exception:
-                        try:
-                            pg_conn.rollback()
-                        except Exception:
-                            pass
-                pg_conn.commit()
-                raw_cur.close()
-            finally:
-                try:
-                    pg_conn.close()
-                except Exception:
-                    pass
         except Exception:
             pass
     return healed
@@ -5219,7 +5161,12 @@ def get_update_auth_token():
             return str(r[0]).strip()
     except Exception:
         pass
-    if get_db_mode() == "supabase" and not is_supabase_offline() and _is_app_logged_in_or_headless():
+    if (
+        get_db_mode() == "supabase"
+        and not is_supabase_offline()
+        and _is_app_logged_in_or_headless()
+        and not _SYNC_IN_PROGRESS
+    ):
         try:
             pg = get_shared_supabase_conn()
             cur = pg.cursor()
@@ -5298,25 +5245,29 @@ def get_supabase_system_config(key, default=None):
     except Exception:
         pass
 
-    if get_db_mode() == "supabase" and not is_supabase_offline() and _is_app_logged_in_or_headless():
+    if (
+        get_db_mode() == "supabase"
+        and not is_supabase_offline()
+        and _is_app_logged_in_or_headless()
+        and not _SYNC_IN_PROGRESS
+    ):
         try:
-            import pg8000
-            pg = get_shared_supabase_conn(timeout=5)
-            with pg.cursor() as cur:
-                cur.execute("SELECT value FROM app_system_config WHERE key = %s", (key,))
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    cloud_val = str(row[0]).strip()
-                    try:
-                        c2 = sqlite3.connect(TEMP_DB_PATH)
-                        cur2 = c2.cursor()
-                        cur2.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
-                        cur2.execute("INSERT OR REPLACE INTO app_system_config (key, value) VALUES (?, ?)", (key, cloud_val))
-                        c2.commit()
-                        c2.close()
-                    except Exception:
-                        pass
-                    return cloud_val
+            pg = get_shared_supabase_conn(timeout=4)
+            cur = pg.cursor()
+            cur.execute("SELECT value FROM app_system_config WHERE key = ?", (key,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                cloud_val = str(row[0]).strip()
+                try:
+                    c2 = sqlite3.connect(TEMP_DB_PATH)
+                    cur2 = c2.cursor()
+                    cur2.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
+                    cur2.execute("INSERT OR REPLACE INTO app_system_config (key, value) VALUES (?, ?)", (key, cloud_val))
+                    c2.commit()
+                    c2.close()
+                except Exception:
+                    pass
+                return cloud_val
         except Exception:
             pass
 
@@ -6375,6 +6326,22 @@ def _cloud_insert_row(pg_cur, table, row):
     last_err = None
     popped_id = False
     table_l = str(table or "").lower()
+    if not popped_id and row.get("id") is not None and table_l in ("payroll_records", "expenses"):
+        try:
+            pg_cur.execute(f"SELECT * FROM {table} WHERE id = ?", (row["id"],))
+            found = pg_cur.fetchone()
+            desc = pg_cur.description
+            if found and desc:
+                cols = [d[0] for d in desc]
+                existing = {cols[i]: found[i] for i in range(min(len(cols), len(found)))}
+                if table_l == "payroll_records" and _payroll_identity(existing) == _payroll_identity(row):
+                    return row["id"]
+                if table_l == "expenses" and _expense_identity(existing) == _expense_identity(row):
+                    return row["id"]
+                row.pop("id", None)
+                popped_id = True
+        except Exception:
+            pass
     for _ in range(16):
         try:
             _pg_insert(pg_cur, table, row)
@@ -6472,14 +6439,15 @@ def _cloud_upsert_by_key(pg_cur, table, key, row):
         target_u = str(decrypt_val(row[key]) if row[key] else "").strip().lower()
         target_set = {"zad", "ziad"} if target_u in ("zad", "ziad") else {target_u}
         try:
-            raw_cur = pg_cur._cur if hasattr(pg_cur, "_cur") else pg_cur
-            raw_cur.execute("SELECT username FROM users")
-            matching_raw = []
-            for (ru,) in raw_cur.fetchall() or []:
-                if ru is not None and str(decrypt_val(ru)).strip().lower() in target_set:
-                    matching_raw.append(ru)
-            for ru in matching_raw:
-                raw_cur.execute("DELETE FROM users WHERE username = %s", (ru,))
+            with _SUPABASE_LOCK:
+                raw_cur = pg_cur._cur if hasattr(pg_cur, "_cur") else pg_cur
+                raw_cur.execute("SELECT username FROM users")
+                matching_raw = []
+                for (ru,) in raw_cur.fetchall() or []:
+                    if ru is not None and str(decrypt_val(ru)).strip().lower() in target_set:
+                        matching_raw.append(ru)
+                for ru in matching_raw:
+                    raw_cur.execute("DELETE FROM users WHERE username = %s", (ru,))
         except Exception:
             pass
         col_list = ", ".join(cols)
@@ -6750,26 +6718,27 @@ def flush_offline_queue_to_cloud():
 
         # Fix sequences for tables with id
         if committed:
-            try:
-                raw = pg_proxy.conn.cursor()
-                for tbl in ("employees", "payroll_records", "expenses", "shop_documents", "payout_tiers"):
-                    try:
-                        raw.execute(
-                            f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
-                            f"COALESCE((SELECT MAX(id) FROM {tbl}), 1))"
-                        )
-                    except Exception:
-                        try:
-                            pg_proxy.rollback()
-                        except Exception:
-                            pass
-                raw.close()
-                pg_proxy.commit()
-            except Exception:
+            with _SUPABASE_LOCK:
                 try:
-                    pg_proxy.rollback()
+                    raw = pg_proxy.conn.cursor()
+                    for tbl in ("employees", "payroll_records", "expenses", "shop_documents", "payout_tiers"):
+                        try:
+                            raw.execute(
+                                f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
+                                f"COALESCE((SELECT MAX(id) FROM {tbl}), 1))"
+                            )
+                        except Exception:
+                            try:
+                                pg_proxy.rollback()
+                            except Exception:
+                                pass
+                    raw.close()
+                    pg_proxy.commit()
                 except Exception:
-                    pass
+                    try:
+                        pg_proxy.rollback()
+                    except Exception:
+                        pass
 
         if committed and (applied_ids or remaps):
             lite = _original_sqlite3_connect(path)
@@ -6793,6 +6762,11 @@ def flush_offline_queue_to_cloud():
                 lite.commit()
             finally:
                 lite.close()
+            if not stop_reason:
+                try:
+                    _LOCAL_PROTECTED_EXPENSE_IDS.clear()
+                except Exception:
+                    pass
             _persist_offline_cache()
 
         if stop_reason:
@@ -7261,8 +7235,46 @@ def _repoint_queued_row_id(lcur, table, old_id, new_id):
                 pass
 
 
+def _queued_insert_and_upsert_ids_for_table(lcur, table):
+    """Return (insert_ids, upsert_ids, delete_ids) queued for `table` in offline_sync_queue."""
+    ins_ids = set()
+    ups_ids = set()
+    del_ids = set()
+    try:
+        lcur.execute("SELECT payload FROM offline_sync_queue ORDER BY id ASC")
+        for (raw,) in lcur.fetchall() or []:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            if str(payload.get("table") or "").lower() != str(table).lower():
+                continue
+            op = str(payload.get("op") or "").lower()
+            row = payload.get("row") or {}
+            rid_val = row.get("id") if isinstance(row, dict) and row.get("id") is not None else payload.get("id")
+            if rid_val is None:
+                continue
+            try:
+                rid = int(rid_val)
+            except Exception:
+                continue
+            if op == "insert":
+                ins_ids.add(rid)
+                del_ids.discard(rid)
+            elif op == "upsert":
+                ups_ids.add(rid)
+                del_ids.discard(rid)
+            elif op == "delete":
+                del_ids.add(rid)
+                ins_ids.discard(rid)
+                ups_ids.discard(rid)
+    except Exception:
+        pass
+    return ins_ids, ups_ids, del_ids
+
+
 def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
-    """Upsert cloud rows without wiping local envelopes or unsynced records."""
+    """Upsert cloud rows into local SQLite while preserving unsynced queued local rows and syncing remote edits/deletes."""
     if "id" not in use_cols:
         lcur.execute(f"DELETE FROM {tbl}")
         if packed_rows:
@@ -7277,60 +7289,59 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
     placeholders = ", ".join(["?"] * len(use_cols))
     id_idx = use_cols.index("id")
     protected_ids = _active_protected_expense_ids() if tbl == "expenses" else set()
-    queued_ids = _queued_row_ids_for_table(lcur, tbl) | protected_ids
+    ins_ids, ups_ids, del_q_ids = _queued_insert_and_upsert_ids_for_table(lcur, tbl)
+    queued_ids = ins_ids | ups_ids | del_q_ids | _queued_row_ids_for_table(lcur, tbl) | protected_ids
+    queued_insert_ids = ins_ids | (protected_ids - ups_ids - del_q_ids)
 
-    envelope_snaps = []
-    local_envelope_ids = set()
+    unsynced_snaps = []
     local_row_by_id = {}
-    if tbl == "expenses":
+    if tbl in ("expenses", "payroll_records"):
         try:
             lcur.execute(f"SELECT {col_list} FROM {tbl}")
             for row in lcur.fetchall() or []:
                 rid = _row_id_value(use_cols, row)
                 if rid is not None:
                     local_row_by_id[rid] = list(row)
-                    local_envelope_ids.add(rid)
-                envelope_snaps.append(list(row))
+                    if rid in (queued_ids - del_q_ids):
+                        unsynced_snaps.append(list(row))
         except Exception:
-            envelope_snaps = []
+            unsynced_snaps = []
 
     cloud_ids = set()
-    cloud_envelope_ids = set()
-    cloud_expense_identities = set()
+    cloud_identities = set()
+    identity_fn = _expense_identity if tbl == "expenses" else (_payroll_identity if tbl == "payroll_records" else None)
     for row in packed_rows or []:
         rid = _row_id_value(use_cols, row)
         if rid is not None:
             cloud_ids.add(rid)
-        if tbl == "expenses":
+        if identity_fn is not None:
             rec_d = {use_cols[i]: row[i] for i in range(min(len(use_cols), len(row)))}
-            cloud_expense_identities.add(_expense_identity(rec_d))
-            if is_envelope_category(_row_category(use_cols, row)) and rid is not None:
-                cloud_envelope_ids.add(rid)
+            cloud_identities.add(identity_fn(rec_d))
 
-    taken_ids = set(cloud_ids) | set(local_envelope_ids) | set(queued_ids) | set(local_row_by_id.keys())
+    taken_ids = set(cloud_ids) | set(queued_ids) | set(local_row_by_id.keys())
 
-    # 1. Clean up local records deleted from cloud (except expenses/envelopes & un-pushed local queue)
-    if cloud_ids and tbl != "expenses":
-        try:
-            lcur.execute(f"SELECT id FROM {tbl}")
-            local_all_ids = {r[0] for r in (lcur.fetchall() or []) if r and r[0] is not None}
-            del_ids = local_all_ids - cloud_ids - queued_ids - local_envelope_ids
-            for did in del_ids:
-                lcur.execute(f"DELETE FROM {tbl} WHERE id = ?", (did,))
-        except Exception:
-            pass
+    # 1. Clean up local records that were deleted in Cloud (excluding any unsynced local queued rows)
+    try:
+        lcur.execute(f"SELECT id FROM {tbl}")
+        local_all_ids = {r[0] for r in (lcur.fetchall() or []) if r and r[0] is not None}
+        del_ids = (local_all_ids - cloud_ids - queued_ids) | del_q_ids
+        for did in del_ids:
+            lcur.execute(f"DELETE FROM {tbl} WHERE id = ?", (did,))
+    except Exception:
+        pass
 
+    # 2. Apply Cloud rows, moving any colliding local unsynced INSERT row to a fresh ID
     for row in packed_rows or []:
         row = list(row)
         rid = _row_id_value(use_cols, row)
-        if tbl == "expenses" and rid is not None and (rid in local_envelope_ids or rid in queued_ids):
+        if rid is not None and rid in del_q_ids:
+            continue
+        if identity_fn is not None and rid is not None and rid in queued_insert_ids:
             local_r = local_row_by_id.get(rid)
             if local_r is not None:
                 local_rec = {use_cols[i]: local_r[i] for i in range(min(len(use_cols), len(local_r)))}
                 cloud_rec = {use_cols[i]: row[i] for i in range(min(len(use_cols), len(row)))}
-                if _expense_identity(local_rec) != _expense_identity(cloud_rec):
-                    # Different expense/envelope on this ID: move the local unsynced row to a fresh ID
-                    # so BOTH the cloud record and the local record are preserved!
+                if identity_fn(local_rec) != identity_fn(cloud_rec):
                     new_id = _next_sqlite_id(lcur, tbl, taken_ids)
                     try:
                         lcur.execute(
@@ -7341,14 +7352,15 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
                         local_row_by_id[new_id] = list(local_r)
                         local_row_by_id[new_id][id_idx] = new_id
                         local_row_by_id.pop(rid, None)
-                        if rid in local_envelope_ids:
-                            local_envelope_ids.discard(rid)
-                            local_envelope_ids.add(new_id)
                         taken_ids.add(new_id)
-                        if rid in queued_ids:
-                            queued_ids.discard(rid)
-                            queued_ids.add(new_id)
-                        for snap in envelope_snaps:
+                        queued_ids.discard(rid)
+                        queued_ids.add(new_id)
+                        queued_insert_ids.discard(rid)
+                        queued_insert_ids.add(new_id)
+                        if tbl == "expenses" and rid in _LOCAL_PROTECTED_EXPENSE_IDS:
+                            _LOCAL_PROTECTED_EXPENSE_IDS.discard(rid)
+                            _LOCAL_PROTECTED_EXPENSE_IDS.add(new_id)
+                        for snap in unsynced_snaps:
                             if _row_id_value(use_cols, snap) == rid:
                                 snap[id_idx] = new_id
                     except Exception:
@@ -7360,13 +7372,17 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
             tuple(row),
         )
 
-    for snap in envelope_snaps:
+    # 3. Ensure any unsynced local queued rows remain present
+    for snap in unsynced_snaps:
         sid = _row_id_value(use_cols, snap)
-        snap_rec = {use_cols[i]: snap[i] for i in range(min(len(use_cols), len(snap)))}
-        if _expense_identity(snap_rec) in cloud_expense_identities:
+        if sid is None or sid not in queued_ids or sid in del_q_ids:
             continue
-        if sid is not None and sid in cloud_ids:
+        snap_rec = {use_cols[i]: snap[i] for i in range(min(len(use_cols), len(snap)))}
+        if sid in queued_insert_ids and identity_fn is not None and identity_fn(snap_rec) in cloud_identities:
+            continue
+        if sid in queued_insert_ids and sid in cloud_ids:
             new_id = _next_sqlite_id(lcur, tbl, taken_ids)
+            _repoint_queued_row_id(lcur, tbl, sid, new_id)
             snap[id_idx] = new_id
             taken_ids.add(new_id)
         lcur.execute(
@@ -7538,9 +7554,9 @@ def update_user_password_everywhere(username, new_password_or_hash):
 
 def verify_user_password_everywhere(username, entered_password):
     """
-    Verify a user's password across Supabase Cloud Postgres, active DB, local SQLite cache, and local snapshots.
-    Always checks Supabase Cloud Postgres live when in supabase mode so password changes made on another device
-    work immediately on first login attempt.
+    Verify a user's password across local SQLite cache, active DB, Supabase Cloud Postgres, and local snapshots.
+    Checks local SQLite first for instant (<1ms) login, and falls back to live Supabase Cloud Postgres if local
+    does not match so password changes made on another device work immediately on first login attempt.
     """
     if not username or entered_password is None:
         return False
@@ -7581,48 +7597,10 @@ def verify_user_password_everywhere(username, entered_password):
             return False
         return s.lower() not in (default_admin_hash, "admin")
 
-    cloud_stored = []
     local_stored = []
+    cloud_stored = []
 
-    # 1. Always check live Supabase Cloud Postgres first when in supabase mode (even if previously marked offline)
-    if get_db_mode() == "supabase":
-        try:
-            pg_conn = _open_supabase_pg_conn(timeout=5)
-            try:
-                leave_supabase_offline_mode()
-                raw_cur = pg_conn.cursor()
-                raw_cur.execute("SELECT username, password FROM users")
-                for row in raw_cur.fetchall() or []:
-                    if row and len(row) >= 2:
-                        u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
-                        if u_dec in target_names and row[1] is not None:
-                            cloud_stored.append(row[1])
-                raw_cur.close()
-            finally:
-                try:
-                    pg_conn.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # If Cloud has a matching password (custom or default), heal local cache and succeed immediately!
-    if cloud_stored:
-        cloud_custom = [p for p in cloud_stored if _is_custom_pw(p)]
-        if any(_pw_matches(p) for p in cloud_custom):
-            try:
-                update_user_password_everywhere(username, hash_strip)
-            except Exception:
-                pass
-            return True
-        if not cloud_custom and any(_pw_matches(p) for p in cloud_stored):
-            try:
-                update_user_password_everywhere(username, hash_strip)
-            except Exception:
-                pass
-            return True
-
-    # 2. Local SQLite offline cache & Active DB
+    # 1. Fast path: check local SQLite offline cache & Active DB first (< 1ms, zero network blocking)
     for db_opener in (
         lambda: _original_sqlite3_connect(ensure_offline_cache_open(), timeout=5),
         lambda: sqlite3.connect(TEMP_DB_PATH),
@@ -7645,15 +7623,55 @@ def verify_user_password_everywhere(username, entered_password):
         except Exception:
             pass
 
+    if local_stored:
+        local_custom = [p for p in local_stored if _is_custom_pw(p)]
+        if any(_pw_matches(p) for p in local_custom):
+            return True
+        if not local_custom and any(_pw_matches(p) for p in local_stored):
+            return True
+
+    # 2. If local didn't match (e.g. password changed on another device), check live Supabase Cloud Postgres
+    if get_db_mode() == "supabase":
+        try:
+            pg_conn = _open_supabase_pg_conn(timeout=4)
+            try:
+                leave_supabase_offline_mode()
+                raw_cur = pg_conn.cursor()
+                raw_cur.execute("SELECT username, password FROM users")
+                for row in raw_cur.fetchall() or []:
+                    if row and len(row) >= 2:
+                        u_dec = str(decrypt_val(row[0]) if row[0] is not None else "").strip().lower()
+                        if u_dec in target_names and row[1] is not None:
+                            cloud_stored.append(row[1])
+                raw_cur.close()
+            finally:
+                try:
+                    pg_conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if cloud_stored:
+        cloud_custom = [p for p in cloud_stored if _is_custom_pw(p)]
+        if any(_pw_matches(p) for p in cloud_custom):
+            try:
+                update_user_password_everywhere(username, hash_strip)
+            except Exception:
+                pass
+            return True
+        if not cloud_custom and any(_pw_matches(p) for p in cloud_stored):
+            try:
+                update_user_password_everywhere(username, hash_strip)
+            except Exception:
+                pass
+            return True
+
     all_stored = cloud_stored + local_stored
     custom_candidates = [p for p in all_stored if _is_custom_pw(p)]
     default_candidates = [p for p in all_stored if not _is_custom_pw(p)]
 
     if any(_pw_matches(p) for p in custom_candidates):
-        try:
-            update_user_password_everywhere(username, hash_strip)
-        except Exception:
-            pass
         return True
 
     # 3. Check local snapshot backups ONLY for CUSTOM passwords
@@ -7703,13 +7721,15 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
         lcur.execute("ALTER TABLE users ADD COLUMN updated_at TEXT DEFAULT ''")
     except Exception:
         pass
-    try:
-        raw_pg_cur = pg_cur.conn.cursor()
-        raw_pg_cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
-        pg_cur.conn.commit()
-        raw_pg_cur.close()
-    except Exception:
-        pass
+    if "updated_at" not in use_cols:
+        try:
+            with _SUPABASE_LOCK:
+                raw_pg_cur = pg_cur.conn.cursor()
+                raw_pg_cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TEXT DEFAULT ''")
+                pg_cur.conn.commit()
+                raw_pg_cur.close()
+        except Exception:
+            pass
 
     local_users = {}
     try:
@@ -7788,18 +7808,19 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
                 if upd_idx != -1 and len(c_row_list) > upd_idx:
                     c_row_list[upd_idx] = l_upd
                 try:
-                    raw_pg_cur = pg_cur.conn.cursor()
-                    raw_pg_cur.execute("SELECT username FROM users")
-                    for pr in raw_pg_cur.fetchall() or []:
-                        if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
-                            raw_pg_cur.execute("DELETE FROM users WHERE username = %s", (pr[0],))
-                    enc_u = _encrypt_for_col("username", clean_u)
-                    enc_p = _encrypt_for_col("password", l_dec_p)
-                    try:
-                        raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
-                    except Exception:
-                        raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
-                    raw_pg_cur.close()
+                    with _SUPABASE_LOCK:
+                        raw_pg_cur = pg_cur.conn.cursor()
+                        raw_pg_cur.execute("SELECT username FROM users")
+                        for pr in raw_pg_cur.fetchall() or []:
+                            if pr and pr[0] is not None and str(decrypt_val(pr[0])).strip().lower() == dec_u:
+                                raw_pg_cur.execute("DELETE FROM users WHERE username = %s", (pr[0],))
+                        enc_u = _encrypt_for_col("username", clean_u)
+                        enc_p = _encrypt_for_col("password", l_dec_p)
+                        try:
+                            raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
+                        except Exception:
+                            raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
+                        raw_pg_cur.close()
                 except Exception:
                     pass
                 final_rows.append(tuple(c_row_list))
@@ -7829,14 +7850,15 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
             final_rows.append(tuple(new_row))
             # Push local-only user to Cloud
             try:
-                raw_pg_cur = pg_cur.conn.cursor()
-                enc_u = _encrypt_for_col("username", clean_u)
-                enc_p = _encrypt_for_col("password", l_dec_p)
-                try:
-                    raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
-                except Exception:
-                    raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
-                raw_pg_cur.close()
+                with _SUPABASE_LOCK:
+                    raw_pg_cur = pg_cur.conn.cursor()
+                    enc_u = _encrypt_for_col("username", clean_u)
+                    enc_p = _encrypt_for_col("password", l_dec_p)
+                    try:
+                        raw_pg_cur.execute("INSERT INTO users (username, password, updated_at) VALUES (%s, %s, %s)", (enc_u, enc_p, l_upd))
+                    except Exception:
+                        raw_pg_cur.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (enc_u, enc_p))
+                    raw_pg_cur.close()
             except Exception:
                 pass
 
@@ -7849,179 +7871,195 @@ def _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
 
 def _get_cloud_table_digest(pg_cur, tbl):
     """Return a tiny (~40-byte) digest tuple including a hash of fields so any insert/update/delete triggers sync without full-table egress."""
-    raw_cur = None
-    use_savepoint = False
-    try:
-        underlying_conn = getattr(pg_cur, "conn", None) or getattr(pg_cur, "_conn", None)
-        if underlying_conn is not None and hasattr(underlying_conn, "cursor"):
-            raw_cur = underlying_conn.cursor()
-            raw_cur.execute("SAVEPOINT sp_digest")
-            use_savepoint = True
-        else:
-            raw_cur = pg_cur
+    with _SUPABASE_LOCK:
+        raw_cur = None
+        use_savepoint = False
+        try:
+            underlying_conn = getattr(pg_cur, "conn", None) or getattr(pg_cur, "_conn", None)
+            if underlying_conn is not None and hasattr(underlying_conn, "cursor"):
+                raw_cur = underlying_conn.cursor()
+                raw_cur.execute("SAVEPOINT sp_digest")
+                use_savepoint = True
+            else:
+                raw_cur = pg_cur
 
-        if tbl == "expenses":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(expense_date AS TEXT), '') || '|' || "
-                "COALESCE(CAST(category AS TEXT), '') || '|' || "
-                "COALESCE(CAST(description AS TEXT), '') || '|' || "
-                "COALESCE(CAST(amount AS TEXT), '') || '|' || "
-                "COALESCE(CAST(payment_type AS TEXT), '') || '|' || "
-                "COALESCE(CAST(location AS TEXT), '') || '|' || "
-                "COALESCE(CAST(status AS TEXT), '') || '|' || "
-                "COALESCE(CAST(is_tip AS TEXT), '') || '|' || "
-                "COALESCE(CAST(assignee_id AS TEXT), '') || '|' || "
-                "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
-                "COALESCE(CAST(tip_given AS TEXT), '') || '|' || "
-                "COALESCE(CAST(cycle_key AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM expenses"
-            )
-            r = raw_cur.fetchone()
-            res = ("expenses", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
-        elif tbl == "payroll_records":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
-                "COALESCE(CAST(record_date AS TEXT), '') || '|' || "
-                "COALESCE(CAST(payment_amount AS TEXT), '') || '|' || "
-                "COALESCE(CAST(payment_type AS TEXT), '') || '|' || "
-                "COALESCE(CAST(revenue AS TEXT), '') || '|' || "
-                "COALESCE(CAST(hours AS TEXT), '') || '|' || "
-                "COALESCE(CAST(calculation AS TEXT), '') || '|' || "
-                "COALESCE(CAST(notes AS TEXT), '') || '|' || "
-                "COALESCE(CAST(written_up AS TEXT), '') || '|' || "
-                "COALESCE(CAST(location AS TEXT), '') || '|' || "
-                "COALESCE(CAST(product_sales AS TEXT), '') || '|' || "
-                "COALESCE(CAST(tip AS TEXT), '') || '|' || "
-                "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || "
-                "COALESCE(CAST(service_addon_sales AS TEXT), '') || '|' || "
-                "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || "
-                "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
-                "COALESCE(CAST(cycle_key AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM payroll_records"
-            )
-            r = raw_cur.fetchone()
-            res = ("payroll_records", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
-        elif tbl == "shop_documents":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(title AS TEXT), '') || '|' || "
-                "COALESCE(CAST(description AS TEXT), '') || '|' || "
-                "COALESCE(CAST(doc_date AS TEXT), '') || '|' || "
-                "COALESCE(CAST(location AS TEXT), '') || '|' || "
-                "COALESCE(CAST(file_path AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM shop_documents"
-            )
-            r = raw_cur.fetchone()
-            res = ("shop_documents", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
-        elif tbl == "employees":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(name AS TEXT), '') || '|' || "
-                "COALESCE(CAST(first_name AS TEXT), '') || '|' || "
-                "COALESCE(CAST(last_name AS TEXT), '') || '|' || "
-                "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || "
-                "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
-                "COALESCE(CAST(use_tiered_payout AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM employees"
-            )
-            r = raw_cur.fetchone()
-            res = ("employees", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
-        elif tbl == "payout_tiers":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(from_sales AS TEXT), '') || '|' || "
-                "COALESCE(CAST(to_sales AS TEXT), '') || '|' || "
-                "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
-                "COALESCE(CAST(kind AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM payout_tiers"
-            )
-            r = raw_cur.fetchone()
-            res = ("payout_tiers", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
-        elif tbl == "users":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(username), ''), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(username AS TEXT), '') || '|' || "
-                "COALESCE(CAST(password AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM users"
-            )
-            r = raw_cur.fetchone()
-            res = ("users", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
-        elif tbl == "cash_month_locks":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(year_month), ''), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(year_month AS TEXT), '') || '|' || "
-                "COALESCE(CAST(locked_by AS TEXT), '') || '|' || "
-                "COALESCE(CAST(locked_at AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM cash_month_locks"
-            )
-            r = raw_cur.fetchone()
-            res = ("cash_month_locks", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
-        elif tbl in ("config_locations", "config_categories", "config_payments"):
-            raw_cur.execute(
-                f"SELECT COUNT(*), COALESCE(MAX(name), ''), "
-                f"COALESCE(SUM(CAST(hashtext(COALESCE(CAST(name AS TEXT), '')) AS BIGINT)), 0) "
-                f"FROM {tbl}"
-            )
-            r = raw_cur.fetchone()
-            res = (tbl, int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
-        elif tbl == "vagaro_pull_logs":
-            raw_cur.execute(
-                "SELECT COUNT(*), COALESCE(MAX(pulled_date), ''), "
-                "COALESCE(SUM(CAST(hashtext("
-                "COALESCE(CAST(pulled_date AS TEXT), '') || '|' || "
-                "COALESCE(CAST(pull_timestamp AS TEXT), '')"
-                ") AS BIGINT)), 0) "
-                "FROM vagaro_pull_logs"
-            )
-            r = raw_cur.fetchone()
-            res = ("vagaro_pull_logs", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
-        else:
-            raw_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {tbl}")
-            r = raw_cur.fetchone()
-            res = (tbl, int(r[0] or 0), int(r[1] or 0))
+            if tbl == "expenses":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(expense_date AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(category AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(description AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(amount AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(payment_type AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(location AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(status AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(is_tip AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(assignee_id AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(tip_given AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(cycle_key AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(owner AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(document_path AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM expenses"
+                )
+                r = raw_cur.fetchone()
+                res = ("expenses", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+            elif tbl == "payroll_records":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(record_date AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(payment_amount AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(payment_type AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(revenue AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(hours AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(calculation AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(notes AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(written_up AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(location AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(product_sales AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(tip AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(written_up_desc AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(service_addon_sales AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(cycle_key AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(owner AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM payroll_records"
+                )
+                r = raw_cur.fetchone()
+                res = ("payroll_records", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+            elif tbl == "shop_documents":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(title AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(description AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(doc_date AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(location AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(file_path AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(owner AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM shop_documents"
+                )
+                r = raw_cur.fetchone()
+                res = ("shop_documents", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+            elif tbl == "employees":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(name AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(first_name AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(last_name AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(hour_rate AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(use_tiered_payout AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM employees"
+                )
+                r = raw_cur.fetchone()
+                res = ("employees", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+            elif tbl == "payout_tiers":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(from_sales AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(to_sales AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(percentage AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(kind AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM payout_tiers"
+                )
+                r = raw_cur.fetchone()
+                res = ("payout_tiers", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+            elif tbl == "users":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(username), ''), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(username AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(password AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM users"
+                )
+                r = raw_cur.fetchone()
+                res = ("users", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+            elif tbl == "cash_month_locks":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(year_month), ''), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(year_month AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(locked_by AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(locked_at AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM cash_month_locks"
+                )
+                r = raw_cur.fetchone()
+                res = ("cash_month_locks", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+            elif tbl in ("config_locations", "config_categories", "config_payments"):
+                raw_cur.execute(
+                    f"SELECT COUNT(*), COALESCE(MAX(name), ''), "
+                    f"COALESCE(SUM(CAST(hashtext(COALESCE(CAST(name AS TEXT), '')) AS BIGINT)), 0) "
+                    f"FROM {tbl}"
+                )
+                r = raw_cur.fetchone()
+                res = (tbl, int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+            elif tbl == "vagaro_pull_logs":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(pulled_date), ''), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(pulled_date AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(pull_timestamp AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM vagaro_pull_logs"
+                )
+                r = raw_cur.fetchone()
+                res = ("vagaro_pull_logs", int(r[0] or 0), str(r[1] or ""), int(r[2] or 0))
+            else:
+                raw_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM {tbl}")
+                r = raw_cur.fetchone()
+                res = (tbl, int(r[0] or 0), int(r[1] or 0))
 
-        if use_savepoint:
-            raw_cur.execute("RELEASE SAVEPOINT sp_digest")
-            raw_cur.close()
-        return res
-    except Exception:
-        if use_savepoint and raw_cur is not None:
-            try:
-                raw_cur.execute("ROLLBACK TO SAVEPOINT sp_digest")
+            if use_savepoint:
                 raw_cur.execute("RELEASE SAVEPOINT sp_digest")
-            except Exception:
-                pass
-            try:
                 raw_cur.close()
-            except Exception:
-                pass
-        return None
+            return res
+        except Exception:
+            if use_savepoint and raw_cur is not None:
+                try:
+                    raw_cur.execute("ROLLBACK TO SAVEPOINT sp_digest")
+                except Exception:
+                    pass
+                fallback_res = None
+                try:
+                    if tbl in ("expenses", "payroll_records", "shop_documents", "employees", "payout_tiers"):
+                        raw_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0) FROM {tbl}")
+                        r = raw_cur.fetchone()
+                        fallback_res = (tbl, int(r[0] or 0), int(r[1] or 0), int(r[2] or 0))
+                except Exception:
+                    try:
+                        raw_cur.execute("ROLLBACK TO SAVEPOINT sp_digest")
+                    except Exception:
+                        pass
+                try:
+                    raw_cur.execute("RELEASE SAVEPOINT sp_digest")
+                except Exception:
+                    pass
+                try:
+                    raw_cur.close()
+                except Exception:
+                    pass
+                return fallback_res
+            return None
 
 
 def refresh_offline_cache_from_cloud(force_full=False):
     """Copy decrypted cloud tables into the local offline cache ONLY when a table's cloud digest has changed."""
     if get_db_mode() != "supabase":
         return False
-    try:
-        run_one_time_admin_envelopes_to_moe_migration()
-    except Exception:
-        pass
     path = ensure_offline_cache_open()
     try:
         pg_proxy = get_shared_supabase_conn()
@@ -8030,14 +8068,12 @@ def refresh_offline_cache_from_cloud(force_full=False):
         try:
             lite.execute("PRAGMA busy_timeout=8000")
             lcur = lite.cursor()
-            _init_offline_schema(lcur)
             lcur.execute(
                 "CREATE TABLE IF NOT EXISTS offline_sync_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, created_at TEXT)"
             )
-            needs_backfill = False
             for tbl in OFFLINE_SYNC_TABLES:
                 try:
-                    # 1. Tiny 32-byte digest gate: skip full SELECT * if nothing in this table changed!
+                    # 1. Tiny 40-byte digest gate: skip full SELECT * if nothing in this table changed!
                     cloud_digest = _get_cloud_table_digest(pg_cur, tbl)
                     cloud_count = cloud_digest[1] if cloud_digest and len(cloud_digest) > 1 else -1
                     try:
@@ -8046,9 +8082,6 @@ def refresh_offline_cache_from_cloud(force_full=False):
                     except Exception:
                         local_count = 0
 
-                    if cloud_count >= 0 and local_count > cloud_count and tbl in ("expenses", "payroll_records"):
-                        needs_backfill = True
-
                     if (
                         not force_full
                         and cloud_digest is not None
@@ -8056,17 +8089,6 @@ def refresh_offline_cache_from_cloud(force_full=False):
                         and local_count == cloud_count
                     ):
                         continue
-
-                    if tbl == "payroll_records":
-                        try:
-                            dropped = _dedupe_payroll_table(pg_cur)
-                            if dropped:
-                                pg_proxy.commit()
-                        except Exception:
-                            try:
-                                pg_proxy.rollback()
-                            except Exception:
-                                pass
 
                     pg_cur.execute(f"SELECT * FROM {tbl}")
                     rows = pg_cur.fetchall() or []
@@ -8084,11 +8106,18 @@ def refresh_offline_cache_from_cloud(force_full=False):
                         tuple(row[i] for i in indexes)
                         for row in rows
                     ]
-                    # Never replace a table that has local data with an empty cloud result
-                    # (a failed/blank SELECT would delete every envelope/expense).
-                    if not packed:
-                        if local_count > 0:
-                            continue
+                    # Protect large local tables against an unexpected blank SELECT, while allowing
+                    # legitimate 0-row states (e.g. unlocking the last cash_month_lock) to sync.
+                    if not packed and local_count > 0:
+                        if tbl in ("cash_month_locks", "vagaro_pull_logs", "shop_documents", "payout_tiers"):
+                            if cloud_count != 0:
+                                continue
+                        elif tbl in ("expenses", "payroll_records", "employees", "users"):
+                            if cloud_count != 0 or local_count > 3:
+                                continue
+                        else:
+                            if cloud_count != 0:
+                                continue
                     sp = f"sp_pull_{tbl}"
                     lcur.execute(f"SAVEPOINT {sp}")
                     try:
@@ -8157,11 +8186,6 @@ def refresh_offline_cache_from_cloud(force_full=False):
             lite.commit()
         finally:
             lite.close()
-        if needs_backfill:
-            try:
-                backfill_local_rows_missing_from_cloud()
-            except Exception:
-                pass
         _schedule_persist_offline_cache(0.5)
         return True
     except Exception:
@@ -8209,7 +8233,7 @@ def try_reconnect_supabase():
 
 
 def cloud_data_fingerprint():
-    """Change detector so live sync can skip full UI reloads when nothing changed."""
+    """Change detector so live sync triggers a UI refresh whenever any row or column in any synced table changes."""
     try:
         path = OFFLINE_TEMP_DB_PATH or TEMP_DB_PATH
         if not path or path == SUPABASE_DB_SENTINEL:
@@ -8220,6 +8244,18 @@ def cloud_data_fingerprint():
             "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0) FROM payroll_records"
         )
         p = cur.fetchone() or (0, 0, 0)
+        p_sig = 0
+        try:
+            cur.execute(
+                "SELECT id, employee_id, record_date, payment_amount, payment_type, revenue, hours, "
+                "calculation, notes, written_up, location, product_sales, tip, written_up_desc, "
+                "service_addon_sales, hour_rate, percentage, cycle_key FROM payroll_records"
+            )
+            for row in cur.fetchall() or []:
+                p_sig = (p_sig + hash(tuple(str(v) for v in row))) & 0x7FFFFFFF
+        except Exception:
+            pass
+
         cur.execute(
             "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
             "COALESCE(SUM(CAST(amount AS REAL)), 0) FROM expenses"
@@ -8228,7 +8264,10 @@ def cloud_data_fingerprint():
         sig = 0
         try:
             cur.execute(
-                "SELECT id, amount, expense_date, category, status, ifnull(description,'') "
+                "SELECT id, amount, expense_date, category, status, ifnull(description,''), "
+                "ifnull(location,''), ifnull(payment_type,''), ifnull(assignee_id,''), "
+                "ifnull(employee_id,''), ifnull(is_tip,''), ifnull(tip_given,''), "
+                "ifnull(cycle_key,''), ifnull(owner,'') "
                 "FROM expenses"
             )
             for row in cur.fetchall() or []:
@@ -8241,42 +8280,86 @@ def cloud_data_fingerprint():
                             str(row[2]),
                             plain_label(row[3]),
                             plain_label(row[4]),
-                            str(row[5])[:40],
+                            str(row[5]),
+                            plain_label(row[6]),
+                            plain_label(row[7]),
+                            str(row[8]),
+                            str(row[9]),
+                            str(row[10]),
+                            str(row[11]),
+                            str(row[12]),
+                            plain_label(row[13]),
                         )
                     )
                 ) & 0x7FFFFFFF
         except Exception:
             pass
+
         cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM employees")
         em = cur.fetchone() or (0, 0)
+        em_sig = 0
         try:
-            cur.execute("SELECT COUNT(*) FROM cash_month_locks")
-            locks = cur.fetchone() or (0,)
+            cur.execute(
+                "SELECT id, name, first_name, last_name, hour_rate, percentage, use_tiered_payout FROM employees"
+            )
+            for row in cur.fetchall() or []:
+                em_sig = (em_sig + hash(tuple(str(v) for v in row))) & 0x7FFFFFFF
+        except Exception:
+            pass
+
+        locks_sig = 0
+        try:
+            cur.execute("SELECT year_month, locked_by, locked_at FROM cash_month_locks")
+            lock_rows = cur.fetchall() or []
+            locks = (len(lock_rows),)
+            for row in lock_rows:
+                locks_sig = (locks_sig + hash(tuple(str(v) for v in row))) & 0x7FFFFFFF
         except Exception:
             locks = (0,)
+
+        docs_sig = 0
         try:
-            cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM shop_documents")
-            docs = cur.fetchone() or (0, 0)
+            cur.execute("SELECT id, title, doc_date, location, description, file_path FROM shop_documents")
+            doc_rows = cur.fetchall() or []
+            docs = (len(doc_rows), max((int(r[0] or 0) for r in doc_rows), default=0))
+            for row in doc_rows:
+                docs_sig = (docs_sig + hash(tuple(str(v) for v in row))) & 0x7FFFFFFF
         except Exception:
             docs = (0, 0)
+
+        tiers_sig = 0
         try:
-            cur.execute("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM payout_tiers")
-            tiers = cur.fetchone() or (0, 0)
+            cur.execute("SELECT id, from_sales, to_sales, percentage, kind FROM payout_tiers")
+            tier_rows = cur.fetchall() or []
+            tiers = (len(tier_rows), max((int(r[0] or 0) for r in tier_rows), default=0))
+            for row in tier_rows:
+                tiers_sig = (tiers_sig + hash(tuple(str(v) for v in row))) & 0x7FFFFFFF
         except Exception:
             tiers = (0, 0)
+
+        cfg_sig = 0
         try:
-            cur.execute("SELECT COUNT(*) FROM config_locations")
-            locs = cur.fetchone() or (0,)
+            cur.execute("SELECT name FROM config_locations")
+            loc_rows = cur.fetchall() or []
+            locs = (len(loc_rows),)
+            for (n,) in loc_rows:
+                cfg_sig = (cfg_sig + hash(("loc", str(n)))) & 0x7FFFFFFF
         except Exception:
             locs = (0,)
         try:
-            cur.execute("SELECT COUNT(*) FROM config_categories")
-            cats = cur.fetchone() or (0,)
+            cur.execute("SELECT name FROM config_categories")
+            cat_rows = cur.fetchall() or []
+            cats = (len(cat_rows),)
+            for (n,) in cat_rows:
+                cfg_sig = (cfg_sig + hash(("cat", str(n)))) & 0x7FFFFFFF
         except Exception:
             cats = (0,)
         try:
-            cur.execute("SELECT COUNT(*) FROM config_payments")
-            pmts = cur.fetchone() or (0,)
+            cur.execute("SELECT name FROM config_payments")
+            pmt_rows = cur.fetchall() or []
+            pmts = (len(pmt_rows),)
+            for (n,) in pmt_rows:
+                cfg_sig = (cfg_sig + hash(("pmt", str(n)))) & 0x7FFFFFFF
         except Exception:
             pmts = (0,)
         conn.close()
@@ -8284,6 +8367,7 @@ def cloud_data_fingerprint():
             int(p[0] or 0),
             int(p[1] or 0),
             int(p[2] or 0),
+            int(p_sig),
             int(e[0] or 0),
             int(e[1] or 0),
             int(e[2] or 0),
@@ -8291,13 +8375,18 @@ def cloud_data_fingerprint():
             int(sig),
             int(em[0] or 0),
             int(em[1] or 0),
+            int(em_sig),
             int(locks[0] or 0),
+            int(locks_sig),
             int(docs[0] or 0),
             int(docs[1] or 0),
+            int(docs_sig),
             int(tiers[0] or 0),
+            int(tiers_sig),
             int(locs[0] or 0),
             int(cats[0] or 0),
             int(pmts[0] or 0),
+            int(cfg_sig),
         )
     except Exception:
         return None
@@ -12955,7 +13044,6 @@ if HAS_DEPS:
                     enter_supabase_offline_mode(str(cloud_err))
 
                 if verify_user_password_everywhere(username, password):
-                    update_user_password_everywhere(username, password)
                     self.current_user = username
                     try:
                         global CURRENT_SESSION_USER
@@ -14331,7 +14419,7 @@ if HAS_DEPS:
                 pass
 
         def _finish_login_and_sync(self):
-            """After a valid password, force a full cloud sync so local data is up to date with all devices, then open main application."""
+            """Open the main application immediately on login and run a full cloud sync in a background thread so the UI never hangs."""
             global _push_timer
             self.is_logged_in = True
             self.last_activity_time = time.time()
@@ -14346,15 +14434,47 @@ if HAS_DEPS:
                         _push_timer = None
                 except Exception:
                     pass
-                self.show_busy(self._tr("Syncing latest data from all devices…"))
+                self._login_bg_sync_active = True
+            self.show_main_application()
+            if get_db_mode() == "supabase":
                 try:
-                    sync_local_cache_with_cloud(backfill=True, init_schema=False, force_full=True)
-                    self.invalidate_config_caches()
+                    if self._widget_alive(getattr(self, "lbl_live_sync", None)):
+                        self.lbl_live_sync.config(text="🔄 " + self._tr("Syncing…"))
                 except Exception:
                     pass
-                finally:
-                    self.hide_busy()
-            self.show_main_application()
+
+                def _login_bg_sync():
+                    ok = False
+                    after_fp = None
+                    try:
+                        ok, _msg = sync_local_cache_with_cloud(
+                            backfill=False, init_schema=False, force_full=True
+                        )
+                        after_fp = cloud_data_fingerprint()
+                    except Exception:
+                        ok = False
+                    finally:
+                        self._login_bg_sync_active = False
+
+                    def _after_login_sync_ui():
+                        try:
+                            if not getattr(self, "is_logged_in", False) or not self.winfo_exists():
+                                return
+                            self.invalidate_config_caches()
+                            if after_fp is not None:
+                                self._last_sync_fingerprint = after_fp
+                            if self._widget_alive(getattr(self, "lbl_live_sync", None)):
+                                self.lbl_live_sync.config(text=cloud_sync_status_label(ok=ok))
+                            self._schedule_soft_ui_refresh(full=True)
+                        except Exception:
+                            pass
+
+                    try:
+                        self.after(0, _after_login_sync_ui)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_login_bg_sync, daemon=True).start()
 
         def _tr(self, text):
             if not hasattr(self, 'lang'):
@@ -15110,8 +15230,7 @@ if HAS_DEPS:
                 ok = False
                 msg = ""
                 try:
-                    close_shared_supabase_conn()
-                    ok, msg = sync_local_cache_with_cloud(backfill=True, init_schema=False)
+                    ok, msg = sync_local_cache_with_cloud(backfill=True, init_schema=False, force_full=True)
                 except Exception as e:
                     ok = False
                     msg = str(e)
@@ -15131,6 +15250,10 @@ if HAS_DEPS:
                             pending = offline_pending_count()
                             l.config(text=f"📴 {self._tr('Offline')} ({pending} {self._tr('pending')})")
                     if ok:
+                        try:
+                            self.invalidate_config_caches()
+                        except Exception:
+                            pass
                         self._schedule_soft_ui_refresh(full=True)
 
                 try:
@@ -15146,7 +15269,8 @@ if HAS_DEPS:
             if get_db_mode() != "supabase":
                 return
             self._last_sync_fingerprint = cloud_data_fingerprint()
-            self._live_sync_after_id = self.after(800, self._live_sync_tick)
+            init_delay = LIVE_SYNC_INTERVAL_MS if getattr(self, "_login_bg_sync_active", False) else 1500
+            self._live_sync_after_id = self.after(init_delay, self._live_sync_tick)
 
         def stop_live_sync(self):
             aid = getattr(self, "_live_sync_after_id", None)
@@ -15166,8 +15290,13 @@ if HAS_DEPS:
                     and get_db_mode() == "supabase"
                     and self.winfo_exists()
                 ):
-                    if _SYNC_IN_PROGRESS or getattr(self, "_rebuilding_ui", False) or self._envelope_ui_open():
-                        next_interval = 2000
+                    if (
+                        _SYNC_IN_PROGRESS
+                        or getattr(self, "_login_bg_sync_active", False)
+                        or getattr(self, "_rebuilding_ui", False)
+                        or self._envelope_ui_open()
+                    ):
+                        next_interval = 3000
                     else:
                         def _bg():
                             status = None
@@ -15203,6 +15332,11 @@ if HAS_DEPS:
                                 try:
                                     if self._widget_alive(getattr(self, "lbl_live_sync", None)) and status:
                                         self.lbl_live_sync.config(text=status)
+                                    if changed:
+                                        try:
+                                            self.invalidate_config_caches()
+                                        except Exception:
+                                            pass
                                     if ok or changed:
                                         if after is not None:
                                             self._last_sync_fingerprint = after
@@ -18266,7 +18400,7 @@ if HAS_DEPS:
             dialog.title(self._tr("Change Username"))
             dialog.geometry("420x260")
             dialog.transient(self)
-            dialog.grab_set()
+            self._safe_grab_set(dialog)
             dialog.focus_set()
 
             who = getattr(self, "current_user", DEFAULT_ADMIN_USERNAME) or DEFAULT_ADMIN_USERNAME
@@ -18308,7 +18442,7 @@ if HAS_DEPS:
             dialog.title("Change App Login Password")
             dialog.geometry("400x320")
             dialog.transient(self)
-            dialog.grab_set()
+            self._safe_grab_set(dialog)
             dialog.focus_set()
             
             tb.Label(dialog, text="Current Password:").pack(pady=(20, 5))
@@ -18430,7 +18564,7 @@ if HAS_DEPS:
             del_win.title("Confirm Delete")
             del_win.geometry("440x240")
             del_win.transient(self)
-            del_win.grab_set()
+            self._safe_grab_set(del_win)
 
             tb.Label(
                 del_win,
@@ -18488,7 +18622,7 @@ if HAS_DEPS:
             except Exception:
                 win.geometry("1100x600")
             win.transient(self)
-            win.grab_set()
+            self._safe_grab_set(win)
             win.focus_set()
             
             tb.Label(win, text=f"Performance & Payroll Summary for {emp_name}", font=("Segoe UI", 16, "bold"), bootstyle="primary").pack(pady=15)
@@ -18897,7 +19031,7 @@ if HAS_DEPS:
             dialog = tb.Toplevel(self)
             dialog.title(self._tr("Edit Employee") if emp_id else self._tr("Add Employee"))
             dialog.transient(self)
-            dialog.grab_set()
+            self._safe_grab_set(dialog)
             dialog.focus_set()
             try:
                 dialog.update_idletasks()
@@ -19179,7 +19313,7 @@ if HAS_DEPS:
             popup.title(self._tr("Select Action"))
             popup.geometry("620x230")
             popup.transient(self)
-            popup.grab_set()
+            self._safe_grab_set(popup)
             popup.focus_set()
             
             popup.update_idletasks()
@@ -19484,7 +19618,7 @@ if HAS_DEPS:
                 self.folders_win.geometry(f"{w}x{h}+{x}+{y}")
             except Exception:
                 self.folders_win.geometry("1100x600")
-            self.folders_win.grab_set()
+            self._safe_grab_set(self.folders_win)
             self.folders_win.focus_force()
             self._present_window(self.folders_win)
             
@@ -19577,7 +19711,7 @@ if HAS_DEPS:
             win.title(self._tr("Employee details and documents"))
             win.geometry("750x650")
             win.transient(self.folders_win if self._widget_alive(getattr(self, "folders_win", None)) else self)
-            win.grab_set()
+            self._safe_grab_set(win)
             win.focus_set()
             
             tb.Label(win, text=f"{self._tr('Documents')}: {first} {last}", font=("Segoe UI", 16, "bold"), bootstyle="primary").pack(pady=10)
@@ -21633,7 +21767,7 @@ if HAS_DEPS:
                 preview = tb.Toplevel(parent)
                 preview.title(f"{self._tr('Document Preview')}: {os.path.basename(path)}")
                 preview.transient(parent)
-                preview.grab_set()
+                self._safe_grab_set(preview)
                 preview.focus_set()
                 preview.geometry("860x700")
 
@@ -21684,7 +21818,7 @@ if HAS_DEPS:
             preview = tb.Toplevel(parent)
             preview.title(f"{self._tr('Document Preview')}: {os.path.basename(path)}")
             preview.transient(parent)
-            preview.grab_set()
+            self._safe_grab_set(preview)
             preview.focus_set()
             preview.geometry("440x240")
             tb.Label(preview, text=f"📄 {os.path.basename(path)}", font=("Segoe UI", 13, "bold")).pack(pady=(25, 10))
@@ -22019,7 +22153,7 @@ if HAS_DEPS:
             dialog = tb.Toplevel(parent_win)
             dialog.title(self._tr("Import Sales Data"))
             dialog.transient(parent_win)
-            dialog.grab_set()
+            self._safe_grab_set(dialog)
             dialog.focus_set()
             try:
                 dialog.update_idletasks()
@@ -24376,7 +24510,7 @@ if HAS_DEPS:
                 pw_win.title(self._tr("Admin Password Required — Detach PC"))
                 pw_win.geometry("460x280")
                 pw_win.transient(dialog)
-                pw_win.grab_set()
+                self._safe_grab_set(pw_win)
                 pw_win.focus_set()
 
                 tb.Label(
