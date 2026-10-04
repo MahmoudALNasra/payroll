@@ -880,6 +880,17 @@ TRANSLATIONS = {
     "Note (Said / Done / Made)": "الملاحظة (ما قيل / فُعل / أُنجز)",
     "💾 Save Note": "💾 حفظ الملاحظة",
     "💾 Update Note": "💾 تحديث الملاحظة",
+    "Add Note": "إضافة ملاحظة",
+    "Save Note": "حفظ الملاحظة",
+    "Update Note": "تحديث الملاحظة",
+    "Clear / New": "مسح / جديد",
+    "Today": "اليوم",
+    "Note Date:": "تاريخ الملاحظة:",
+    "Auto-Allocated Cycle:": "الدورة التلقائية:",
+    "Added By (User):": "أضيفت بواسطة (المستخدم):",
+    "Note (What was said, done, or made):": "الملاحظة (ما قيل أو فُعل أو أُنجز):",
+    "Add / Update Note": "إضافة / تحديث ملاحظة",
+    "Synced Shop Notes History": "سجل ملاحظات المحل المتزامن",
     "🧹 Clear / New": "🧹 مسح / جديد",
     "✏️ Edit Selected Note": "✏️ تعديل الملاحظة المحددة",
     "🗑️ Delete Selected Note": "🗑️ حذف الملاحظة المحددة",
@@ -898,7 +909,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.65"
+APP_VERSION = "2.5.66"
 APP_BUILD_DATE = "2026-10-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -17249,14 +17260,39 @@ if HAS_DEPS:
             meta_row = tb.Frame(form_lf)
             meta_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-            # Date field
+            # Date field (Darwin-safe Entry or DateEntry + Today quick button)
             tb.Label(meta_row, text=self._tr("Note Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
-            self.notes_date_entry = create_date_entry(meta_row, width=12, bootstyle="primary", startdate=datetime.today())
-            self.notes_date_entry.pack(side=LEFT, padx=(0, 14))
+            today_iso = datetime.today().strftime("%Y-%m-%d")
+            if platform.system() == "Darwin":
+                self.notes_date_entry = tb.Entry(meta_row, width=11, font=("Segoe UI", 10), bootstyle="primary")
+                self.notes_date_entry.entry = self.notes_date_entry
+            else:
+                self.notes_date_entry = tb.DateEntry(meta_row, bootstyle="primary", dateformat="%Y-%m-%d", width=10)
+            try:
+                self.notes_date_entry.entry.delete(0, tk.END)
+                self.notes_date_entry.entry.insert(0, today_iso)
+            except Exception:
+                pass
+            self.notes_date_entry.pack(side=LEFT, padx=(0, 4))
+
+            def _set_note_date_today():
+                try:
+                    self.notes_date_entry.entry.delete(0, tk.END)
+                    self.notes_date_entry.entry.insert(0, datetime.today().strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
+                _update_auto_cycle_from_date()
+
+            tb.Button(
+                meta_row,
+                text=self._tr("Today"),
+                bootstyle="secondary-outline",
+                cursor="hand2",
+                command=_set_note_date_today,
+            ).pack(side=LEFT, padx=(0, 12))
 
             # Auto-Allocated Cycle display (read-only badge, calculated automatically from Note Date)
             tb.Label(meta_row, text=self._tr("Auto-Allocated Cycle:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
-            today_iso = datetime.today().strftime("%Y-%m-%d")
             init_ck = cycle_for_date(today_iso)
             self.notes_auto_cycle_key = init_ck
             self.lbl_notes_auto_cycle = tb.Label(
@@ -17265,7 +17301,7 @@ if HAS_DEPS:
                 font=("Segoe UI", 10, "bold"),
                 bootstyle="info",
             )
-            self.lbl_notes_auto_cycle.pack(side=LEFT, padx=(0, 16))
+            self.lbl_notes_auto_cycle.pack(side=LEFT, padx=(0, 12))
 
             tb.Separator(meta_row, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=6)
 
@@ -17276,12 +17312,12 @@ if HAS_DEPS:
             self.ent_notes_user = tb.Entry(
                 meta_row,
                 textvariable=self.notes_user_var,
-                width=14,
+                width=13,
                 state="readonly",
                 font=("Segoe UI", 10, "bold"),
                 bootstyle="secondary",
             )
-            self.ent_notes_user.pack(side=LEFT, padx=(0, 8))
+            self.ent_notes_user.pack(side=LEFT, padx=(0, 6))
 
             self.lbl_notes_edit_badge = tb.Label(
                 meta_row,
@@ -17311,6 +17347,7 @@ if HAS_DEPS:
 
             self.txt_shop_note = tk.Text(
                 txt_wrap,
+                width=36,
                 height=3,
                 wrap="word",
                 font=("Segoe UI", 11),
@@ -17385,11 +17422,11 @@ if HAS_DEPS:
                 except Exception:
                     pass
                 if self._widget_alive(self.btn_save_shop_note):
-                    self.btn_save_shop_note.config(text="➕ " + self._tr("Save Note"), bootstyle="success")
+                    self.btn_save_shop_note.config(text="➕ " + self._tr("Add Note"), bootstyle="success")
                 if self._widget_alive(self.lbl_notes_edit_badge):
                     self.lbl_notes_edit_badge.config(text="")
 
-            def _save_or_update_note():
+            def _save_or_update_note(*_):
                 try:
                     raw_d = self.notes_date_entry.entry.get().strip()
                 except Exception:
@@ -17410,6 +17447,10 @@ if HAS_DEPS:
                         self._tr("Please enter a note before saving."),
                         parent=win,
                     )
+                    try:
+                        self.txt_shop_note.focus_set()
+                    except Exception:
+                        pass
                     return
 
                 logged_user = str(getattr(self, "current_user", None) or _session_user_name() or DEFAULT_ADMIN_USERNAME).strip()
@@ -17447,10 +17488,17 @@ if HAS_DEPS:
 
                 _reset_note_form()
                 self.load_shop_notes_data(quiet=True)
+                return "break"
+
+            try:
+                self.txt_shop_note.bind("<Control-Return>", _save_or_update_note)
+                self.txt_shop_note.bind("<Command-Return>", _save_or_update_note)
+            except Exception:
+                pass
 
             self.btn_save_shop_note = tb.Button(
                 btn_col,
-                text="➕ " + self._tr("Save Note"),
+                text="➕ " + self._tr("Add Note"),
                 bootstyle="success",
                 width=16,
                 cursor="hand2",
@@ -17484,17 +17532,17 @@ if HAS_DEPS:
             flt_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
             tb.Label(flt_bar, text=self._tr("Cycle:"), font=("Segoe UI", 9, "bold")).pack(side=LEFT, padx=(0, 4))
-            self.notes_cycle_filter = tb.Combobox(flt_bar, width=32, state="readonly", bootstyle="info")
-            self.notes_cycle_filter.pack(side=LEFT, padx=(0, 10))
+            self.notes_cycle_filter = tb.Combobox(flt_bar, width=26, state="readonly", bootstyle="info")
+            self.notes_cycle_filter.pack(side=LEFT, padx=(0, 8))
 
             tb.Label(flt_bar, text=self._tr("Added By:"), font=("Segoe UI", 9, "bold")).pack(side=LEFT, padx=(0, 4))
-            self.notes_user_filter = tb.Combobox(flt_bar, width=13, state="readonly", bootstyle="secondary")
+            self.notes_user_filter = tb.Combobox(flt_bar, width=11, state="readonly", bootstyle="secondary")
             self.notes_user_filter.set(self._tr("All"))
-            self.notes_user_filter.pack(side=LEFT, padx=(0, 10))
+            self.notes_user_filter.pack(side=LEFT, padx=(0, 8))
 
             tb.Label(flt_bar, text="🔍", font=("Segoe UI", 10)).pack(side=LEFT, padx=(0, 3))
             self.notes_search_var = tk.StringVar(value="")
-            ent_search = tb.Entry(flt_bar, textvariable=self.notes_search_var, width=18)
+            ent_search = tb.Entry(flt_bar, textvariable=self.notes_search_var, width=15)
             ent_search.pack(side=LEFT, padx=(0, 8))
 
             def _edit_selected_note(*_):
@@ -17567,6 +17615,13 @@ if HAS_DEPS:
                 cursor="hand2",
                 command=_edit_selected_note,
             ).pack(side=RIGHT, padx=4)
+            tb.Button(
+                flt_bar,
+                text="➕ " + self._tr("Add Note"),
+                bootstyle="success",
+                cursor="hand2",
+                command=_save_or_update_note,
+            ).pack(side=RIGHT, padx=4)
 
             # Notes Table
             tbl_wrap = tb.Frame(list_lf)
@@ -17579,7 +17634,7 @@ if HAS_DEPS:
                 tbl_wrap,
                 columns=cols,
                 show="headings",
-                height=8,
+                height=6,
                 bootstyle="primary",
                 selectmode="extended",
             )
@@ -17593,7 +17648,7 @@ if HAS_DEPS:
             self.tree_shop_notes.column("Date", width=98, stretch=False, anchor=CENTER)
             self.tree_shop_notes.column("Cycle", width=220, stretch=False, anchor=W)
             self.tree_shop_notes.column("Added By", width=115, stretch=False, anchor=CENTER)
-            self.tree_shop_notes.column("Note", width=420, stretch=True, anchor=W)
+            self.tree_shop_notes.column("Note", width=400, stretch=True, anchor=W)
 
             self.tree_shop_notes.grid(row=0, column=0, sticky="nsew")
             notes_sb = tb.Scrollbar(tbl_wrap, orient=VERTICAL, command=self.tree_shop_notes.yview)
@@ -17615,6 +17670,7 @@ if HAS_DEPS:
 
             self.txt_note_reader = tk.Text(
                 reader_frame,
+                width=36,
                 height=3,
                 wrap="word",
                 font=("Segoe UI", 10),
