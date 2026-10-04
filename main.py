@@ -63,6 +63,7 @@ class SafeTkProxy:
         0x1F5C4: "[DB]",
         0x1F50D: "[Search]",
         0x1F4F4: "[Offline]",
+        0x1F4DD: "[Notes]",
     }
 
     def __init__(self, real_tk):
@@ -866,6 +867,25 @@ TRANSLATIONS = {
     "Last 2 Cycles": "آخر دورتين",
     "Last 4 Cycles": "آخر 4 دورات",
     "All Cycles with Sales": "كل الدورات ذات المبيعات",
+    "📝 Notes": "📝 الملاحظات",
+    "Shop Notes": "ملاحظات المحل",
+    "📝 Notes — Said, Done, or Made": "📝 الملاحظات — ما قيل أو فُعل أو أُنجز",
+    "Add and review team notes by date & pay cycle. Synced across all devices.": "إضافة ومراجعة الملاحظات حسب التاريخ ودورة الرواتب (متزامنة بين جميع الأجهزة).",
+    "➕ Add / Edit Note": "➕ إضافة / تعديل ملاحظة",
+    "Date:": "التاريخ:",
+    "Auto Cycle:": "الدورة التلقائية:",
+    "Added By:": "أضيفت بواسطة:",
+    "Added By": "أضيفت بواسطة",
+    "Note (What they said, done, or made):": "الملاحظة (ما قيل أو فُعل أو أُنجز):",
+    "Note (Said / Done / Made)": "الملاحظة (ما قيل / فُعل / أُنجز)",
+    "💾 Save Note": "💾 حفظ الملاحظة",
+    "💾 Update Note": "💾 تحديث الملاحظة",
+    "🧹 Clear / New": "🧹 مسح / جديد",
+    "✏️ Edit Selected Note": "✏️ تعديل الملاحظة المحددة",
+    "🗑️ Delete Selected Note": "🗑️ حذف الملاحظة المحددة",
+    "Filter Cycle:": "تصفية الدورة:",
+    "Search:": "بحث:",
+    "Selected Note Details:": "تفاصيل الملاحظة المحددة:",
 }
 
 # --- APP CONFIGURATION ---
@@ -878,7 +898,7 @@ APP_THEME = "cosmo"
 # - Format: MAJOR.MINOR.PATCH (e.g., 2.5.3)
 # - Every commit: Increment PATCH (2.5.1 -> 2.5.2 -> 2.5.3 -> ...)
 # - Big change / major feature / overhaul: Increment MINOR (e.g., 2.6.0, 2.7.0) or MAJOR (3.0.0)
-APP_VERSION = "2.5.63"
+APP_VERSION = "2.5.65"
 APP_BUILD_DATE = "2026-10-04"
 DEFAULT_UPDATE_SERVER_URL = "https://raw.githubusercontent.com/MahmoudALNasra/payroll/main/main.py"
 DEFAULT_GITHUB_RAW_URL = DEFAULT_UPDATE_SERVER_URL
@@ -1570,7 +1590,7 @@ def product_percent_for_sales(total_prod):
 DET_ENCRYPT_COLS = {
     'name', 'first_name', 'last_name', 'username', 'user_name', 'phone', 'email', 'ssn', 'address',
     'category', 'payment_type', 'location', 'status', 'written_up', 'pulled_date', 'is_tip',
-    'title', 'description', 'notes', 'written_up_desc',
+    'title', 'description', 'notes', 'written_up_desc', 'note_text', 'person_name',
 }
 RAND_ENCRYPT_COLS = {
     'old_data', 'new_data', 'password',
@@ -1828,7 +1848,7 @@ class PostgresCursorProxy:
                 tbl_match = re.search(r"INSERT\s+INTO\s+(\w+)", query, re.IGNORECASE)
                 if tbl_match:
                     tbl_name = tbl_match.group(1).lower()
-                    if tbl_name in ["employees", "payroll_records", "expenses", "shop_documents"]:
+                    if tbl_name in ["employees", "payroll_records", "expenses", "shop_documents", "shop_notes"]:
                         self._history_table = tbl_name
                         self._history_action = "INSERT"
 
@@ -3328,6 +3348,7 @@ OFFLINE_SYNC_TABLES = (
     "payroll_records",
     "expenses",
     "shop_documents",
+    "shop_notes",
     "vagaro_pull_logs",
     "payout_tiers",
     "cash_month_locks",
@@ -3724,7 +3745,7 @@ def ensure_offline_cache_open():
         cur = lite.cursor()
         # Build local (plaintext) schema — temporarily pretend we're not on live PG.
         _init_offline_schema(cur)
-        for _tbl_owner in ("expenses", "payroll_records", "shop_documents"):
+        for _tbl_owner in ("expenses", "payroll_records", "shop_documents", "shop_notes"):
             try:
                 cur.execute(f"ALTER TABLE {_tbl_owner} ADD COLUMN owner TEXT DEFAULT ''")
             except Exception:
@@ -4030,6 +4051,33 @@ def heal_encrypted_envelope_descriptions(force=False):
             except Exception:
                 pass
 
+            # d) shop_notes (note_text & person_name & owner)
+            try:
+                cur.execute("SELECT id, note_text, person_name, owner FROM shop_notes")
+                n_updates = []
+                for r in cur.fetchall() or []:
+                    if not r:
+                        continue
+                    nid, raw_nt, raw_pn, raw_ow = r
+                    if any(
+                        v and str(v).strip().startswith(("enc:", "denc:", "str:"))
+                        for v in (raw_nt, raw_pn, raw_ow)
+                    ):
+                        n_updates.append((
+                            plain_label(raw_nt),
+                            plain_label(raw_pn),
+                            plain_label(raw_ow),
+                            nid,
+                        ))
+                for u in n_updates:
+                    cur.execute(
+                        "UPDATE shop_notes SET note_text=?, person_name=?, owner=? WHERE id=?",
+                        u,
+                    )
+                    healed += 1
+            except Exception:
+                pass
+
             conn.commit()
             conn.close()
         except Exception:
@@ -4108,6 +4156,7 @@ BACKUP_DUMP_TABLES = (
     "payroll_records",
     "expenses",
     "shop_documents",
+    "shop_notes",
     "vagaro_pull_logs",
     "payout_tiers",
     "cash_month_locks",
@@ -4162,6 +4211,10 @@ def _friendly_user_action(action, table=None, row=None, record_id=None):
     if t == "shop_documents":
         title = plain_label(row.get("title") or "")
         return f"{verb} shop document {title}".strip()
+    if t == "shop_notes":
+        nt = plain_label(row.get("note_text") or "")
+        short_nt = (nt[:36] + "…") if len(nt) > 36 else nt
+        return f"{verb} note ({short_nt})".strip() if short_nt else f"{verb} shop note"
     if t.startswith("config_"):
         return f"{verb} setting {name or record_id or t}".strip()
     if t:
@@ -4868,7 +4921,7 @@ def restore_snapshot_dict(snapshot, source_name="backup"):
                     except Exception:
                         pass
                 # If main data table, remove rows in cloud that were deleted in this snapshot
-                if tbl_l in ("payroll_records", "employees", "expenses", "cash_envelopes"):
+                if tbl_l in ("payroll_records", "employees", "expenses", "cash_envelopes", "shop_notes"):
                     try:
                         pg_cur.execute(f"SELECT id FROM {tbl_l}")
                         cloud_ids = [r[0] for r in (pg_cur.fetchall() or []) if r and r[0] is not None]
@@ -5118,9 +5171,9 @@ def restart_app():
 def get_custom_update_server_url():
     """Retrieve the configured update server URL or return the default."""
     try:
-        conn = sqlite3.connect(TEMP_DB_PATH)
+        db_file = ensure_offline_cache_open() if (not TEMP_DB_PATH or TEMP_DB_PATH == SUPABASE_DB_SENTINEL) else str(TEMP_DB_PATH)
+        conn = _original_sqlite3_connect(db_file, timeout=5)
         cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("SELECT value FROM app_settings WHERE key IN ('update_server_url', 'github_raw_url') ORDER BY CASE WHEN key='update_server_url' THEN 0 ELSE 1 END")
         r = cur.fetchone()
         conn.close()
@@ -5151,9 +5204,9 @@ set_custom_github_raw_url = set_custom_update_server_url
 def get_update_auth_token():
     """Retrieve private cloud update access token if configured (from Supabase cloud_config or local DB)."""
     try:
-        conn = sqlite3.connect(TEMP_DB_PATH)
+        db_file = ensure_offline_cache_open() if (not TEMP_DB_PATH or TEMP_DB_PATH == SUPABASE_DB_SENTINEL) else str(TEMP_DB_PATH)
+        conn = _original_sqlite3_connect(db_file, timeout=5)
         cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT)")
         cur.execute("SELECT value FROM app_settings WHERE key = 'update_auth_token'")
         r = cur.fetchone()
         conn.close()
@@ -5168,13 +5221,13 @@ def get_update_auth_token():
         and not _SYNC_IN_PROGRESS
     ):
         try:
-            pg = get_shared_supabase_conn()
-            cur = pg.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS cloud_config (key TEXT PRIMARY KEY, value TEXT)")
-            cur.execute("SELECT value FROM cloud_config WHERE key = 'update_auth_token'")
-            row = cur.fetchone()
-            if row and row[0] and str(row[0]).strip():
-                return str(row[0]).strip()
+            with _SUPABASE_LOCK:
+                pg = get_shared_supabase_conn()
+                cur = pg.cursor()
+                cur.execute("SELECT value FROM cloud_config WHERE key = 'update_auth_token'")
+                row = cur.fetchone()
+                if row and row[0] and str(row[0]).strip():
+                    return str(row[0]).strip()
         except Exception:
             pass
     return os.environ.get("UPDATE_AUTH_TOKEN") or ""
@@ -5194,11 +5247,12 @@ def set_update_auth_token(token_str, sync_to_cloud=True):
         pass
     if sync_to_cloud and get_db_mode() == "supabase" and not is_supabase_offline():
         try:
-            pg = get_shared_supabase_conn()
-            cur = pg.cursor()
-            cur.execute("CREATE TABLE IF NOT EXISTS cloud_config (key TEXT PRIMARY KEY, value TEXT)")
-            cur.execute("INSERT INTO cloud_config (key, value) VALUES ('update_auth_token', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (tok,))
-            pg.commit()
+            with _SUPABASE_LOCK:
+                pg = get_shared_supabase_conn()
+                cur = pg.cursor()
+                cur.execute("CREATE TABLE IF NOT EXISTS cloud_config (key TEXT PRIMARY KEY, value TEXT)")
+                cur.execute("INSERT INTO cloud_config (key, value) VALUES ('update_auth_token', %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", (tok,))
+                pg.commit()
         except Exception:
             pass
 
@@ -5234,9 +5288,9 @@ def get_supabase_system_config(key, default=None):
     """
     local_val = None
     try:
-        conn = sqlite3.connect(TEMP_DB_PATH)
+        db_file = ensure_offline_cache_open() if (not TEMP_DB_PATH or TEMP_DB_PATH == SUPABASE_DB_SENTINEL) else str(TEMP_DB_PATH)
+        conn = _original_sqlite3_connect(db_file, timeout=5)
         cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
         cur.execute("SELECT value FROM app_system_config WHERE key=?", (key,))
         row = cur.fetchone()
         if row and row[0] is not None:
@@ -5252,21 +5306,24 @@ def get_supabase_system_config(key, default=None):
         and not _SYNC_IN_PROGRESS
     ):
         try:
-            pg = get_shared_supabase_conn(timeout=4)
-            cur = pg.cursor()
-            cur.execute("SELECT value FROM app_system_config WHERE key = ?", (key,))
-            row = cur.fetchone()
+            with _SUPABASE_LOCK:
+                pg = get_shared_supabase_conn(timeout=4)
+                cur = pg.cursor()
+                cur.execute("SELECT value FROM app_system_config WHERE key = ?", (key,))
+                row = cur.fetchone()
             if row and row[0] is not None:
                 cloud_val = str(row[0]).strip()
-                try:
-                    c2 = sqlite3.connect(TEMP_DB_PATH)
-                    cur2 = c2.cursor()
-                    cur2.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
-                    cur2.execute("INSERT OR REPLACE INTO app_system_config (key, value) VALUES (?, ?)", (key, cloud_val))
-                    c2.commit()
-                    c2.close()
-                except Exception:
-                    pass
+                if cloud_val != local_val:
+                    try:
+                        db_file = ensure_offline_cache_open() if (not TEMP_DB_PATH or TEMP_DB_PATH == SUPABASE_DB_SENTINEL) else str(TEMP_DB_PATH)
+                        c2 = _original_sqlite3_connect(db_file, timeout=5)
+                        cur2 = c2.cursor()
+                        cur2.execute("CREATE TABLE IF NOT EXISTS app_system_config (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT, updated_by TEXT)")
+                        cur2.execute("INSERT OR REPLACE INTO app_system_config (key, value) VALUES (?, ?)", (key, cloud_val))
+                        c2.commit()
+                        c2.close()
+                    except Exception:
+                        pass
                 return cloud_val
         except Exception:
             pass
@@ -5296,15 +5353,16 @@ def set_supabase_system_config(key, value, user_name="admin"):
     if get_db_mode() == "supabase" and not is_supabase_offline():
         try:
             import pg8000
-            pg = get_shared_supabase_conn(timeout=10)
-            with pg.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO app_system_config (key, value, updated_at, updated_by)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (key) DO UPDATE
-                    SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
-                """, (key, str(value), now_str, user_name))
-                pg.commit()
+            with _SUPABASE_LOCK:
+                pg = get_shared_supabase_conn(timeout=10)
+                with pg.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO app_system_config (key, value, updated_at, updated_by)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (key) DO UPDATE
+                        SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
+                    """, (key, str(value), now_str, user_name))
+                    pg.commit()
             return True, "Configuration saved to central database successfully."
         except Exception as e:
             return False, f"Failed to save to central database: {e}"
@@ -5358,41 +5416,55 @@ def _urlopen_with_fallback(req, timeout=12):
 def _resolve_realtime_update_url(url, auth_token=None):
     """
     If the update URL points to a GitHub repository raw file, resolves the latest
-    commit SHA via the GitHub commits Atom feed or GitHub API so the request bypasses
-    Fastly/GitHub CDN's 5-minute (300-second) raw caching window completely.
+    commit SHA via the GitHub REST API first (real-time, uncached) with fallback to
+    the GitHub commits Atom feed so the request bypasses Fastly/GitHub CDN's 5-minute
+    (300-second) raw caching window completely.
     """
-    import re, time, urllib.request
+    import re, time, json, urllib.request
     m = re.match(r'^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.*)$', str(url).strip())
     if not m:
         return url, ""
     owner, repo, branch, path = m.groups()
     sha = ""
 
-    # 1. Try GitHub commits Atom feed (instant, unauthenticated, never cached by CDN)
-    try:
-        atom_url = f"https://github.com/{owner}/{repo}/commits/{branch}.atom?_cb={int(time.time())}"
-        headers = {"User-Agent": "PayrollApp-Updater/2.5", "Cache-Control": "no-cache", "Pragma": "no-cache"}
-        req = urllib.request.Request(atom_url, headers=headers)
-        with _urlopen_with_fallback(req, timeout=5) as resp:
-            text = resp.read().decode("utf-8", errors="ignore")
-            shas = re.findall(r'/commit/([a-f0-9]{40})', text)
-            if shas:
-                sha = shas[0]
-    except Exception:
-        pass
+    # 1. Try GitHub REST API first (real-time commit SHA immediately after git push, never delayed by Atom web cache)
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}?_cb={int(time.time() * 1000)}"
+    base_headers = {
+        "User-Agent": "PayrollApp-Updater/2.5",
+        "Accept": "application/vnd.github.v3+json",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+    }
+    header_attempts = []
+    if auth_token:
+        h_auth = dict(base_headers)
+        h_auth["Authorization"] = f"token {auth_token}"
+        header_attempts.append(h_auth)
+    header_attempts.append(base_headers)
 
-    # 2. Try GitHub API fallback if Atom feed did not yield a SHA
+    for hdrs in header_attempts:
+        try:
+            req = urllib.request.Request(api_url, headers=hdrs)
+            with _urlopen_with_fallback(req, timeout=5) as resp:
+                d = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                cand = str(d.get("sha") or "").strip()
+                if len(cand) == 40:
+                    sha = cand
+                    break
+        except Exception:
+            continue
+
+    # 2. Try GitHub commits Atom feed fallback if REST API did not yield a SHA (e.g. rate-limited)
     if not sha:
         try:
-            api_url = f"https://api.github.com/repos/{owner}/{repo}/commits/{branch}"
-            headers = {"User-Agent": "PayrollApp-Updater/2.5", "Cache-Control": "no-cache", "Pragma": "no-cache"}
-            if auth_token:
-                headers["Authorization"] = f"token {auth_token}"
-            req = urllib.request.Request(api_url, headers=headers)
+            atom_url = f"https://github.com/{owner}/{repo}/commits/{branch}.atom?_cb={int(time.time() * 1000)}"
+            headers = {"User-Agent": "PayrollApp-Updater/2.5", "Cache-Control": "no-cache, no-store", "Pragma": "no-cache"}
+            req = urllib.request.Request(atom_url, headers=headers)
             with _urlopen_with_fallback(req, timeout=5) as resp:
-                import json
-                d = json.loads(resp.read().decode("utf-8"))
-                sha = d.get("sha", "")
+                text = resp.read().decode("utf-8", errors="ignore")
+                shas = re.findall(r'/commit/([a-f0-9]{40})', text)
+                if shas:
+                    sha = shas[0]
         except Exception:
             pass
 
@@ -5487,26 +5559,40 @@ def check_for_cloud_update():
     """
     url = get_custom_update_server_url()
     token = get_update_auth_token()
-    import time, urllib.request
+    import time, urllib.request, re
 
     # Bypass CDN cache by resolving real-time commit SHA when using GitHub + always add timestamp cache-buster
     req_url, resolved_sha = _resolve_realtime_update_url(url, auth_token=token)
     sep = "&" if "?" in req_url else "?"
     req_url = f"{req_url}{sep}_cb={int(time.time() * 1000)}"
 
-    headers = {
+    base_headers = {
         "User-Agent": "PayrollApp-Updater/2.5",
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
         "Expires": "0",
     }
-    if token:
-        headers["Authorization"] = f"token {token}"
-    req = urllib.request.Request(req_url, headers=headers)
+
+    def _fetch_url_bytes(target_u):
+        attempts = []
+        if token:
+            h_auth = dict(base_headers)
+            h_auth["Authorization"] = f"token {token}"
+            attempts.append(h_auth)
+        attempts.append(base_headers)
+        last_exc = None
+        for hdrs in attempts:
+            try:
+                r_obj = urllib.request.Request(target_u, headers=hdrs)
+                with _urlopen_with_fallback(r_obj, timeout=12) as resp:
+                    return resp.read()
+            except Exception as ex:
+                last_exc = ex
+        raise last_exc
+
     try:
-        with _urlopen_with_fallback(req, timeout=12) as resp:
-            raw_bytes = resp.read()
-            remote_code = raw_bytes.decode("utf-8", errors="replace")
+        raw_bytes = _fetch_url_bytes(req_url)
+        remote_code = raw_bytes.decode("utf-8", errors="replace")
     except Exception as e:
         err_str = str(e)
         if "404" in err_str:
@@ -5519,18 +5605,33 @@ def check_for_cloud_update():
             clean_err = f"Could not connect to update service: {err_str}"
         return "error", {"error": clean_err}
 
-    remote_hash = hashlib.sha256(raw_bytes).hexdigest()
-    remote_norm_hash = hashlib.sha256(raw_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
-
     local_info = get_active_code_info()
     running_version = local_info.get("running_version") or APP_VERSION
     running_norm_hash = local_info.get("norm_hash") or ""
     disk_version = local_info.get("disk_version") or running_version
     disk_norm_hash = local_info.get("disk_norm_hash") or running_norm_hash
 
-    import re
     m_ver = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', remote_code)
     remote_version = m_ver.group(1) if m_ver else running_version
+
+    # If the primary URL returned a version <= running_version, also check the direct raw branch URL
+    # in case an intermediate endpoint was momentarily behind by a few seconds.
+    if _parse_version_tuple(remote_version) <= _parse_version_tuple(running_version) and resolved_sha:
+        try:
+            alt_sep = "&" if "?" in url else "?"
+            alt_url = f"{url}{alt_sep}_cb={int(time.time() * 1000)}"
+            alt_bytes = _fetch_url_bytes(alt_url)
+            alt_code = alt_bytes.decode("utf-8", errors="replace")
+            m_alt_ver = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', alt_code)
+            if m_alt_ver and _parse_version_tuple(m_alt_ver.group(1)) > _parse_version_tuple(remote_version):
+                raw_bytes = alt_bytes
+                remote_code = alt_code
+                remote_version = m_alt_ver.group(1)
+        except Exception:
+            pass
+
+    remote_hash = hashlib.sha256(raw_bytes).hexdigest()
+    remote_norm_hash = hashlib.sha256(raw_bytes.replace(b"\r\n", b"\n").strip()).hexdigest()
 
     m_date = re.search(r'APP_BUILD_DATE\s*=\s*["\']([^"\']+)["\']', remote_code)
     remote_build_date = m_date.group(1) if m_date else ""
@@ -5763,6 +5864,12 @@ def _check_and_run_dynamic_update():
             code_str = f.read()
         if len(code_str.strip()) < 500:
             return False
+        m_dyn_ver = re.search(r'APP_VERSION\s*=\s*["\']([^"\']+)["\']', code_str)
+        if m_dyn_ver:
+            dyn_ver = m_dyn_ver.group(1)
+            if _parse_version_tuple(dyn_ver) <= _parse_version_tuple(APP_VERSION):
+                # Built-in script/binary is already as new or newer than the cached update file
+                return False
         compile(code_str, update_file, "exec")
     except Exception as e:
         try:
@@ -6037,7 +6144,7 @@ class OfflineTrackingCursor:
         self._cur.execute(query, params)
         q = (query or "").strip()
         qu = q.upper()
-        if self._wrapper is not None and not qu.startswith(("SELECT", "PRAGMA")):
+        if self._wrapper is not None and not qu.startswith(("SELECT", "PRAGMA", "CREATE TABLE IF NOT EXISTS", "CREATE INDEX IF NOT EXISTS")):
             self._wrapper._dirty = True
         try:
             if qu.startswith("INSERT"):
@@ -6103,7 +6210,7 @@ class OfflineTrackingCursor:
                     return self
                 lid = self._lastrowid or self._cur.lastrowid
                 if lid:
-                    if table.lower() in ("expenses", "payroll_records", "shop_documents"):
+                    if table.lower() in ("expenses", "payroll_records", "shop_documents", "shop_notes"):
                         try:
                             cur_owner = _session_user_name()
                             self._cur.execute(
@@ -6317,7 +6424,7 @@ def _pg_inserted_id(pg_cur, row):
 def _cloud_insert_row(pg_cur, table, row):
     """Insert a new row. Never overwrite an existing cloud id (avoids wiping other PCs).
 
-    Returns the cloud id used. For payroll_records and expenses, an id clash with the *same*
+    Returns the cloud id used. For payroll_records, expenses, and shop_notes, an id clash with the *same*
     logical row is treated as already uploaded — we do not insert a second copy.
     """
     if not row:
@@ -6326,7 +6433,7 @@ def _cloud_insert_row(pg_cur, table, row):
     last_err = None
     popped_id = False
     table_l = str(table or "").lower()
-    if not popped_id and row.get("id") is not None and table_l in ("payroll_records", "expenses"):
+    if not popped_id and row.get("id") is not None and table_l in ("payroll_records", "expenses", "shop_notes"):
         try:
             pg_cur.execute(f"SELECT * FROM {table} WHERE id = ?", (row["id"],))
             found = pg_cur.fetchone()
@@ -6337,6 +6444,8 @@ def _cloud_insert_row(pg_cur, table, row):
                 if table_l == "payroll_records" and _payroll_identity(existing) == _payroll_identity(row):
                     return row["id"]
                 if table_l == "expenses" and _expense_identity(existing) == _expense_identity(row):
+                    return row["id"]
+                if table_l == "shop_notes" and _shop_note_identity(existing) == _shop_note_identity(row):
                     return row["id"]
                 row.pop("id", None)
                 popped_id = True
@@ -6388,6 +6497,21 @@ def _cloud_insert_row(pg_cur, table, row):
                                 "description": found[5],
                             }
                             if _expense_identity(existing) == _expense_identity(row):
+                                return row["id"]
+                    except Exception:
+                        pass
+                elif table_l == "shop_notes":
+                    try:
+                        pg_cur.execute(
+                            "SELECT * FROM shop_notes WHERE id = ?",
+                            (row["id"],),
+                        )
+                        found = pg_cur.fetchone()
+                        desc = pg_cur.description
+                        if found and desc:
+                            cols = [d[0] for d in desc]
+                            existing = {cols[i]: found[i] for i in range(min(len(cols), len(found)))}
+                            if _shop_note_identity(existing) == _shop_note_identity(row):
                                 return row["id"]
                     except Exception:
                         pass
@@ -6569,7 +6693,7 @@ def _apply_offline_payload(pg_cur, payload, col_cache):
                         orig_id is not None
                         and new_id is not None
                         and int(orig_id) != int(new_id)
-                        and str(table or "").lower() in ("payroll_records", "expenses")
+                        and str(table or "").lower() in ("payroll_records", "expenses", "shop_notes")
                     ):
                         remap = (str(table).lower(), int(orig_id), int(new_id))
                 except Exception:
@@ -6581,7 +6705,7 @@ def _apply_offline_payload(pg_cur, payload, col_cache):
                         orig_id is not None
                         and new_id is not None
                         and int(orig_id) != int(new_id)
-                        and str(table or "").lower() in ("payroll_records", "expenses")
+                        and str(table or "").lower() in ("payroll_records", "expenses", "shop_notes")
                     ):
                         remap = (str(table).lower(), int(orig_id), int(new_id))
                 except Exception:
@@ -6721,7 +6845,7 @@ def flush_offline_queue_to_cloud():
             with _SUPABASE_LOCK:
                 try:
                     raw = pg_proxy.conn.cursor()
-                    for tbl in ("employees", "payroll_records", "expenses", "shop_documents", "payout_tiers"):
+                    for tbl in ("employees", "payroll_records", "expenses", "shop_documents", "shop_notes", "payout_tiers"):
                         try:
                             raw.execute(
                                 f"SELECT setval(pg_get_serial_sequence('{tbl}', 'id'), "
@@ -6874,6 +6998,22 @@ def _money_key(val):
     return round(to_float(decrypt_val(val) if val is not None else 0, 0.0), 2)
 
 
+def _shop_note_identity(rec):
+    """Logical fingerprint so the same shop note is not uploaded twice."""
+    if not rec:
+        return None
+    dt_raw = rec.get("note_date")
+    dt_plain = plain_label(dt_raw) if dt_raw is not None else ""
+    dt_s = normalize_iso_date(dt_plain) or str(dt_plain or "")[:10]
+    return (
+        dt_s,
+        plain_label(rec.get("cycle_key") or "").strip().lower(),
+        plain_label(rec.get("owner") or "").strip().lower(),
+        plain_label(rec.get("note_text") or "").strip().lower(),
+        plain_label(rec.get("created_at") or "").strip(),
+    )
+
+
 def _payroll_identity(rec):
     """Logical fingerprint so the same shop-earnings row is not uploaded twice."""
     if not rec:
@@ -6992,6 +7132,7 @@ def backfill_local_rows_missing_from_cloud():
         cloud_expense_keys = set()
         cloud_envelope_keys = set()
         cloud_payroll_keys = set()
+        cloud_note_keys = set()
         try:
             pg_cur.execute(
                 "SELECT id, expense_date, category, location, amount, description FROM expenses"
@@ -7027,8 +7168,18 @@ def backfill_local_rows_missing_from_cloud():
                 cloud_payroll_keys.add(_payroll_identity(prec))
         except Exception:
             cloud_payroll_keys = set()
+        try:
+            pg_cur.execute("SELECT * FROM shop_notes")
+            nrow = pg_cur.fetchall() or []
+            ndesc = pg_cur.description
+            ncols = [d[0] for d in ndesc] if ndesc else []
+            for r in nrow:
+                nrec = {ncols[i]: r[i] for i in range(min(len(ncols), len(r)))}
+                cloud_note_keys.add(_shop_note_identity(nrec))
+        except Exception:
+            cloud_note_keys = set()
 
-        for table in ("employees", "payroll_records", "expenses", "shop_documents"):
+        for table in ("employees", "payroll_records", "expenses", "shop_documents", "shop_notes"):
             queued_ids = _queued_row_ids_for_table(lcur, table)
             try:
                 if table == "expenses":
@@ -7080,6 +7231,14 @@ def backfill_local_rows_missing_from_cloud():
                     else:
                         if ekey in cloud_expense_keys:
                             continue
+                    payload_row = dict(rec)
+                    _queue_offline_op({"op": "insert", "table": table, "row": payload_row}, lite)
+                    queued_ids.add(rid_i)
+                    queued += 1
+                    continue
+                if table == "shop_notes":
+                    if _shop_note_identity(rec) in cloud_note_keys:
+                        continue
                     payload_row = dict(rec)
                     _queue_offline_op({"op": "insert", "table": table, "row": payload_row}, lite)
                     queued_ids.add(rid_i)
@@ -7295,7 +7454,7 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
 
     unsynced_snaps = []
     local_row_by_id = {}
-    if tbl in ("expenses", "payroll_records"):
+    if tbl in ("expenses", "payroll_records", "shop_notes"):
         try:
             lcur.execute(f"SELECT {col_list} FROM {tbl}")
             for row in lcur.fetchall() or []:
@@ -7309,7 +7468,14 @@ def _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed_rows):
 
     cloud_ids = set()
     cloud_identities = set()
-    identity_fn = _expense_identity if tbl == "expenses" else (_payroll_identity if tbl == "payroll_records" else None)
+    if tbl == "expenses":
+        identity_fn = _expense_identity
+    elif tbl == "payroll_records":
+        identity_fn = _payroll_identity
+    elif tbl == "shop_notes":
+        identity_fn = _shop_note_identity
+    else:
+        identity_fn = None
     for row in packed_rows or []:
         rid = _row_id_value(use_cols, row)
         if rid is not None:
@@ -7948,6 +8114,23 @@ def _get_cloud_table_digest(pg_cur, tbl):
                 )
                 r = raw_cur.fetchone()
                 res = ("shop_documents", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+            elif tbl == "shop_notes":
+                raw_cur.execute(
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
+                    "COALESCE(SUM(CAST(hashtext("
+                    "COALESCE(CAST(note_date AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(cycle_key AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(note_text AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(owner AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(employee_id AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(person_name AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(created_at AS TEXT), '') || '|' || "
+                    "COALESCE(CAST(updated_at AS TEXT), '')"
+                    ") AS BIGINT)), 0) "
+                    "FROM shop_notes"
+                )
+                r = raw_cur.fetchone()
+                res = ("shop_notes", int(r[0] or 0), int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
             elif tbl == "employees":
                 raw_cur.execute(
                     "SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0), "
@@ -8035,7 +8218,7 @@ def _get_cloud_table_digest(pg_cur, tbl):
                     pass
                 fallback_res = None
                 try:
-                    if tbl in ("expenses", "payroll_records", "shop_documents", "employees", "payout_tiers"):
+                    if tbl in ("expenses", "payroll_records", "shop_documents", "shop_notes", "employees", "payout_tiers"):
                         raw_cur.execute(f"SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(id), 0) FROM {tbl}")
                         r = raw_cur.fetchone()
                         fallback_res = (tbl, int(r[0] or 0), int(r[1] or 0), int(r[2] or 0))
@@ -8109,7 +8292,7 @@ def refresh_offline_cache_from_cloud(force_full=False):
                     # Protect large local tables against an unexpected blank SELECT, while allowing
                     # legitimate 0-row states (e.g. unlocking the last cash_month_lock) to sync.
                     if not packed and local_count > 0:
-                        if tbl in ("cash_month_locks", "vagaro_pull_logs", "shop_documents", "payout_tiers"):
+                        if tbl in ("cash_month_locks", "vagaro_pull_logs", "shop_documents", "shop_notes", "payout_tiers"):
                             if cloud_count != 0:
                                 continue
                         elif tbl in ("expenses", "payroll_records", "employees", "users"):
@@ -8121,7 +8304,7 @@ def refresh_offline_cache_from_cloud(force_full=False):
                     sp = f"sp_pull_{tbl}"
                     lcur.execute(f"SAVEPOINT {sp}")
                     try:
-                        if tbl in ("expenses", "payroll_records"):
+                        if tbl in ("expenses", "payroll_records", "shop_notes"):
                             _merge_cloud_rows_into_local(lcur, tbl, use_cols, packed)
                         elif tbl == "users":
                             _merge_users_table_preserve_custom_passwords(lcur, pg_cur, use_cols, packed)
@@ -8169,12 +8352,13 @@ def refresh_offline_cache_from_cloud(force_full=False):
                 for (payload_raw,) in pending:
                     try:
                         payload = json.loads(payload_raw)
-                        # expenses/payroll are merged (not wiped). Replaying those
+                        # expenses/payroll/shop_notes are merged (not wiped). Replaying those
                         # queue items would DELETE the other PC's just-pulled row
                         # and put a local envelope/expense back on the same id.
                         if str(payload.get("table") or "").lower() in (
                             "expenses",
                             "payroll_records",
+                            "shop_notes",
                             "user_action_log",
                         ):
                             continue
@@ -8327,6 +8511,16 @@ def cloud_data_fingerprint():
         except Exception:
             docs = (0, 0)
 
+        notes_sig = 0
+        try:
+            cur.execute("SELECT id, note_date, cycle_key, note_text, owner, updated_at FROM shop_notes")
+            note_rows = cur.fetchall() or []
+            notes_meta = (len(note_rows), max((int(r[0] or 0) for r in note_rows), default=0))
+            for row in note_rows:
+                notes_sig = (notes_sig + hash(tuple(str(v) for v in row))) & 0x7FFFFFFF
+        except Exception:
+            notes_meta = (0, 0)
+
         tiers_sig = 0
         try:
             cur.execute("SELECT id, from_sales, to_sales, percentage, kind FROM payout_tiers")
@@ -8381,6 +8575,9 @@ def cloud_data_fingerprint():
             int(docs[0] or 0),
             int(docs[1] or 0),
             int(docs_sig),
+            int(notes_meta[0] or 0),
+            int(notes_meta[1] or 0),
+            int(notes_sig),
             int(tiers[0] or 0),
             int(tiers_sig),
             int(locs[0] or 0),
@@ -9704,6 +9901,19 @@ def ensure_all_supabase_tables(db_conn):
         )
         """,
         """
+        CREATE TABLE IF NOT EXISTS shop_notes (
+            id SERIAL PRIMARY KEY,
+            note_date TEXT,
+            cycle_key TEXT,
+            note_text TEXT,
+            owner TEXT DEFAULT '',
+            employee_id INTEGER,
+            person_name TEXT DEFAULT '',
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS payout_tiers (
             id SERIAL PRIMARY KEY,
             from_sales TEXT,
@@ -9846,6 +10056,14 @@ def ensure_all_supabase_tables(db_conn):
         ("shop_documents", "file_type", "TEXT"),
         ("shop_documents", "filename", "TEXT"),
         ("shop_documents", "owner", "TEXT DEFAULT ''"),
+        ("shop_notes", "note_date", "TEXT"),
+        ("shop_notes", "cycle_key", "TEXT"),
+        ("shop_notes", "note_text", "TEXT"),
+        ("shop_notes", "owner", "TEXT DEFAULT ''"),
+        ("shop_notes", "employee_id", "INTEGER"),
+        ("shop_notes", "person_name", "TEXT DEFAULT ''"),
+        ("shop_notes", "created_at", "TEXT"),
+        ("shop_notes", "updated_at", "TEXT"),
     ]
     for tbl, col, col_type in col_migrations:
         try:
@@ -10021,6 +10239,7 @@ def upload_local_database_to_supabase(progress_cb=None):
                 "payroll_records",
                 "expenses",
                 "shop_documents",
+                "shop_notes",
                 "payout_tiers",
                 "cash_month_locks",
                 "vagaro_pull_logs",
@@ -10053,6 +10272,7 @@ def upload_local_database_to_supabase(progress_cb=None):
                 "payroll_records",
                 "expenses",
                 "shop_documents",
+                "shop_notes",
                 "payout_tiers",
                 "cash_month_locks",
                 "vagaro_pull_logs",
@@ -10326,6 +10546,9 @@ def migrate_supabase_encryption():
             ]),
             ("shop_documents", "id", [
                 "location", "title", "description",
+            ]),
+            ("shop_notes", "id", [
+                "note_text", "person_name",
             ]),
             ("config_locations", "name", ["name"]),
             ("config_categories", "name", ["name"]),
@@ -10786,6 +11009,47 @@ def _init_db_schema(cursor, seed=True):
     except Exception:
         pass
 
+    try:
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS shop_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                note_date TEXT,
+                cycle_key TEXT,
+                note_text TEXT,
+                owner TEXT DEFAULT '',
+                employee_id INTEGER,
+                person_name TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        _commit_step()
+    except Exception:
+        pass
+
+    _add_missing_columns(cursor, "shop_notes", [
+        ("note_date", "TEXT"),
+        ("cycle_key", "TEXT"),
+        ("note_text", "TEXT"),
+        ("owner", "TEXT DEFAULT ''"),
+        ("employee_id", "INTEGER"),
+        ("person_name", "TEXT DEFAULT ''"),
+        ("created_at", "TEXT"),
+        ("updated_at", "TEXT"),
+    ])
+    _commit_step()
+
+    try:
+        cursor.execute("SELECT id, note_date FROM shop_notes WHERE cycle_key IS NULL OR TRIM(cycle_key)=''")
+        for _n_id, _n_date in cursor.fetchall() or []:
+            if _n_date:
+                _ck = cycle_for_date(_n_date)
+                if _ck:
+                    cursor.execute("UPDATE shop_notes SET cycle_key=? WHERE id=?", (_ck, _n_id))
+        _commit_step()
+    except Exception:
+        pass
+
     # Repair encrypted-name leftovers / Shop dupes, then seed ONLY if empty.
     # Skip expensive repair on warm Supabase DBs that already have employees —
     # startup only needs schema + login users to be ready.
@@ -10801,7 +11065,7 @@ def _init_db_schema(cursor, seed=True):
     if get_db_mode() == "supabase" and not is_supabase_offline():
         all_pg_tables = [
             "users", "employees", "config_locations", "config_categories",
-            "config_payments", "payroll_records", "expenses", "shop_documents",
+            "config_payments", "payroll_records", "expenses", "shop_documents", "shop_notes",
             "payout_tiers", "cash_month_locks", "vagaro_pull_logs", "cloud_backups",
             "offline_sync_queue", "database_history_log", "app_system_config"
         ]
@@ -10946,10 +11210,10 @@ if HAS_DEPS:
                     sw = self.winfo_screenwidth()
                     sh = self.winfo_screenheight()
                     win_w = max(1120, min(sw - 20, 1440))
-                    win_h = max(740, min(sh - 75, 960))
+                    win_h = max(700, min(sh - 105, 920))
                     self.geometry(f"{win_w}x{win_h}+10+25")
                 except Exception:
-                    self.geometry("1180x760")
+                    self.geometry("1180x720")
             else:
                 try:
                     self.wm_attributes("-zoomed", True)
@@ -11409,6 +11673,33 @@ if HAS_DEPS:
 
         def _begin_startup_bootstrap(self):
             import threading
+
+            def _prefetch_update():
+                try:
+                    status, data = check_for_cloud_update()
+                    if status in ("update_available", "installed_pending_restart"):
+                        r_ver = data.get("remote_version", "Latest")
+                        self._update_detected_status = status
+                        self._update_detected_version = r_ver
+                        self._update_detected_data = data
+                        self._cached_bottom_remote_ver = r_ver
+                        self._cached_bottom_update_data = data
+                        def _notify_ui():
+                            try:
+                                if getattr(self, "is_logged_in", False):
+                                    self._render_main_update_banner(status, data)
+                                else:
+                                    self._render_login_update_banner(status, data)
+                            except Exception:
+                                pass
+                        self.after(0, _notify_ui)
+                except Exception:
+                    pass
+
+            try:
+                threading.Thread(target=_prefetch_update, daemon=True).start()
+            except Exception:
+                pass
 
             def work():
                 def _safe_after(cb):
@@ -12471,178 +12762,209 @@ if HAS_DEPS:
                 pass
             sys.exit(0)
 
+        def _render_login_update_banner(self, status, data):
+            """Renders the bright yellow update notification banner on the Login screen and bottom bar."""
+            try:
+                r_ver = (data or {}).get("remote_version", "Latest")
+                is_forced = bool((data or {}).get("is_forced", False))
+                local_info = get_active_code_info()
+                running_ver = local_info.get("running_version") or APP_VERSION
+
+                if status in ("update_available", "installed_pending_restart"):
+                    try:
+                        self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
+                    except Exception:
+                        pass
+
+                if not hasattr(self, "_login_upd_badge_frame") or not self._login_upd_badge_frame.winfo_exists():
+                    return
+
+                for child in self._login_upd_badge_frame.winfo_children():
+                    child.destroy()
+
+                if status == "update_available":
+                    def _do_quick_install():
+                        if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                            for c in self._login_upd_badge_frame.winfo_children():
+                                try:
+                                    c.configure(state="disabled")
+                                except Exception:
+                                    pass
+                        self.show_busy(self._tr(f"Installing update v{r_ver}…"))
+                        def _worker():
+                            ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
+                            def _done():
+                                self.hide_busy()
+                                if ok:
+                                    if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
+                                        self._login_upd_badge_frame.grid_remove()
+                                    ans = messagebox.askyesno(
+                                        "Update Installed Successfully 🎉",
+                                        f"Update v{r_ver} has been installed successfully!\n\n"
+                                        "To activate the new version, the app needs to restart:\n\n"
+                                        "• [Yes] = Restart app automatically now\n"
+                                        "• [No] = Close app cleanly (reopen manually)",
+                                        parent=self,
+                                    )
+                                    if ans:
+                                        restart_app()
+                                    else:
+                                        self.shutdown_app()
+                                else:
+                                    messagebox.showerror("Update Failed", msg, parent=self)
+                            self.after(0, _done)
+                        threading.Thread(target=_worker, daemon=True).start()
+
+                    if is_forced:
+                        self._mandatory_update_active = True
+                        self._mandatory_update_version = r_ver
+                        self._mandatory_update_data = data
+                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                            self.btn_login.config(state="disabled")
+                        if hasattr(self, "_login_status") and self._login_status.winfo_exists():
+                            self._login_status.config(
+                                text=f"⚠️ Login disabled: Mandatory update v{r_ver} required.",
+                                bootstyle="danger"
+                            )
+                        card = tb.Labelframe(self._login_upd_badge_frame, text=self._tr(" 🚨 CRITICAL UPDATE REQUIRED "), bootstyle="danger", padding=12)
+                        card.pack(fill=X)
+                        tb.Label(
+                            card,
+                            text=f"A mandatory software update (v{r_ver}) is required to communicate with the shared database.\n\n"
+                                 f"Your current version (v{running_ver}) is outdated and cannot safely connect.\n"
+                                 f"Please update now to continue.",
+                            font=("Segoe UI", 9, "bold"),
+                            bootstyle="danger",
+                            justify=CENTER,
+                            wraplength=340,
+                        ).pack(pady=(2, 8))
+                        tb.Button(
+                            card,
+                            text=f"🚀 Download & Install Update v{r_ver} Now",
+                            bootstyle="danger",
+                            cursor="hand2",
+                            command=_do_quick_install,
+                        ).pack(fill=X, pady=2)
+                        self._login_upd_badge_frame.grid()
+                    else:
+                        self._mandatory_update_active = False
+                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                            self.btn_login.config(state="normal")
+                        yel_box = tk.Frame(
+                            self._login_upd_badge_frame,
+                            bg="#fde047",
+                            highlightbackground="#ca8a04",
+                            highlightthickness=2,
+                            padx=10,
+                            pady=8,
+                        )
+                        yel_box.pack(fill=X, pady=(6, 0))
+                        tk.Label(
+                            yel_box,
+                            text=f"🔔 NEW UPDATE AVAILABLE (v{r_ver})",
+                            font=("Segoe UI", 9, "bold"),
+                            bg="#fde047",
+                            fg="#713f12",
+                        ).pack(anchor=CENTER, pady=(0, 4))
+                        btn = tk.Button(
+                            yel_box,
+                            text=f"✨ Update Available: v{r_ver} — Click to Install Now ✨",
+                            font=("Segoe UI", 10, "bold"),
+                            bg="#facc15",
+                            fg="#0f172a",
+                            activebackground="#eab308",
+                            activeforeground="#000000",
+                            relief="raised",
+                            bd=2,
+                            padx=12,
+                            pady=5,
+                            cursor="hand2",
+                            command=_do_quick_install,
+                        )
+                        btn.pack(fill=X)
+                        self._login_upd_badge_frame.grid()
+                elif status == "installed_pending_restart":
+                    if is_forced:
+                        self._mandatory_update_active = True
+                        self._mandatory_restart_required = True
+                        self._mandatory_update_version = r_ver
+                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                            self.btn_login.config(state="disabled")
+                        if hasattr(self, "_login_status") and self._login_status.winfo_exists():
+                            self._login_status.config(
+                                text=f"⚠️ Restart required: Update v{r_ver} is ready.",
+                                bootstyle="danger"
+                            )
+                        card = tb.Labelframe(self._login_upd_badge_frame, text=self._tr(" 🚨 RESTART REQUIRED TO ACTIVATE UPDATE "), bootstyle="danger", padding=12)
+                        card.pack(fill=X)
+                        tb.Label(
+                            card,
+                            text=f"Mandatory update v{r_ver} has been downloaded.\n\n"
+                                 f"You must restart the application to activate it before logging in.",
+                            font=("Segoe UI", 9, "bold"),
+                            bootstyle="danger",
+                            justify=CENTER,
+                            wraplength=340,
+                        ).pack(pady=(2, 8))
+                        tb.Button(
+                            card,
+                            text=f"🔄 Restart Application Now to Activate v{r_ver}",
+                            bootstyle="danger",
+                            cursor="hand2",
+                            command=restart_app,
+                        ).pack(fill=X, pady=2)
+                        self._login_upd_badge_frame.grid()
+                    else:
+                        self._mandatory_update_active = False
+                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                            self.btn_login.config(state="normal")
+                        yel_box = tk.Frame(
+                            self._login_upd_badge_frame,
+                            bg="#fde047",
+                            highlightbackground="#ca8a04",
+                            highlightthickness=2,
+                            padx=10,
+                            pady=8,
+                        )
+                        yel_box.pack(fill=X, pady=(6, 0))
+                        btn = tk.Button(
+                            yel_box,
+                            text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
+                            font=("Segoe UI", 10, "bold"),
+                            bg="#facc15",
+                            fg="#0f172a",
+                            activebackground="#eab308",
+                            activeforeground="#000000",
+                            relief="raised",
+                            bd=2,
+                            padx=12,
+                            pady=5,
+                            cursor="hand2",
+                            command=restart_app,
+                        )
+                        btn.pack(fill=X)
+                        self._login_upd_badge_frame.grid()
+                else:
+                    self._mandatory_update_active = False
+                    if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
+                        self.btn_login.config(state="normal")
+                    self._login_upd_badge_frame.grid_remove()
+            except Exception:
+                pass
+
         def _check_login_updates_bg(self):
             """Checks for cloud software updates in the background on startup and displays an install badge or mandatory update blocker."""
             def _bg():
                 try:
                     status, data = check_for_cloud_update()
                     r_ver = data.get("remote_version", "Latest")
-                    is_forced = bool(data.get("is_forced", False))
-                    min_req = data.get("min_required_version", "")
-                    local_info = get_active_code_info()
-                    running_ver = local_info.get("running_version") or APP_VERSION
-
-                    if status == "update_available":
+                    if status in ("update_available", "installed_pending_restart"):
+                        self._update_detected_status = status
                         self._update_detected_version = r_ver
                         self._update_detected_data = data
-                        def _show():
-                            try:
-                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
-                                    for child in self._login_upd_badge_frame.winfo_children():
-                                        child.destroy()
-
-                                    def _do_quick_install():
-                                        if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
-                                            for c in self._login_upd_badge_frame.winfo_children():
-                                                try:
-                                                    c.configure(state="disabled")
-                                                except Exception:
-                                                    pass
-                                        self.show_busy(self._tr(f"Installing update v{r_ver}…"))
-                                        def _worker():
-                                            ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
-                                            def _done():
-                                                self.hide_busy()
-                                                if ok:
-                                                    if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
-                                                        self._login_upd_badge_frame.grid_remove()
-                                                    ans = messagebox.askyesno(
-                                                        "Update Installed Successfully 🎉",
-                                                        f"Update v{r_ver} has been installed successfully!\n\n"
-                                                        "To activate the new version, the app needs to restart:\n\n"
-                                                        "• [Yes] = Restart app automatically now\n"
-                                                        "• [No] = Close app cleanly (reopen manually)",
-                                                        parent=self,
-                                                    )
-                                                    if ans:
-                                                        restart_app()
-                                                    else:
-                                                        self.shutdown_app()
-                                                else:
-                                                    messagebox.showerror("Update Failed", msg, parent=self)
-                                            self.after(0, _done)
-                                        threading.Thread(target=_worker, daemon=True).start()
-
-                                    if is_forced:
-                                        self._mandatory_update_active = True
-                                        self._mandatory_update_version = r_ver
-                                        self._mandatory_update_data = data
-                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
-                                            self.btn_login.config(state="disabled")
-                                        if hasattr(self, "_login_status") and self._login_status.winfo_exists():
-                                            self._login_status.config(
-                                                text=f"⚠️ Login disabled: Mandatory update v{r_ver} required.",
-                                                bootstyle="danger"
-                                            )
-                                        card = tb.Labelframe(self._login_upd_badge_frame, text=self._tr(" 🚨 CRITICAL UPDATE REQUIRED "), bootstyle="danger", padding=12)
-                                        card.pack(fill=X)
-                                        tb.Label(
-                                            card,
-                                            text=f"A mandatory software update (v{r_ver}) is required to communicate with the shared database.\n\n"
-                                                 f"Your current version (v{running_ver}) is outdated and cannot safely connect.\n"
-                                                 f"Please update now to continue.",
-                                            font=("Segoe UI", 9, "bold"),
-                                            bootstyle="danger",
-                                            justify=CENTER,
-                                            wraplength=340,
-                                        ).pack(pady=(2, 8))
-                                        tb.Button(
-                                            card,
-                                            text=f"🚀 Download & Install Update v{r_ver} Now",
-                                            bootstyle="danger",
-                                            cursor="hand2",
-                                            command=_do_quick_install,
-                                        ).pack(fill=X, pady=2)
-                                        self._login_upd_badge_frame.grid()
-                                    else:
-                                        self._mandatory_update_active = False
-                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
-                                            self.btn_login.config(state="normal")
-                                        btn = tb.Button(
-                                            self._login_upd_badge_frame,
-                                            text=f"✨ Update Available: v{r_ver} — Click to Install Now",
-                                            bootstyle="warning",
-                                            cursor="hand2",
-                                            command=_do_quick_install,
-                                        )
-                                        btn.pack(fill=X, pady=(6, 0))
-                                        self._login_upd_badge_frame.grid()
-                            except Exception:
-                                pass
-                        self.after(0, _show)
-                    elif status == "installed_pending_restart":
-                        self._update_detected_version = r_ver
-                        self._update_detected_data = data
-                        def _show_restart():
-                            try:
-                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
-                                    for child in self._login_upd_badge_frame.winfo_children():
-                                        child.destroy()
-                                    if is_forced:
-                                        self._mandatory_update_active = True
-                                        self._mandatory_restart_required = True
-                                        self._mandatory_update_version = r_ver
-                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
-                                            self.btn_login.config(state="disabled")
-                                        if hasattr(self, "_login_status") and self._login_status.winfo_exists():
-                                            self._login_status.config(
-                                                text=f"⚠️ Restart required: Update v{r_ver} is ready.",
-                                                bootstyle="danger"
-                                            )
-                                        card = tb.Labelframe(self._login_upd_badge_frame, text=self._tr(" 🚨 RESTART REQUIRED TO ACTIVATE UPDATE "), bootstyle="danger", padding=12)
-                                        card.pack(fill=X)
-                                        tb.Label(
-                                            card,
-                                            text=f"Mandatory update v{r_ver} has been downloaded.\n\n"
-                                                 f"You must restart the application to activate it before logging in.",
-                                            font=("Segoe UI", 9, "bold"),
-                                            bootstyle="danger",
-                                            justify=CENTER,
-                                            wraplength=340,
-                                        ).pack(pady=(2, 8))
-                                        tb.Button(
-                                            card,
-                                            text=f"🔄 Restart Application Now to Activate v{r_ver}",
-                                            bootstyle="danger",
-                                            cursor="hand2",
-                                            command=restart_app,
-                                        ).pack(fill=X, pady=2)
-                                        self._login_upd_badge_frame.grid()
-                                    else:
-                                        self._mandatory_update_active = False
-                                        if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
-                                            self.btn_login.config(state="normal")
-                                        btn = tb.Button(
-                                            self._login_upd_badge_frame,
-                                            text=f"✅ Update v{r_ver} Ready — Click to Restart Now",
-                                            bootstyle="success",
-                                            cursor="hand2",
-                                            command=restart_app,
-                                        )
-                                        btn.pack(fill=X, pady=(6, 0))
-                                        self._login_upd_badge_frame.grid()
-                            except Exception:
-                                pass
-                        self.after(0, _show_restart)
-                    else:
-                        def _hide():
-                            try:
-                                self._mandatory_update_active = False
-                                if hasattr(self, "btn_login") and self.btn_login.winfo_exists():
-                                    self.btn_login.config(state="normal")
-                                if hasattr(self, "_login_upd_badge_frame") and self._login_upd_badge_frame.winfo_exists():
-                                    self._login_upd_badge_frame.grid_remove()
-                            except Exception:
-                                pass
-                        self.after(0, _hide)
+                        self._cached_bottom_remote_ver = r_ver
+                        self._cached_bottom_update_data = data
+                    self.after(0, lambda s=status, d=data: self._render_login_update_banner(s, d))
                 except Exception:
                     pass
                 finally:
@@ -12655,119 +12977,156 @@ if HAS_DEPS:
                         pass
             threading.Thread(target=_bg, daemon=True).start()
 
+        def _pack_main_upd_banner_above_notebook(self):
+            """Packs self._main_upd_banner above self.notebook so self.notebook (expand=True) never squeezes it to 0px height."""
+            if not hasattr(self, "_main_upd_banner") or not self._main_upd_banner.winfo_exists():
+                return
+            nb = getattr(self, "notebook", None)
+            if nb is not None and self._widget_alive(nb):
+                try:
+                    self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0), before=nb)
+                    return
+                except Exception:
+                    pass
+            self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
+
+        def _render_main_update_banner(self, status, data):
+            """Renders the bright yellow update notification banner at the top and bottom of the Main Dashboard."""
+            try:
+                r_ver = (data or {}).get("remote_version", "Latest")
+                is_forced = bool((data or {}).get("is_forced", False))
+
+                if status in ("update_available", "installed_pending_restart"):
+                    try:
+                        self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
+                    except Exception:
+                        pass
+
+                if not hasattr(self, "_main_upd_banner") or not self._main_upd_banner.winfo_exists():
+                    return
+
+                for child in self._main_upd_banner.winfo_children():
+                    child.destroy()
+
+                if status == "update_available":
+                    yel_bar = tk.Frame(
+                        self._main_upd_banner,
+                        bg="#fde047",
+                        highlightbackground="#ca8a04",
+                        highlightthickness=2,
+                        padx=10,
+                        pady=6,
+                    )
+                    yel_bar.pack(fill=X)
+
+                    def _do_quick_install():
+                        btn.config(text=f"⏳ Installing v{r_ver}...", state="disabled")
+                        def _worker():
+                            ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
+                            def _done():
+                                if ok:
+                                    if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
+                                        self._main_upd_banner.pack_forget()
+                                    ans = messagebox.askyesno(
+                                        "Update Installed Successfully 🎉",
+                                        f"Update v{r_ver} has been installed successfully!\n\n"
+                                        "To activate the new version, the app needs to restart:\n\n"
+                                        "• [Yes] = Restart app automatically now\n"
+                                        "• [No] = Close app cleanly (reopen manually)",
+                                        parent=self,
+                                    )
+                                    if ans:
+                                        restart_app()
+                                    else:
+                                        self.shutdown_app()
+                                else:
+                                    btn.config(text=f"❌ Retry Installing v{r_ver}", state="normal")
+                                    messagebox.showerror("Update Failed", msg, parent=self)
+                            self.after(0, _done)
+                        threading.Thread(target=_worker, daemon=True).start()
+
+                    if is_forced:
+                        btn = tb.Button(
+                            yel_bar,
+                            text=f"🚨 CRITICAL DATABASE UPDATE REQUIRED: v{r_ver} — Click to Install & Restart Now",
+                            bootstyle="danger",
+                            cursor="hand2",
+                            command=_do_quick_install,
+                        )
+                        btn.pack(fill=X, pady=2)
+                        self._pack_main_upd_banner_above_notebook()
+                        if not getattr(self, "_mandatory_modal_shown", False):
+                            self._mandatory_modal_shown = True
+                            if messagebox.askyesno(
+                                "Critical Update Required 🚨",
+                                f"A mandatory software update (v{r_ver}) has been released for the shared database.\n\n"
+                                f"To prevent data corruption or communication errors, you must update now.\n\n"
+                                f"Would you like to install update v{r_ver} and restart immediately?",
+                                parent=self
+                            ):
+                                _do_quick_install()
+                    else:
+                        btn = tk.Button(
+                            yel_bar,
+                            text=f"✨ YELLOW UPDATE NOTIFICATION: Software Update v{r_ver} Available — Click to Install & Restart Now ✨",
+                            font=("Segoe UI", 10, "bold"),
+                            bg="#facc15",
+                            fg="#0f172a",
+                            activebackground="#eab308",
+                            activeforeground="#000000",
+                            relief="raised",
+                            bd=2,
+                            padx=14,
+                            pady=4,
+                            cursor="hand2",
+                            command=_do_quick_install,
+                        )
+                        btn.pack(fill=X)
+                        self._pack_main_upd_banner_above_notebook()
+                elif status == "installed_pending_restart":
+                    yel_bar = tk.Frame(
+                        self._main_upd_banner,
+                        bg="#fde047",
+                        highlightbackground="#ca8a04",
+                        highlightthickness=2,
+                        padx=10,
+                        pady=6,
+                    )
+                    yel_bar.pack(fill=X)
+                    btn_txt = f"🚨 Update v{r_ver} Ready — Must Restart Now" if is_forced else f"✅ Update v{r_ver} Ready — Click to Restart Now"
+                    btn = tk.Button(
+                        yel_bar,
+                        text=btn_txt,
+                        font=("Segoe UI", 10, "bold"),
+                        bg="#ef4444" if is_forced else "#facc15",
+                        fg="#ffffff" if is_forced else "#0f172a",
+                        relief="raised",
+                        bd=2,
+                        padx=14,
+                        pady=4,
+                        cursor="hand2",
+                        command=restart_app,
+                    )
+                    btn.pack(fill=X)
+                    self._pack_main_upd_banner_above_notebook()
+                else:
+                    self._main_upd_banner.pack_forget()
+            except Exception:
+                pass
+
         def _check_main_window_updates_bg(self):
             """Checks for software updates while inside the main dashboard and displays update banners or prompts."""
             def _bg():
                 try:
                     status, data = check_for_cloud_update()
                     r_ver = data.get("remote_version", "Latest")
-                    is_forced = bool(data.get("is_forced", False))
-                    if status == "update_available":
+                    if status in ("update_available", "installed_pending_restart"):
+                        self._update_detected_status = status
                         self._update_detected_version = r_ver
                         self._update_detected_data = data
-                        def _show():
-                            try:
-                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
-                                    for child in self._main_upd_banner.winfo_children():
-                                        child.destroy()
-                                    
-                                    def _do_quick_install():
-                                        btn.config(text=f"⏳ Installing v{r_ver}...", state="disabled")
-                                        def _worker():
-                                            ok, msg = install_cloud_update(data.get("remote_code"), data.get("remote_hash"))
-                                            def _done():
-                                                if ok:
-                                                    if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
-                                                        self._main_upd_banner.pack_forget()
-                                                    ans = messagebox.askyesno(
-                                                        "Update Installed Successfully 🎉",
-                                                        f"Update v{r_ver} has been installed successfully!\n\n"
-                                                        "To activate the new version, the app needs to restart:\n\n"
-                                                        "• [Yes] = Restart app automatically now\n"
-                                                        "• [No] = Close app cleanly (reopen manually)",
-                                                        parent=self,
-                                                    )
-                                                    if ans:
-                                                        restart_app()
-                                                    else:
-                                                        self.shutdown_app()
-                                                else:
-                                                    btn.config(text=f"❌ Retry Installing v{r_ver}", state="normal")
-                                                    messagebox.showerror("Update Failed", msg, parent=self)
-                                            self.after(0, _done)
-                                        threading.Thread(target=_worker, daemon=True).start()
-
-                                    if is_forced:
-                                        btn = tb.Button(
-                                            self._main_upd_banner,
-                                            text=f"🚨 CRITICAL DATABASE UPDATE REQUIRED: v{r_ver} — Click to Install & Restart Now",
-                                            bootstyle="danger",
-                                            cursor="hand2",
-                                            command=_do_quick_install,
-                                        )
-                                        btn.pack(fill=X, pady=4)
-                                        self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
-                                        if not getattr(self, "_mandatory_modal_shown", False):
-                                            self._mandatory_modal_shown = True
-                                            if messagebox.askyesno(
-                                                "Critical Update Required 🚨",
-                                                f"A mandatory software update (v{r_ver}) has been released for the shared database.\n\n"
-                                                f"To prevent data corruption or communication errors, you must update now.\n\n"
-                                                f"Would you like to install update v{r_ver} and restart immediately?",
-                                                parent=self
-                                            ):
-                                                _do_quick_install()
-                                    else:
-                                        btn = tb.Button(
-                                            self._main_upd_banner,
-                                            text=f"✨ Software Update Available: v{r_ver} — Click to Install & Restart Now",
-                                            bootstyle="warning",
-                                            cursor="hand2",
-                                            command=_do_quick_install,
-                                        )
-                                        btn.pack(fill=X, pady=4)
-                                        self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
-                            except Exception:
-                                pass
-                        self.after(0, _show)
-                    elif status == "installed_pending_restart":
-                        self._update_detected_version = r_ver
-                        self._update_detected_data = data
-                        def _show_restart():
-                            try:
-                                self.ensure_bottom_yellow_update_bar(force_show=True, remote_version=r_ver, update_data=data)
-                            except Exception:
-                                pass
-                            try:
-                                if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
-                                    for child in self._main_upd_banner.winfo_children():
-                                        child.destroy()
-                                    btn_style = "danger" if is_forced else "success"
-                                    btn_txt = f"🚨 Update v{r_ver} Ready — Must Restart Now" if is_forced else f"✅ Update v{r_ver} Ready — Click to Restart Now"
-                                    btn = tb.Button(
-                                        self._main_upd_banner,
-                                        text=btn_txt,
-                                        bootstyle=btn_style,
-                                        cursor="hand2",
-                                        command=restart_app,
-                                    )
-                                    btn.pack(fill=X, pady=4)
-                                    self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
-                            except Exception:
-                                pass
-                        self.after(0, _show_restart)
-                    else:
-                        def _hide():
-                            try:
-                                if hasattr(self, "_main_upd_banner") and self._main_upd_banner.winfo_exists():
-                                    self._main_upd_banner.pack_forget()
-                            except Exception:
-                                pass
-                        self.after(0, _hide)
+                        self._cached_bottom_remote_ver = r_ver
+                        self._cached_bottom_update_data = data
+                    self.after(0, lambda s=status, d=data: self._render_main_update_banner(s, d))
                 except Exception:
                     pass
                 finally:
@@ -12923,19 +13282,20 @@ if HAS_DEPS:
 
             # Automatic Update Notification Banner on Login Screen (Appears ONLY when update is available)
             self._login_upd_badge_frame = tb.Frame(frame)
-            self._login_upd_badge_frame.grid(row=7, column=0, columnspan=2, pady=(10, 0))
+            self._login_upd_badge_frame.grid(row=7, column=0, columnspan=2, pady=(10, 0), sticky=EW)
             self._login_upd_badge_frame.grid_remove()
-            self._check_login_updates_bg()
-            if (
-                getattr(self, "_db_error_update_needed", False)
-                or getattr(self, "_update_detected_version", None)
-                or getattr(self, "_cached_bottom_remote_ver", None)
-            ):
+            if getattr(self, "_update_detected_version", None) and getattr(self, "_update_detected_data", None):
+                self._render_login_update_banner(
+                    getattr(self, "_update_detected_status", "update_available"),
+                    getattr(self, "_update_detected_data", {}),
+                )
+            elif getattr(self, "_db_error_update_needed", False) or getattr(self, "_cached_bottom_remote_ver", None):
                 self.ensure_bottom_yellow_update_bar(
                     force_show=True,
                     remote_version=getattr(self, "_update_detected_version", None) or getattr(self, "_cached_bottom_remote_ver", None),
                     update_data=getattr(self, "_update_detected_data", None) or getattr(self, "_cached_bottom_update_data", None),
                 )
+            self._check_login_updates_bg()
 
             # Engine version & status indicator
             try:
@@ -14628,10 +14988,16 @@ if HAS_DEPS:
             
             # Dynamic Update Banner in Main Dashboard (Appears ONLY when update is available)
             self._main_upd_banner = tb.Frame(self)
-            self._main_upd_banner.pack(fill=X, side=TOP, padx=20, pady=(6, 0))
-            self._main_upd_banner.pack_forget()
-            self._check_main_window_updates_bg()
-            if (
+
+            self.notebook = tb.Notebook(self, bootstyle="info")
+            self.notebook.pack(fill=BOTH, expand=True, padx=20, pady=20)
+
+            if getattr(self, "_update_detected_version", None) and getattr(self, "_update_detected_data", None):
+                self._render_main_update_banner(
+                    getattr(self, "_update_detected_status", "update_available"),
+                    getattr(self, "_update_detected_data", {}),
+                )
+            elif (
                 getattr(self, "_db_error_update_needed", False)
                 or getattr(self, "_update_detected_version", None)
                 or getattr(self, "_cached_bottom_remote_ver", None)
@@ -14641,9 +15007,7 @@ if HAS_DEPS:
                     remote_version=getattr(self, "_update_detected_version", None) or getattr(self, "_cached_bottom_remote_ver", None),
                     update_data=getattr(self, "_update_detected_data", None) or getattr(self, "_cached_bottom_update_data", None),
                 )
-
-            self.notebook = tb.Notebook(self, bootstyle="info")
-            self.notebook.pack(fill=BOTH, expand=True, padx=20, pady=20)
+            self._check_main_window_updates_bg()
             
             self.tab_calendar = tb.Frame(self.notebook, padding=10)
             self.notebook.add(self.tab_calendar, text=self._tr("🟢 💈 Shop Earnings"))
@@ -15419,6 +15783,12 @@ if HAS_DEPS:
                 win = getattr(self, "expenses_win", None)
                 if self._widget_alive(win) and hasattr(self, "load_expenses_data"):
                     self.load_expenses_data(quiet=True)
+            except Exception:
+                pass
+            try:
+                nwin = getattr(self, "notes_win", None)
+                if self._widget_alive(nwin) and hasattr(self, "load_shop_notes_data"):
+                    self.load_shop_notes_data(quiet=True)
             except Exception:
                 pass
             if not full:
@@ -16758,12 +17128,661 @@ if HAS_DEPS:
 
             tb.Button(hdr_btns, text="🖨️ " + self._tr("Print / Save PDF"), bootstyle="success", cursor="hand2", command=_print_or_pdf_report).pack(side=LEFT, padx=4)
             tb.Button(hdr_btns, text="💾 " + self._tr("Export CSV / Excel"), bootstyle="info", cursor="hand2", command=_export_csv_excel).pack(side=LEFT, padx=4)
-            tb.Button(hdr_btns, text="🔒 " + self._tr("Lock Selected Cycles"), bootstyle="danger", cursor="hand2", command=_lock_selected_from_report).pack(side=LEFT, padx=4)
+            btn_lock_rep = tb.Button(hdr_btns, text="🔒 " + self._tr("Lock Selected Cycles"), bootstyle="danger", cursor="hand2", command=_lock_selected_from_report)
+            btn_lock_rep.pack_forget()
             tb.Button(hdr_btns, text="✕ " + self._tr("Close Window"), bootstyle="light", cursor="hand2", command=_close_rep).pack(side=LEFT, padx=(8, 0))
 
             cb_emp.bind("<<ComboboxSelected>>", lambda e: _refresh_report())
             _rebuild_cycle_checkboxes()
             _refresh_report()
+
+        def open_shop_notes_dialog(self, parent=None):
+            """Responsive Shop Notes Dialog (13" MacBook friendly) with auto-allocated cycle from Date,
+            pre-filled logged-in user, and live cloud sync.
+            (Connected-person columns employee_id & person_name exist in shop_notes DB for future use;
+             no person UI field is shown right now.)
+            """
+            existing_win = getattr(self, "notes_win", None)
+            if self._widget_alive(existing_win):
+                try:
+                    self._present_window(existing_win)
+                    existing_win.focus_set()
+                    self.load_shop_notes_data(quiet=True)
+                except Exception:
+                    pass
+                return
+
+            parent_win = parent if self._widget_alive(parent) else self
+            win = tb.Toplevel(parent_win)
+            self.notes_win = win
+            win.title("📝 " + self._tr("Shop Notes (Said / Done / Made)"))
+
+            # Responsive sizing for 13-inch MacBook (1280x800 / 1440x900)
+            try:
+                self.update_idletasks()
+                scr_w = self.winfo_screenwidth() or 1280
+                scr_h = self.winfo_screenheight() or 800
+                win_w = max(840, min(1060, int(scr_w * 0.80)))
+                win_h = max(560, min(720, int(scr_h * 0.82)))
+                x = max(20, (scr_w - win_w) // 2)
+                y = max(20, (scr_h - win_h) // 2 - 10)
+                win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+            except Exception:
+                win.geometry("960x650")
+            win.minsize(780, 520)
+
+            try:
+                win.transient(parent_win)
+            except Exception:
+                pass
+            self._present_window(win)
+            win.focus_set()
+
+            def _close_notes():
+                aid = getattr(self, "_poll_notes_date_after_id", None)
+                if aid is not None:
+                    try:
+                        win.after_cancel(aid)
+                    except Exception:
+                        pass
+                    self._poll_notes_date_after_id = None
+                self.notes_win = None
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+
+            win.protocol("WM_DELETE_WINDOW", _close_notes)
+
+            # Top Header Banner
+            hdr = tb.Frame(win, padding=(14, 10), bootstyle="primary")
+            hdr.pack(side=TOP, fill=X)
+            hdr_left = tb.Frame(hdr, bootstyle="primary")
+            hdr_left.pack(side=LEFT, fill=X, expand=True)
+            tb.Label(
+                hdr_left,
+                text="📝 " + self._tr("Shop Notes (Said / Done / Made)"),
+                font=("Segoe UI", 14, "bold"),
+                bootstyle="inverse-primary",
+            ).pack(anchor=W)
+            tb.Label(
+                hdr_left,
+                text=self._tr("Record what was said, done, or made — auto-allocated to its pay cycle and synced across all devices."),
+                font=("Segoe UI", 9),
+                bootstyle="inverse-primary",
+            ).pack(anchor=W)
+
+            hdr_right = tb.Frame(hdr, bootstyle="primary")
+            hdr_right.pack(side=RIGHT)
+            tb.Button(
+                hdr_right,
+                text="🔄 " + self._tr("Refresh"),
+                bootstyle="info",
+                cursor="hand2",
+                command=lambda: self.load_shop_notes_data(quiet=False),
+            ).pack(side=LEFT, padx=4)
+            tb.Button(
+                hdr_right,
+                text="✕ " + self._tr("Close"),
+                bootstyle="light",
+                cursor="hand2",
+                command=_close_notes,
+            ).pack(side=LEFT, padx=(4, 0))
+
+            # Main responsive container using grid so both entry and table scale on 13" MacBook
+            body = tb.Frame(win, padding=(12, 8))
+            body.pack(side=TOP, fill=BOTH, expand=True)
+            body.columnconfigure(0, weight=1)
+            body.rowconfigure(0, weight=0)
+            body.rowconfigure(1, weight=1)
+
+            # --- 1. Add / Edit Note Form Card ---
+            form_lf = tb.Labelframe(
+                body,
+                text="➕ " + self._tr("Add / Update Note"),
+                padding=(10, 8),
+                bootstyle="primary",
+            )
+            form_lf.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+            form_lf.columnconfigure(0, weight=1)
+
+            meta_row = tb.Frame(form_lf)
+            meta_row.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+            # Date field
+            tb.Label(meta_row, text=self._tr("Note Date:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
+            self.notes_date_entry = create_date_entry(meta_row, width=12, bootstyle="primary", startdate=datetime.today())
+            self.notes_date_entry.pack(side=LEFT, padx=(0, 14))
+
+            # Auto-Allocated Cycle display (read-only badge, calculated automatically from Note Date)
+            tb.Label(meta_row, text=self._tr("Auto-Allocated Cycle:"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(0, 6))
+            today_iso = datetime.today().strftime("%Y-%m-%d")
+            init_ck = cycle_for_date(today_iso)
+            self.notes_auto_cycle_key = init_ck
+            self.lbl_notes_auto_cycle = tb.Label(
+                meta_row,
+                text=cycle_label_with_year(init_ck) if init_ck else "—",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="info",
+            )
+            self.lbl_notes_auto_cycle.pack(side=LEFT, padx=(0, 16))
+
+            tb.Separator(meta_row, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=6)
+
+            # Added By (User) — pre-filled automatically as logged-in user
+            tb.Label(meta_row, text=self._tr("Added By (User):"), font=("Segoe UI", 10, "bold")).pack(side=LEFT, padx=(6, 6))
+            logged_in_user = str(getattr(self, "current_user", None) or _session_user_name() or DEFAULT_ADMIN_USERNAME).strip()
+            self.notes_user_var = tk.StringVar(value=logged_in_user)
+            self.ent_notes_user = tb.Entry(
+                meta_row,
+                textvariable=self.notes_user_var,
+                width=14,
+                state="readonly",
+                font=("Segoe UI", 10, "bold"),
+                bootstyle="secondary",
+            )
+            self.ent_notes_user.pack(side=LEFT, padx=(0, 8))
+
+            self.lbl_notes_edit_badge = tb.Label(
+                meta_row,
+                text="",
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="warning",
+            )
+            self.lbl_notes_edit_badge.pack(side=RIGHT, padx=4)
+
+            # Responsive Multi-Line Note Text Field + Action Buttons
+            text_row = tb.Frame(form_lf)
+            text_row.grid(row=1, column=0, sticky="ew")
+            text_row.columnconfigure(0, weight=1)
+            text_row.columnconfigure(1, weight=0)
+
+            txt_wrap = tb.Frame(text_row)
+            txt_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+            txt_wrap.columnconfigure(0, weight=1)
+            txt_wrap.rowconfigure(1, weight=1)
+
+            tb.Label(
+                txt_wrap,
+                text=self._tr("Note (What was said, done, or made):"),
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="secondary",
+            ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
+            self.txt_shop_note = tk.Text(
+                txt_wrap,
+                height=3,
+                wrap="word",
+                font=("Segoe UI", 11),
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=6,
+            )
+            self.txt_shop_note.grid(row=1, column=0, sticky="nsew")
+            txt_sb = tb.Scrollbar(txt_wrap, orient=VERTICAL, command=self.txt_shop_note.yview)
+            self.txt_shop_note.configure(yscrollcommand=txt_sb.set)
+            txt_sb.grid(row=1, column=1, sticky="ns")
+
+            btn_col = tb.Frame(text_row)
+            btn_col.grid(row=0, column=1, sticky="ns", pady=(18, 0))
+
+            self._editing_shop_note_id = None
+
+            def _update_auto_cycle_from_date(*_):
+                try:
+                    raw_d = self.notes_date_entry.entry.get().strip()
+                except Exception:
+                    raw_d = ""
+                norm_d = normalize_iso_date(raw_d)
+                ck = cycle_for_date(norm_d) if norm_d else None
+                self.notes_auto_cycle_key = ck
+                if self._widget_alive(self.lbl_notes_auto_cycle):
+                    self.lbl_notes_auto_cycle.config(
+                        text=cycle_label_with_year(ck) if ck else self._tr("Invalid Date"),
+                        bootstyle="info" if ck else "danger",
+                    )
+
+            try:
+                self.notes_date_entry.entry.bind("<KeyRelease>", _update_auto_cycle_from_date)
+                self.notes_date_entry.entry.bind("<FocusOut>", _update_auto_cycle_from_date)
+                self.notes_date_entry.entry.bind("<ButtonRelease-1>", _update_auto_cycle_from_date)
+            except Exception:
+                pass
+
+            # Lightweight poller while Notes window is open so picking a date from the popup calendar updates the cycle immediately
+            self._last_polled_note_date = ""
+
+            def _poll_note_date():
+                if not self._widget_alive(win):
+                    return
+                try:
+                    cur_d = self.notes_date_entry.entry.get().strip()
+                    if cur_d != self._last_polled_note_date:
+                        self._last_polled_note_date = cur_d
+                        _update_auto_cycle_from_date()
+                except Exception:
+                    pass
+                try:
+                    self._poll_notes_date_after_id = win.after(350, _poll_note_date)
+                except Exception:
+                    pass
+
+            _poll_note_date()
+
+            def _reset_note_form():
+                self._editing_shop_note_id = None
+                cur_u = str(getattr(self, "current_user", None) or _session_user_name() or DEFAULT_ADMIN_USERNAME).strip()
+                self.notes_user_var.set(cur_u)
+                try:
+                    self.notes_date_entry.entry.delete(0, tk.END)
+                    self.notes_date_entry.entry.insert(0, datetime.today().strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
+                _update_auto_cycle_from_date()
+                try:
+                    self.txt_shop_note.delete("1.0", tk.END)
+                except Exception:
+                    pass
+                if self._widget_alive(self.btn_save_shop_note):
+                    self.btn_save_shop_note.config(text="➕ " + self._tr("Save Note"), bootstyle="success")
+                if self._widget_alive(self.lbl_notes_edit_badge):
+                    self.lbl_notes_edit_badge.config(text="")
+
+            def _save_or_update_note():
+                try:
+                    raw_d = self.notes_date_entry.entry.get().strip()
+                except Exception:
+                    raw_d = ""
+                norm_d = normalize_iso_date(raw_d)
+                if not norm_d:
+                    messagebox.showwarning(
+                        self._tr("Invalid Date"),
+                        self._tr("Please enter a valid date (YYYY-MM-DD)."),
+                        parent=win,
+                    )
+                    return
+                auto_ck = cycle_for_date(norm_d)
+                note_body = self.txt_shop_note.get("1.0", tk.END).strip()
+                if not note_body:
+                    messagebox.showwarning(
+                        self._tr("Empty Note"),
+                        self._tr("Please enter a note before saving."),
+                        parent=win,
+                    )
+                    return
+
+                logged_user = str(getattr(self, "current_user", None) or _session_user_name() or DEFAULT_ADMIN_USERNAME).strip()
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                conn = sqlite3.connect(TEMP_DB_PATH)
+                cur = conn.cursor()
+                try:
+                    if self._editing_shop_note_id is not None:
+                        cur.execute(
+                            """
+                            UPDATE shop_notes
+                            SET note_date = ?, cycle_key = ?, note_text = ?, updated_at = ?
+                            WHERE id = ?
+                            """,
+                            (norm_d, auto_ck, note_body, now_ts, int(self._editing_shop_note_id)),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO shop_notes
+                            (note_date, cycle_key, note_text, owner, employee_id, person_name, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, NULL, '', ?, ?)
+                            """,
+                            (norm_d, auto_ck, note_body, logged_user, now_ts, now_ts),
+                        )
+                    commit_and_save(conn)
+                finally:
+                    conn.close()
+
+                try:
+                    schedule_cloud_push(0.2)
+                except Exception:
+                    pass
+
+                _reset_note_form()
+                self.load_shop_notes_data(quiet=True)
+
+            self.btn_save_shop_note = tb.Button(
+                btn_col,
+                text="➕ " + self._tr("Save Note"),
+                bootstyle="success",
+                width=16,
+                cursor="hand2",
+                command=_save_or_update_note,
+            )
+            self.btn_save_shop_note.pack(side=TOP, pady=(0, 4), ipady=2)
+
+            tb.Button(
+                btn_col,
+                text="🔄 " + self._tr("Clear / New"),
+                bootstyle="secondary-outline",
+                width=16,
+                cursor="hand2",
+                command=_reset_note_form,
+            ).pack(side=TOP, ipady=1)
+
+            # --- 2. Notes History, Filter & Full-Text Reader Card ---
+            list_lf = tb.Labelframe(
+                body,
+                text="📋 " + self._tr("Synced Shop Notes History"),
+                padding=(10, 8),
+                bootstyle="info",
+            )
+            list_lf.grid(row=1, column=0, sticky="nsew")
+            list_lf.columnconfigure(0, weight=1)
+            list_lf.rowconfigure(1, weight=1)
+            list_lf.rowconfigure(2, weight=0)
+
+            # Filter & Action Bar
+            flt_bar = tb.Frame(list_lf)
+            flt_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+
+            tb.Label(flt_bar, text=self._tr("Cycle:"), font=("Segoe UI", 9, "bold")).pack(side=LEFT, padx=(0, 4))
+            self.notes_cycle_filter = tb.Combobox(flt_bar, width=32, state="readonly", bootstyle="info")
+            self.notes_cycle_filter.pack(side=LEFT, padx=(0, 10))
+
+            tb.Label(flt_bar, text=self._tr("Added By:"), font=("Segoe UI", 9, "bold")).pack(side=LEFT, padx=(0, 4))
+            self.notes_user_filter = tb.Combobox(flt_bar, width=13, state="readonly", bootstyle="secondary")
+            self.notes_user_filter.set(self._tr("All"))
+            self.notes_user_filter.pack(side=LEFT, padx=(0, 10))
+
+            tb.Label(flt_bar, text="🔍", font=("Segoe UI", 10)).pack(side=LEFT, padx=(0, 3))
+            self.notes_search_var = tk.StringVar(value="")
+            ent_search = tb.Entry(flt_bar, textvariable=self.notes_search_var, width=18)
+            ent_search.pack(side=LEFT, padx=(0, 8))
+
+            def _edit_selected_note(*_):
+                sel = self.tree_shop_notes.selection()
+                if not sel:
+                    messagebox.showinfo(self._tr("Select Note"), self._tr("Please select a note to edit."), parent=win)
+                    return
+                rec = (getattr(self, "_shop_notes_by_iid", None) or {}).get(sel[0])
+                if not rec:
+                    return
+                self._editing_shop_note_id = rec["id"]
+                try:
+                    self.notes_date_entry.entry.delete(0, tk.END)
+                    self.notes_date_entry.entry.insert(0, rec["note_date"] or datetime.today().strftime("%Y-%m-%d"))
+                except Exception:
+                    pass
+                _update_auto_cycle_from_date()
+                self.notes_user_var.set(rec["owner"] or logged_in_user)
+                self.txt_shop_note.delete("1.0", tk.END)
+                self.txt_shop_note.insert("1.0", rec["note_text"] or "")
+                self.btn_save_shop_note.config(text="💾 " + self._tr("Update Note"), bootstyle="warning")
+                self.lbl_notes_edit_badge.config(text=f"✏️ {self._tr('Editing Note')} #{rec['id']}")
+                self.txt_shop_note.focus_set()
+
+            def _delete_selected_note():
+                sel = self.tree_shop_notes.selection()
+                if not sel:
+                    messagebox.showinfo(self._tr("Select Note"), self._tr("Please select a note to delete."), parent=win)
+                    return
+                ids_to_del = []
+                for iid in sel:
+                    rec = (getattr(self, "_shop_notes_by_iid", None) or {}).get(iid)
+                    if rec and rec.get("id") is not None:
+                        ids_to_del.append(int(rec["id"]))
+                if not ids_to_del:
+                    return
+                if not messagebox.askyesno(
+                    self._tr("Confirm Delete"),
+                    self._tr("Are you sure you want to delete the selected note(s)?"),
+                    parent=win,
+                ):
+                    return
+                conn = sqlite3.connect(TEMP_DB_PATH)
+                cur = conn.cursor()
+                try:
+                    for nid in ids_to_del:
+                        cur.execute("DELETE FROM shop_notes WHERE id = ?", (nid,))
+                    commit_and_save(conn)
+                finally:
+                    conn.close()
+                try:
+                    schedule_cloud_push(0.2)
+                except Exception:
+                    pass
+                if self._editing_shop_note_id in ids_to_del:
+                    _reset_note_form()
+                self.load_shop_notes_data(quiet=True)
+
+            tb.Button(
+                flt_bar,
+                text="🗑️ " + self._tr("Delete"),
+                bootstyle="danger",
+                cursor="hand2",
+                command=_delete_selected_note,
+            ).pack(side=RIGHT, padx=(4, 0))
+            tb.Button(
+                flt_bar,
+                text="✏️ " + self._tr("Edit"),
+                bootstyle="warning",
+                cursor="hand2",
+                command=_edit_selected_note,
+            ).pack(side=RIGHT, padx=4)
+
+            # Notes Table
+            tbl_wrap = tb.Frame(list_lf)
+            tbl_wrap.grid(row=1, column=0, sticky="nsew")
+            tbl_wrap.columnconfigure(0, weight=1)
+            tbl_wrap.rowconfigure(0, weight=1)
+
+            cols = ("ID", "Date", "Cycle", "Added By", "Note")
+            self.tree_shop_notes = tb.Treeview(
+                tbl_wrap,
+                columns=cols,
+                show="headings",
+                height=8,
+                bootstyle="primary",
+                selectmode="extended",
+            )
+            self.tree_shop_notes.heading("ID", text="ID")
+            self.tree_shop_notes.heading("Date", text=self._tr("Date"))
+            self.tree_shop_notes.heading("Cycle", text=self._tr("Auto-Allocated Cycle"))
+            self.tree_shop_notes.heading("Added By", text=self._tr("Added By (User)"))
+            self.tree_shop_notes.heading("Note", text=self._tr("Note (What was said, done, or made):"))
+
+            self.tree_shop_notes.column("ID", width=50, stretch=False, anchor=CENTER)
+            self.tree_shop_notes.column("Date", width=98, stretch=False, anchor=CENTER)
+            self.tree_shop_notes.column("Cycle", width=220, stretch=False, anchor=W)
+            self.tree_shop_notes.column("Added By", width=115, stretch=False, anchor=CENTER)
+            self.tree_shop_notes.column("Note", width=420, stretch=True, anchor=W)
+
+            self.tree_shop_notes.grid(row=0, column=0, sticky="nsew")
+            notes_sb = tb.Scrollbar(tbl_wrap, orient=VERTICAL, command=self.tree_shop_notes.yview)
+            self.tree_shop_notes.configure(yscrollcommand=notes_sb.set)
+            notes_sb.grid(row=0, column=1, sticky="ns")
+
+            # Full-Text Note Reader at Bottom (for comfortable reading on 13" MacBook)
+            reader_frame = tb.Frame(list_lf, padding=(0, 6, 0, 0))
+            reader_frame.grid(row=2, column=0, sticky="ew")
+            reader_frame.columnconfigure(0, weight=1)
+
+            self.lbl_note_reader_meta = tb.Label(
+                reader_frame,
+                text=self._tr("Select a note above to read its full text (Double-click to edit):"),
+                font=("Segoe UI", 9, "bold"),
+                bootstyle="secondary",
+            )
+            self.lbl_note_reader_meta.grid(row=0, column=0, sticky="w", pady=(0, 2))
+
+            self.txt_note_reader = tk.Text(
+                reader_frame,
+                height=3,
+                wrap="word",
+                font=("Segoe UI", 10),
+                relief="solid",
+                borderwidth=1,
+                padx=8,
+                pady=4,
+                state="disabled",
+            )
+            self.txt_note_reader.grid(row=1, column=0, sticky="ew")
+
+            def _on_select_note(*_):
+                sel = self.tree_shop_notes.selection()
+                rec = (getattr(self, "_shop_notes_by_iid", None) or {}).get(sel[0]) if sel else None
+                try:
+                    self.txt_note_reader.configure(state="normal")
+                    self.txt_note_reader.delete("1.0", tk.END)
+                    if rec:
+                        ck_lbl = cycle_label_with_year(rec["cycle_key"]) if rec["cycle_key"] else ""
+                        self.lbl_note_reader_meta.config(
+                            text=f"📅 {rec['note_date']}  |  🔄 {ck_lbl}  |  👤 {self._tr('Added By')}: {rec['owner']}"
+                        )
+                        self.txt_note_reader.insert("1.0", rec["note_text"] or "")
+                    else:
+                        self.lbl_note_reader_meta.config(
+                            text=self._tr("Select a note above to read its full text (Double-click to edit):")
+                        )
+                    self.txt_note_reader.configure(state="disabled")
+                except Exception:
+                    pass
+
+            self.tree_shop_notes.bind("<<TreeviewSelect>>", _on_select_note)
+            self.tree_shop_notes.bind("<Double-1>", _edit_selected_note)
+            self.notes_cycle_filter.bind("<<ComboboxSelected>>", lambda e: self.load_shop_notes_data(quiet=True))
+            self.notes_user_filter.bind("<<ComboboxSelected>>", lambda e: self.load_shop_notes_data(quiet=True))
+            ent_search.bind("<KeyRelease>", lambda e: self.load_shop_notes_data(quiet=True))
+
+            self.load_shop_notes_data(quiet=True)
+
+        def load_shop_notes_data(self, quiet=False):
+            """Load and filter shop_notes into the Notes dialog treeview."""
+            tree = getattr(self, "tree_shop_notes", None)
+            if not self._widget_alive(tree):
+                return
+
+            conn = sqlite3.connect(TEMP_DB_PATH)
+            cur = conn.cursor()
+            rows = []
+            try:
+                cur.execute(
+                    """
+                    SELECT id, note_date, cycle_key, note_text, owner, created_at, updated_at
+                    FROM shop_notes
+                    ORDER BY note_date DESC, id DESC
+                    """
+                )
+                rows = cur.fetchall() or []
+            except Exception:
+                rows = []
+            finally:
+                conn.close()
+
+            parsed_notes = []
+            distinct_cycles = set()
+            distinct_users = set()
+
+            for r in rows:
+                nid = r[0]
+                n_date = normalize_iso_date(plain_label(r[1])) or str(plain_label(r[1]) or "")[:10]
+                stored_ck = plain_label(r[2]).strip() if r[2] else ""
+                resolved_ck = stored_ck if (stored_ck and parse_cycle_key(stored_ck)) else cycle_for_date(n_date)
+                n_text = str(decrypt_val(r[3]) if r[3] is not None else "").strip()
+                n_owner = plain_label(r[4]).strip() if r[4] else DEFAULT_ADMIN_USERNAME
+                if resolved_ck:
+                    distinct_cycles.add(resolved_ck)
+                if n_owner:
+                    distinct_users.add(n_owner)
+                parsed_notes.append(
+                    {
+                        "id": nid,
+                        "note_date": n_date,
+                        "cycle_key": resolved_ck,
+                        "note_text": n_text,
+                        "owner": n_owner,
+                        "created_at": plain_label(r[5]) if len(r) > 5 and r[5] else "",
+                        "updated_at": plain_label(r[6]) if len(r) > 6 and r[6] else "",
+                    }
+                )
+
+            # Populate Cycle Filter options while preserving current selection
+            all_cycles_lbl = self._tr("All Cycles")
+            cur_cycle_opt = f"🎯 {self._tr('Current Cycle')}"
+            sel_rev_opt = f"📅 {self._tr('Selected Revenue Cycle(s)')}"
+            cycle_map = {}
+            cycle_opts = [all_cycles_lbl, cur_cycle_opt, sel_rev_opt]
+
+            today_ck = cycle_for_date(datetime.today().strftime("%Y-%m-%d"))
+            yr_cycles = cycles_for_year(getattr(self, "rev_cal_year", datetime.today().year))
+            for ck in sorted(distinct_cycles | set(yr_cycles), reverse=True):
+                if not ck:
+                    continue
+                lbl = cycle_label_with_year(ck)
+                cycle_map[lbl] = ck
+                if lbl not in cycle_opts:
+                    cycle_opts.append(lbl)
+            self._notes_cycle_label_to_key = cycle_map
+
+            if self._widget_alive(getattr(self, "notes_cycle_filter", None)):
+                prev_c = self.notes_cycle_filter.get()
+                self.notes_cycle_filter["values"] = cycle_opts
+                if not prev_c or prev_c not in cycle_opts:
+                    self.notes_cycle_filter.set(all_cycles_lbl)
+
+            if self._widget_alive(getattr(self, "notes_user_filter", None)):
+                all_u_lbl = self._tr("All")
+                u_opts = [all_u_lbl] + sorted(distinct_users, key=lambda s: s.lower())
+                prev_u = self.notes_user_filter.get()
+                self.notes_user_filter["values"] = u_opts
+                if not prev_u or prev_u not in u_opts:
+                    self.notes_user_filter.set(all_u_lbl)
+
+            sel_c_lbl = self.notes_cycle_filter.get() if self._widget_alive(getattr(self, "notes_cycle_filter", None)) else all_cycles_lbl
+            sel_u_lbl = self.notes_user_filter.get() if self._widget_alive(getattr(self, "notes_user_filter", None)) else self._tr("All")
+            q_str = (self.notes_search_var.get() if hasattr(self, "notes_search_var") else "").strip().lower()
+
+            for item in tree.get_children():
+                tree.delete(item)
+            self._shop_notes_by_iid = {}
+
+            for idx, rec in enumerate(parsed_notes):
+                ck = rec["cycle_key"]
+                if sel_c_lbl == cur_cycle_opt:
+                    if ck != today_ck:
+                        continue
+                elif sel_c_lbl == sel_rev_opt:
+                    active_rev_cks = getattr(self, "selected_rev_cycles", set()) or set()
+                    if active_rev_cks and ck not in active_rev_cks:
+                        continue
+                elif sel_c_lbl and sel_c_lbl != all_cycles_lbl:
+                    target_ck = cycle_map.get(sel_c_lbl)
+                    if target_ck and ck != target_ck:
+                        continue
+
+                if sel_u_lbl and sel_u_lbl != self._tr("All"):
+                    if rec["owner"].lower() != sel_u_lbl.lower():
+                        continue
+
+                ck_disp = cycle_label_with_year(ck) if ck else ""
+                if q_str:
+                    hay = f"{rec['note_date']} {ck_disp} {rec['owner']} {rec['note_text']}".lower()
+                    if q_str not in hay:
+                        continue
+
+                one_line_note = " ".join((rec["note_text"] or "").splitlines()).strip()
+                iid = f"note_{rec['id']}_{idx}"
+                self._shop_notes_by_iid[iid] = rec
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        rec["id"],
+                        rec["note_date"],
+                        ck_disp,
+                        rec["owner"],
+                        one_line_note,
+                    ),
+                )
 
         def setup_calendar_tab(self):
             self.rev_cal_year = datetime.today().year
@@ -16775,25 +17794,25 @@ if HAS_DEPS:
             self.selected_rev_cycles = {cur_ck} if cur_ck else {f"{self.rev_cal_year}-01-1"}
             self.cycle_card_widgets = {}
 
-            # Top Control Bar (2-row layout so all buttons after Import Excel Sales fit on 13" MacBook screens)
-            top_frame = tb.Frame(self.tab_calendar, padding=(12, 6))
+            # Top Control Bar: Single aligned row on 13" MacBook (matches table padx=15)
+            top_frame = tb.Frame(self.tab_calendar, padding=(15, 6))
             top_frame.pack(side=TOP, fill=X)
+            top_frame.columnconfigure(0, weight=0)
+            top_frame.columnconfigure(1, weight=0)
+            top_frame.columnconfigure(2, weight=1)
 
-            top_row1 = tb.Frame(top_frame)
-            top_row1.pack(side=TOP, fill=X, pady=(0, 4))
+            # 1. Left: Year & Cycle Selection Controls
+            year_frame = tb.Labelframe(top_frame, text=self._tr("Year:"), padding=(8, 4), bootstyle="info")
+            year_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-            # Row 1 Left: Year & Selection Controls
-            year_frame = tb.Labelframe(top_row1, text=self._tr("Year:"), padding=(8, 4), bootstyle="info")
-            year_frame.pack(side=LEFT, fill=Y, padx=(0, 8))
+            tb.Button(year_frame, text="◀", bootstyle="outline-primary", width=2, cursor="hand2", command=self.prev_rev_year).pack(side=LEFT, padx=2, pady=1)
+            self.lbl_rev_year = tb.Label(year_frame, text=str(self.rev_cal_year), font=("Segoe UI", 12, "bold"), bootstyle="primary")
+            self.lbl_rev_year.pack(side=LEFT, padx=6, pady=1)
+            tb.Button(year_frame, text="▶", bootstyle="outline-primary", width=2, cursor="hand2", command=self.next_rev_year).pack(side=LEFT, padx=2, pady=1)
 
-            tb.Button(year_frame, text="◀", bootstyle="outline-primary", width=3, cursor="hand2", command=self.prev_rev_year).pack(side=LEFT, padx=2)
-            self.lbl_rev_year = tb.Label(year_frame, text=str(self.rev_cal_year), font=("Segoe UI", 14, "bold"), bootstyle="primary")
-            self.lbl_rev_year.pack(side=LEFT, padx=8)
-            tb.Button(year_frame, text="▶", bootstyle="outline-primary", width=3, cursor="hand2", command=self.next_rev_year).pack(side=LEFT, padx=2)
+            tb.Separator(year_frame, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=5, pady=1)
 
-            tb.Separator(year_frame, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=6)
-
-            tb.Button(year_frame, text=f"🎯 {self._tr('Current Cycle')}", bootstyle="info-outline", cursor="hand2", command=self.select_current_rev_cycle).pack(side=LEFT, padx=3)
+            tb.Button(year_frame, text=f"🎯 {self._tr('Current Cycle')}", bootstyle="info-outline", cursor="hand2", command=self.select_current_rev_cycle).pack(side=LEFT, padx=2, pady=1)
 
             self.btn_browse_cycles = tb.Button(
                 year_frame,
@@ -16802,10 +17821,11 @@ if HAS_DEPS:
                 cursor="hand2",
                 command=self._show_rev_cycles_popover,
             )
-            self.btn_browse_cycles.pack(side=LEFT, padx=3)
+            self.btn_browse_cycles.pack(side=LEFT, padx=2, pady=1)
             self.btn_browse_cycles.bind("<Enter>", self._show_rev_cycles_popover)
             self.btn_browse_cycles.bind("<Leave>", lambda e: self._schedule_popover_close())
 
+            # Hidden (not removed) Lock Cycle button
             self.btn_rev_cycle_lock = tb.Button(
                 year_frame,
                 text=f"🔒 {self._tr('Lock Cycle')}",
@@ -16813,28 +17833,30 @@ if HAS_DEPS:
                 cursor="hand2",
                 command=self.open_rev_cycle_lock_dialog,
             )
-            self.btn_rev_cycle_lock.pack(side=LEFT, padx=(6, 2))
+            self.btn_rev_cycle_lock.pack_forget()
 
-            # Row 1 Middle/Right: Employee Filter
-            emp_lf = tb.Labelframe(top_row1, text=self._tr("Employee:"), padding=(8, 4), bootstyle="secondary")
-            emp_lf.pack(side=LEFT, fill=Y, padx=(0, 8))
-            self.cal_name_filter = tb.Combobox(emp_lf, width=18, state="readonly")
+            # 2. Middle: Employee Filter
+            emp_lf = tb.Labelframe(top_frame, text=self._tr("Employee:"), padding=(8, 4), bootstyle="secondary")
+            emp_lf.grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+            self.cal_name_filter = tb.Combobox(emp_lf, width=15, state="readonly")
             self.cal_name_filter.set(self._tr("All"))
-            self.cal_name_filter.pack(side=LEFT, padx=4, pady=1)
+            self.cal_name_filter.pack(side=LEFT, padx=2, pady=1)
             self.cal_name_filter.bind("<<ComboboxSelected>>", lambda e: self.load_calendar_data(quiet=True))
 
-            # Row 2: Actions Bar (full width so all buttons after Import Excel Sales are always visible and aligned)
-            top_row2 = tb.Frame(top_frame)
-            top_row2.pack(side=TOP, fill=X)
+            # 3. Right: Actions Toolbox (Import, Cycle Report/Print, Notes + Record Actions)
+            action_lf = tb.Labelframe(top_frame, text=self._tr("Actions"), padding=(8, 4), bootstyle="primary")
+            action_lf.grid(row=0, column=2, sticky="nsew")
 
-            action_lf = tb.Labelframe(top_row2, text=self._tr("Actions"), padding=(8, 4), bootstyle="primary")
-            action_lf.pack(side=LEFT, fill=X, expand=True)
+            tb.Button(action_lf, text="📥 " + self._tr("Import Excel Sales"), bootstyle="info", cursor="hand2", command=self.open_excel_import_dialog).pack(side=LEFT, padx=(2, 3), pady=1)
+            tb.Button(action_lf, text="🖨️ " + self._tr("Cycle Report / Print"), bootstyle="success", cursor="hand2", command=self.open_employee_cycle_report_dialog).pack(side=LEFT, padx=3, pady=1)
+            self.btn_shop_notes = tb.Button(action_lf, text="📝 " + self._tr("Notes"), bootstyle="primary", cursor="hand2", command=self.open_shop_notes_dialog)
+            self.btn_shop_notes.pack(side=LEFT, padx=3, pady=1)
 
-            tb.Button(action_lf, text="📥 " + self._tr("Import Excel Sales"), bootstyle="info", cursor="hand2", command=self.open_excel_import_dialog).pack(side=LEFT, padx=(2, 4))
-            tb.Button(action_lf, text="🖨️ " + self._tr("Cycle Report / Print"), bootstyle="success", cursor="hand2", command=self.open_employee_cycle_report_dialog).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("✏️ Edit"), bootstyle="warning", cursor="hand2", command=self.edit_selected_record).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("🗑️ Delete"), bootstyle="danger", cursor="hand2", command=self.delete_selected_record).pack(side=LEFT, padx=4)
-            tb.Button(action_lf, text=self._tr("⚙️ Columns"), bootstyle="secondary-outline", cursor="hand2", command=self.open_calendar_columns_dialog).pack(side=LEFT, padx=4)
+            tb.Separator(action_lf, orient=VERTICAL).pack(side=LEFT, fill=Y, padx=5, pady=1)
+
+            tb.Button(action_lf, text=self._tr("✏️ Edit"), bootstyle="warning", cursor="hand2", command=self.edit_selected_record).pack(side=LEFT, padx=3, pady=1)
+            tb.Button(action_lf, text=self._tr("🗑️ Delete"), bootstyle="danger", cursor="hand2", command=self.delete_selected_record).pack(side=LEFT, padx=3, pady=1)
+            tb.Button(action_lf, text=self._tr("⚙️ Columns"), bootstyle="secondary-outline", cursor="hand2", command=self.open_calendar_columns_dialog).pack(side=LEFT, padx=3, pady=1)
 
             self.btn_missing_rate_action = tb.Button(
                 action_lf,
@@ -16843,13 +17865,12 @@ if HAS_DEPS:
                 cursor="hand2",
             )
 
-            tb.Label(action_lf, text=self._tr("(Ctrl / ⌘ multi-select)"), font=("Segoe UI", 8), bootstyle="secondary").pack(side=RIGHT, padx=6)
-
             # Bottom Summary Bar
             summary_frame = tb.Frame(self.tab_calendar, padding=(12, 8), bootstyle="primary")
             summary_frame.pack(side=BOTTOM, fill=X, pady=(8, 0))
             self.lbl_summary = tb.Label(summary_frame, text="", font=("Segoe UI", 12, "bold"), bootstyle="inverse-primary")
             self.lbl_summary.pack(side=LEFT, padx=10)
+            tb.Label(summary_frame, text=self._tr("(Ctrl / ⌘ multi-select)"), font=("Segoe UI", 9), bootstyle="inverse-primary").pack(side=RIGHT, padx=10)
 
             # Records Table Container with Frozen Employee Column
             tree_frame = tb.Frame(self.tab_calendar)
